@@ -8,49 +8,40 @@ using UnityEngine.XR.MagicLeap;
 using UnityEngine.XR.OpenXR;
 using MagicLeap.OpenXR.Features.PixelSensors;
 using Unity.XR.CoreUtils;
-
+using Stopwatch = System.Diagnostics.Stopwatch;
 
 public class DepthSensorAPI : MonoBehaviour
 {
+    private const int TimingLogEveryNFrames = 30;
 
-    [Header("General Configuration")] // change between ML2ToolTrackingManager or IRToolTrack if you are using the ML2IRTracking plugin or the scripts in C#
+    [Header("General Configuration")]
     public ML2ToolTrackingManager streamVisualizer;
-    //public IRToolTrack streamVisualizer;
 
     [SerializeField] XROrigin xrOrigin;
 
-    [Tooltip("If Tue will return a raw depth image. If False will return depth32")]
+    [Tooltip("If True will return a raw depth image. If False will return depth32")]
     public bool UseRawDepth;
 
     [Range(0.2f, 5.00f)] public float DepthRange;
 
     [Header("ShortRange =< 1m")] public ShortRangeUpdateRate SRUpdateRate;
+    [Header("LongRange > 1m")]   public LongRangeUpdateRate  LRUpdateRate;
 
-    [Header("LongRange > 1m")] public LongRangeUpdateRate LRUpdateRate;
-
-    public enum LongRangeUpdateRate
-    {
-        OneFps = 1, FiveFps = 5
-
-    }
-    public enum ShortRangeUpdateRate
-    {
-        FiveFps = 5, ThirtyFps = 30, SixtyFps = 60
-    }
+    public enum LongRangeUpdateRate  { OneFps = 1, FiveFps = 5 }
+    public enum ShortRangeUpdateRate { FiveFps = 5, ThirtyFps = 30, SixtyFps = 60 }
 
     private const string depthCameraSensorPath = "/pixelsensor/depth/center";
-
     private MagicLeapPixelSensorFeature pixelSensorFeature;
     private PixelSensorId? sensorId;
     private List<uint> configuredStreams = new List<uint>();
 
-    public uint targetStream
-    {
-        get { return DepthRange > 1.0f ? (uint)0 : (uint)1; }
-    }
+    public uint targetStream => DepthRange > 1.0f ? (uint)0 : (uint)1;
+
 
     void Start()
     {
+        Application.targetFrameRate = 60;
+        QualitySettings.vSyncCount  = 0;
         pixelSensorFeature = OpenXRSettings.Instance.GetFeature<MagicLeapPixelSensorFeature>();
         if (pixelSensorFeature == null || !pixelSensorFeature.enabled)
         {
@@ -58,71 +49,58 @@ public class DepthSensorAPI : MonoBehaviour
             enabled = false;
             return;
         }
-        Permissions.RequestPermission(MLPermission.DepthCamera, OnPermissionGranted, OnPermissionDenied,
-            OnPermissionDenied);
+        Permissions.RequestPermission(MLPermission.DepthCamera, OnPermissionGranted, OnPermissionDenied, OnPermissionDenied);
     }
 
     private void OnPermissionGranted(string permission)
     {
-        if (permission.Contains(MLPermission.DepthCamera))
-            FindAndInitializeSensor();
-
+        if (permission.Contains(MLPermission.DepthCamera)) FindAndInitializeSensor();
     }
 
     private void OnPermissionDenied(string permission)
     {
-        Debug.LogError($"Permission {permission} not granted. Example script will not work.");
+        Debug.LogError($"Permission {permission} not granted.");
         enabled = false;
     }
 
     private void FindAndInitializeSensor()
     {
         var sensors = pixelSensorFeature.GetSupportedSensors();
-
         foreach (var sensor in sensors)
         {
-            Debug.Log("Sensor Name Found: " + sensor.XrPathString);
-            if (sensor.XrPathString.Contains(depthCameraSensorPath))
-            {
-                sensorId = sensor;
-                break;
+            if (sensor.XrPathString.Contains(depthCameraSensorPath)) 
+            { 
+                sensorId = sensor; 
+                break; 
             }
         }
 
-        if (!sensorId.HasValue)
-        {
-            Debug.LogError($"`{depthCameraSensorPath}` sensor not found.");
-            return;
+        if (!sensorId.HasValue) 
+        { 
+            Debug.LogError($"`{depthCameraSensorPath}` sensor not found."); 
+            return; 
         }
 
-        // Subscribe to the Availability changed callback if the sensor becomes available.
         pixelSensorFeature.OnSensorAvailabilityChanged += OnSensorAvailabilityChanged;
         TryInitializeSensor();
     }
 
     private void OnSensorAvailabilityChanged(PixelSensorId id, bool available)
     {
-        if (sensorId.HasValue && id == sensorId && available)
-        {
-            Debug.Log("Sensor became available.");
-            TryInitializeSensor();
-        }
+        if (sensorId.HasValue && id == sensorId && available) TryInitializeSensor();
     }
 
     private void TryInitializeSensor()
     {
-        if (sensorId.HasValue && pixelSensorFeature.GetSensorStatus(sensorId.Value) ==
-            PixelSensorStatus.Undefined && pixelSensorFeature.CreatePixelSensor(sensorId.Value))
+        if (sensorId.HasValue &&
+            pixelSensorFeature.GetSensorStatus(sensorId.Value) == PixelSensorStatus.Undefined &&
+            pixelSensorFeature.CreatePixelSensor(sensorId.Value))
         {
-            Debug.Log("Sensor created successfully.");
             ConfigureSensorStreams();
-        }
-        else
-        {
-            Debug.LogWarning("Failed to create sensor. Will retry when it becomes available.");
         }
     }
 
+    
     // The capabilities that the script will edit
     private PixelSensorCapabilityType[] targetCapabilityTypes = new[]
     {
@@ -132,62 +110,36 @@ public class DepthSensorAPI : MonoBehaviour
         PixelSensorCapabilityType.Depth,
     };
 
-
     private void ConfigureSensorStreams()
     {
-        if (!sensorId.HasValue)
-        {
-            Debug.LogError("Sensor ID not set.");
-            return;
-        }
-
-        uint streamCount = pixelSensorFeature.GetStreamCount(sensorId.Value);
-        if (streamCount < 1)
-        {
-            Debug.LogError("Expected at least one stream from the sensor.");
-            return;
-        }
-
-        // Only add the target
+        if (!sensorId.HasValue) return;
+        configuredStreams.Clear();
         configuredStreams.Add(targetStream);
 
-
         pixelSensorFeature.GetPixelSensorCapabilities(sensorId.Value, targetStream, out var capabilities);
-        foreach (var pixelSensorCapability in capabilities)
+        foreach (var cap in capabilities)
         {
-            if (!targetCapabilityTypes.Contains(pixelSensorCapability.CapabilityType))
-            {
-                continue;
-            }
+            if (!targetCapabilityTypes.Contains(cap.CapabilityType)) continue;
+            if (!pixelSensorFeature.QueryPixelSensorCapability(sensorId.Value, cap.CapabilityType, targetStream, out var range) || !range.IsValid) continue;
 
-            // More details about the capability
-            if (pixelSensorFeature.QueryPixelSensorCapability(sensorId.Value, pixelSensorCapability.CapabilityType, targetStream, out PixelSensorCapabilityRange range) && range.IsValid)
+            var cfg = new PixelSensorConfigData(range.CapabilityType, targetStream);
+            if (range.CapabilityType == PixelSensorCapabilityType.UpdateRate)
             {
-                if (range.CapabilityType == PixelSensorCapabilityType.UpdateRate)
-                {
-                    var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    configData.IntValue = DepthRange > 1 ? (uint)LRUpdateRate : (uint)SRUpdateRate;
-                    pixelSensorFeature.ApplySensorConfig(sensorId.Value, configData);
-                }
-                else if (range.CapabilityType == PixelSensorCapabilityType.Format)
-                {
-                    var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    configData.IntValue = (uint)range.FrameFormats[UseRawDepth ? 1 : 0];
-                    pixelSensorFeature.ApplySensorConfig(sensorId.Value, configData);
-                }
-                else if (range.CapabilityType == PixelSensorCapabilityType.Resolution)
-                {
-                    var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    configData.VectorValue = range.ExtentValues[0];
-                    pixelSensorFeature.ApplySensorConfig(sensorId.Value, configData);
-                }
-                else if (range.CapabilityType == PixelSensorCapabilityType.Depth)
-                {
-                    var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    configData.FloatValue = DepthRange;
-                    pixelSensorFeature.ApplySensorConfig(sensorId.Value, configData);
-                }
+                cfg.IntValue = DepthRange > 1 ? (uint)LRUpdateRate : (uint)SRUpdateRate;                
+            }  
+            else if (range.CapabilityType == PixelSensorCapabilityType.Format)      
+            {
+                cfg.IntValue = (uint)range.FrameFormats[UseRawDepth ? 1 : 0];
             }
+            else if (range.CapabilityType == PixelSensorCapabilityType.Resolution)
+            {
+                cfg.VectorValue = range.ExtentValues[0];
+            }  
+            else if (range.CapabilityType == PixelSensorCapabilityType.Depth)
+            {
+                cfg.FloatValue = DepthRange;
+            }       
+            pixelSensorFeature.ApplySensorConfig(sensorId.Value, cfg);
         }
 
         StartCoroutine(ConfigureStreamsAndStartSensor());
@@ -195,115 +147,148 @@ public class DepthSensorAPI : MonoBehaviour
 
     private IEnumerator ConfigureStreamsAndStartSensor()
     {
-
-        var configureOperation = pixelSensorFeature.ConfigureSensor(sensorId.Value, configuredStreams.ToArray());
-
-        yield return configureOperation;
-
-        if (configureOperation.DidOperationSucceed)
-        {
-            Debug.Log("Sensor configured with defaults successfully.");
-        }
-        else
-        {
-            Debug.LogError("Failed to configure sensor.");
-            yield break;
+        var configOp = pixelSensorFeature.ConfigureSensor(sensorId.Value, configuredStreams.ToArray());
+        
+        yield return configOp;
+        
+        if (!configOp.DidOperationSucceed) 
+        { 
+            Debug.LogError("Failed to configure sensor."); 
+            yield break; 
         }
 
-
-        Dictionary<uint, PixelSensorMetaDataType[]> supportedMetadataTypes =
-        new Dictionary<uint, PixelSensorMetaDataType[]>();
+        var metaTypes = new Dictionary<uint, PixelSensorMetaDataType[]>();
 
         foreach (uint stream in configuredStreams)
+            if (pixelSensorFeature.EnumeratePixelSensorMetaDataTypes(sensorId.Value, stream, out var t))
+                metaTypes[stream] = t;
+
+        var startOp = pixelSensorFeature.StartSensor(sensorId.Value, configuredStreams, metaTypes);
+
+        yield return startOp;
+
+        if (startOp.DidOperationSucceed)
         {
-            if (pixelSensorFeature.EnumeratePixelSensorMetaDataTypes(sensorId.Value, stream, out var metaDataTypes))
-            {
-                supportedMetadataTypes[stream] = metaDataTypes;
-                
-            }
-        }
-
-        // Assuming that `configuredStreams` is correctly populated with the intended stream indices
-        PixelSensorAsyncOperationResult startOperation = pixelSensorFeature.StartSensor(sensorId.Value, configuredStreams, supportedMetadataTypes);
-
-        yield return startOperation;
-
-        if (startOperation.DidOperationSucceed)
-        {
-            Debug.Log("Sensor started successfully. Monitoring data...");
+            streamVisualizer.Initialize(configuredStreams[0], pixelSensorFeature, sensorId.Value);
+            streamVisualizer.StartWorker();   // start background tracking thread
             StartCoroutine(MonitorSensorData());
         }
-        else
-        {
-            Debug.LogError("Failed to start sensor.");
+        else 
+        { 
+            Debug.LogError("Failed to start sensor."); 
         }
     }
 
     private IEnumerator MonitorSensorData()
-    {   
+    {
+        long submittedSamples = 0;
+        long totalGetSensorDataTicks = 0;
+        long totalByteCopyTicks = 0;
+        long totalGetSensorPoseTicks = 0;
+        long totalSubmitTicks = 0;
 
-        // Initialize Stream ...
-        streamVisualizer.Initialize(configuredStreams[0], pixelSensorFeature, sensorId.Value);
-        
-
-        while (pixelSensorFeature.GetSensorStatus(sensorId.Value) ==
-               PixelSensorStatus.Started)
+        while (pixelSensorFeature.GetSensorStatus(sensorId.Value) == PixelSensorStatus.Started)
         {
-
             foreach (uint stream in configuredStreams)
             {
-                
+                long getSensorDataStart = Stopwatch.GetTimestamp();
+                bool hasFrame = pixelSensorFeature.GetSensorData(
+                    sensorId.Value, stream,
+                    out var frame, out var metaData,
+                    Allocator.Temp, shouldFlipTexture: true);
+                long getSensorDataEnd = Stopwatch.GetTimestamp();
 
-                if (pixelSensorFeature.GetSensorData(sensorId.Value, stream, out var frame, out var metaData,
-                        Allocator.Temp, shouldFlipTexture: true))
+                if (hasFrame && frame.IsValid && frame.Planes.Length > 0)
                 {
-                    // Process Frames ...
-                    Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value,frame.CaptureTime);
+                    var plane = frame.Planes[0];
+                    int byteLen = plane.ByteData.Length;
+                    int w = (int)plane.Width;
+                    int h = (int)plane.Height;
 
+                    // Copy once from the temporary NativeArray into a worker-owned buffer.
+                    byte[] frameBytes = streamVisualizer.AcquireFrameBuffer(byteLen);
+                    long byteCopyStart = Stopwatch.GetTimestamp();
+                    NativeArray<byte>.Copy(plane.ByteData, frameBytes, byteLen);
+                    long byteCopyEnd = Stopwatch.GetTimestamp();
+
+                    // Pose must also be captured here — valid only while frame is alive
+                    long getSensorPoseStart = Stopwatch.GetTimestamp();
+                    Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value, frame.CaptureTime);
+                    
                     if (xrOrigin)
                     {
                         var baseTf = xrOrigin.CameraFloorOffsetObject.transform;
                         sensorPose.position = baseTf.TransformPoint(sensorPose.position);
                         sensorPose.rotation = xrOrigin.transform.rotation * sensorPose.rotation;
                     }
+                    long getSensorPoseEnd = Stopwatch.GetTimestamp();
 
-                    Debug.Log("Sensor Pose:" + sensorPose);
-                    streamVisualizer.ProcessFrame(frame, metaData, sensorPose);
-                    
+                    // Hand off to background thread — returns immediately
+                    long submitStart = Stopwatch.GetTimestamp();
+                    streamVisualizer.SubmitRawFrame(frameBytes, w, h, sensorPose);
+                    long submitEnd = Stopwatch.GetTimestamp();
+
+                    totalGetSensorDataTicks += getSensorDataEnd - getSensorDataStart;
+                    totalByteCopyTicks += byteCopyEnd - byteCopyStart;
+                    totalGetSensorPoseTicks += getSensorPoseEnd - getSensorPoseStart;
+                    totalSubmitTicks += submitEnd - submitStart;
+                    submittedSamples++;
+
+                    if (submittedSamples % TimingLogEveryNFrames == 0)
+                    {
+                        double tickToMs = 1000.0 / Stopwatch.Frequency;
+                        Debug.Log(
+                            $"[Timing][Producer] Avg over {submittedSamples} submitted frames: " +
+                            $"GetSensorData={(totalGetSensorDataTicks / (double)submittedSamples) * tickToMs:F2} ms, " +
+                            $"ByteCopy={(totalByteCopyTicks / (double)submittedSamples) * tickToMs:F2} ms, " +
+                            $"GetSensorPose={(totalGetSensorPoseTicks / (double)submittedSamples) * tickToMs:F2} ms, " +
+                            $"SubmitRawFrame={(totalSubmitTicks / (double)submittedSamples) * tickToMs:F2} ms");
+
+                        submittedSamples = 0;
+                        totalGetSensorDataTicks = 0;
+                        totalByteCopyTicks = 0;
+                        totalGetSensorPoseTicks = 0;
+                        totalSubmitTicks = 0;
+                    }
                 }
 
-                yield return null;
+                yield return null;   // yields AFTER submit, not after ProcessFrame
             }
         }
     }
 
     public void OnDisable()
     {
-        //We start the Coroutine on another MonoBehaviour since it can only run while the object is enabled.
-        MonoBehaviour camMono = Camera.main.GetComponent<MonoBehaviour>();
-        camMono.StartCoroutine(StopSensorCoroutine());
+        if (pixelSensorFeature != null)
+        {
+            pixelSensorFeature.OnSensorAvailabilityChanged -= OnSensorAvailabilityChanged;
+        }
+
+        streamVisualizer?.StopWorker();
+
+        var runner = Camera.main ? Camera.main.GetComponent<MonoBehaviour>() : null;
+       
+        if (runner != null) 
+        {
+            runner.StartCoroutine(StopSensorCoroutine());
+        }
     }
 
     private IEnumerator StopSensorCoroutine()
     {
-        if (sensorId.HasValue)
+        if (!sensorId.HasValue) 
+        { 
+            yield break; 
+        }
+        
+        var stopOp = pixelSensorFeature.StopSensor(sensorId.Value, configuredStreams);
+        
+        yield return stopOp;
+        
+        if (stopOp.DidOperationSucceed)
         {
-            PixelSensorAsyncOperationResult stopSensorAsyncResult =
-                pixelSensorFeature.StopSensor(sensorId.Value, configuredStreams);
-
-            yield return stopSensorAsyncResult;
-
-            if (stopSensorAsyncResult.DidOperationSucceed)
-            {
-                Debug.Log("Sensor stopped successfully.");
-                pixelSensorFeature.ClearAllAppliedConfigs(sensorId.Value);
-                // Free the sensor so it can be marked available and used in other scripts.
-                pixelSensorFeature.DestroyPixelSensor(sensorId.Value);
-            }
-            else
-            {
-                Debug.LogError("Failed to stop the sensor.");
-            }
+            pixelSensorFeature.ClearAllAppliedConfigs(sensorId.Value);
+            pixelSensorFeature.DestroyPixelSensor(sensorId.Value);
         }
     }
 }

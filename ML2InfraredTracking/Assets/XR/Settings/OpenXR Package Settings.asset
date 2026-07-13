@@ -1,5 +1,27 @@
 %YAML 1.1
 %TAG !u! tag:unity3d.com,2011:
+--- !u!114 &-9097483932371346989
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f6a75d1f5ff90154ea2a8e58222a1f59, type: 3}
+  m_Name: FoveatedRenderingFeature Metro
+  m_EditorClassIdentifier: 
+  m_enabled: 0
+  nameUi: Foveated Rendering
+  version: 1
+  featureIdInternal: com.unity.openxr.feature.foveatedrendering
+  openxrExtensionStrings: XR_UNITY_foveation XR_FB_foveation XR_FB_foveation_configuration
+    XR_FB_swapchain_update_state XR_FB_foveation_vulkan XR_META_foveation_eye_tracked
+    XR_META_vulkan_swapchain_create_info
+  company: Unity
+  priority: 0
+  required: 0
 --- !u!114 &-8830424641210805765
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -329,6 +351,7 @@ MonoBehaviour:
   - {fileID: -8660319610888644326}
   - {fileID: 1673433754806938672}
   - {fileID: 753789885768434297}
+  - {fileID: 456959193379536982}
   - {fileID: 716449153063617763}
   - {fileID: 3604055783079447746}
   - {fileID: 3840158042041576073}
@@ -368,9 +391,9 @@ MonoBehaviour:
   m_colorSubmissionModes:
     m_List: 00000000
   m_depthSubmissionMode: 1
-  m_spacewarpMotionVectorTextureFormat: 0
   m_optimizeBufferDiscards: 1
   m_symmetricProjection: 0
+  m_foveatedRenderingApi: 0
 --- !u!114 &-6292766214190480549
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -530,6 +553,7 @@ MonoBehaviour:
   - {fileID: -1709513129294750375}
   - {fileID: 930919287321901945}
   - {fileID: 1408892756279530372}
+  - {fileID: -9097483932371346989}
   - {fileID: -5631253299278462190}
   - {fileID: -8645489259049002043}
   - {fileID: 3678335239352930147}
@@ -550,9 +574,9 @@ MonoBehaviour:
   m_colorSubmissionModes:
     m_List: 00000000
   m_depthSubmissionMode: 0
-  m_spacewarpMotionVectorTextureFormat: 0
   m_optimizeBufferDiscards: 0
   m_symmetricProjection: 0
+  m_foveatedRenderingApi: 0
 --- !u!114 &-4405156837644170839
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -636,8 +660,6 @@ MonoBehaviour:
   optimizeBufferDiscards: 1
   lateLatchingMode: 0
   lateLatchingDebug: 0
-  optimizeMultiviewRenderRegions: 0
-  spacewarpMotionVectorTextureFormat: 0
 --- !u!114 &-3302029937762759092
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -699,6 +721,28 @@ MonoBehaviour:
   company: Unity
   priority: 0
   required: 0
+--- !u!114 &-2868697373899979313
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b5a1f07dc5afe854f9f12a4194aca3fb, type: 3}
+  m_Name: iPhone
+  m_EditorClassIdentifier: 
+  features:
+  - {fileID: 7722838335634595794}
+  m_renderMode: 1
+  m_autoColorSubmissionMode: 1
+  m_colorSubmissionModes:
+    m_List: 00000000
+  m_depthSubmissionMode: 0
+  m_optimizeBufferDiscards: 0
+  m_symmetricProjection: 0
+  m_foveatedRenderingApi: 0
 --- !u!114 &-2840911069954453177
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -735,6 +779,7 @@ MonoBehaviour:
   - {fileID: 5350412477080394216}
   - {fileID: -6845187981125539053}
   - {fileID: -6292766214190480549}
+  - {fileID: 8578338345373762051}
   - {fileID: 6815920584492386132}
   - {fileID: 2046360533940905034}
   - {fileID: 7587019960848500702}
@@ -773,9 +818,9 @@ MonoBehaviour:
   m_colorSubmissionModes:
     m_List: 00000000
   m_depthSubmissionMode: 0
-  m_spacewarpMotionVectorTextureFormat: 0
   m_optimizeBufferDiscards: 0
   m_symmetricProjection: 0
+  m_foveatedRenderingApi: 0
 --- !u!114 &-2488505902219320497
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1008,11 +1053,12 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 9f0ebc320a151d3408ea1e9fce54d40e, type: 3}
   m_Name: OpenXR Package Settings
   m_EditorClassIdentifier: 
-  Keys: 01000000070000000e000000
+  Keys: 01000000070000000e00000004000000
   Values:
   - {fileID: -2763432664503536737}
   - {fileID: -6444401511562071017}
   - {fileID: -4672191383932209624}
+  - {fileID: -2868697373899979313}
 --- !u!114 &109748164689964083
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1092,6 +1138,28 @@ MonoBehaviour:
   openxrExtensionStrings: XR_ML_light_estimation
   company: Magic Leap
   priority: -1
+  required: 0
+--- !u!114 &456959193379536982
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f6a75d1f5ff90154ea2a8e58222a1f59, type: 3}
+  m_Name: FoveatedRenderingFeature Android
+  m_EditorClassIdentifier: 
+  m_enabled: 0
+  nameUi: Foveated Rendering
+  version: 1
+  featureIdInternal: com.unity.openxr.feature.foveatedrendering
+  openxrExtensionStrings: XR_UNITY_foveation XR_FB_foveation XR_FB_foveation_configuration
+    XR_FB_swapchain_update_state XR_FB_foveation_vulkan XR_META_foveation_eye_tracked
+    XR_META_vulkan_swapchain_create_info
+  company: Unity
+  priority: 0
   required: 0
 --- !u!114 &531292237636181874
 MonoBehaviour:
@@ -1999,6 +2067,26 @@ MonoBehaviour:
   perceptionSnapshots: 0
   farClipPolicy: 2
   nearClipPolicy: 1
+--- !u!114 &7722838335634595794
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b213d3e3c7f3109449eb46a4c8ee42f0, type: 3}
+  m_Name: XrPerformanceSettingsFeature iPhone
+  m_EditorClassIdentifier: 
+  m_enabled: 0
+  nameUi: XR Performance Settings
+  version: 1.0.0
+  featureIdInternal: com.unity.openxr.feature.extension.performance_settings
+  openxrExtensionStrings: XR_EXT_performance_settings
+  company: Unity
+  priority: 0
+  required: 0
 --- !u!114 &7758997786158226799
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2058,6 +2146,28 @@ MonoBehaviour:
   openxrExtensionStrings: XR_ML_pixel_sensor XR_EXT_future
   company: Magic Leap
   priority: -2
+  required: 0
+--- !u!114 &8578338345373762051
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f6a75d1f5ff90154ea2a8e58222a1f59, type: 3}
+  m_Name: FoveatedRenderingFeature Standalone
+  m_EditorClassIdentifier: 
+  m_enabled: 0
+  nameUi: Foveated Rendering
+  version: 1
+  featureIdInternal: com.unity.openxr.feature.foveatedrendering
+  openxrExtensionStrings: XR_UNITY_foveation XR_FB_foveation XR_FB_foveation_configuration
+    XR_FB_swapchain_update_state XR_FB_foveation_vulkan XR_META_foveation_eye_tracked
+    XR_META_vulkan_swapchain_create_info
+  company: Unity
+  priority: 0
   required: 0
 --- !u!114 &8863523797579941889
 MonoBehaviour:
