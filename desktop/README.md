@@ -73,7 +73,13 @@ address; `127.0.0.1` may be selected to allow only ADB-forwarded access.
 
 Press `Q` or Escape to quit the viewer. Press `S` to save the current unmodified
 depth matrix as `.npy`; use `--save-dir PATH` to select its directory. The
-OpenCV colour map is display-only—the `depth` NumPy array remains metres.
+default `unity-raw` view matches `DepthRawMat`: grayscale using the shader's
+`_RawMin=5` and `_RawMax=3000`. Override them with `--raw-min` and `--raw-max`
+if the Unity material changes. It also applies Unity's Linear-to-sRGB display
+conversion; use `--unity-color-space gamma` if the project switches to Gamma.
+The earlier inverted Turbo visualization remains
+available with `--view turbo --near 0.2 --far 5`. Visualization is display-only;
+the received NumPy array is never modified.
 The receiver automatically reconnects if a deployment or app restart leaves a
 stale TCP connection; adjust this with `--frame-timeout` if needed.
 

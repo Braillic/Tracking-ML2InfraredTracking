@@ -110,10 +110,31 @@ def receive_frame(connection: socket.socket) -> DepthFrame:
     )
 
 
-def colourise_depth(depth: np.ndarray, near: float, far: float) -> np.ndarray:
-    valid = np.isfinite(depth) & (depth > 0)
-    clipped = np.clip(np.where(valid, depth, near), near, far)
-    grey = ((clipped - near) * (255.0 / max(far - near, 1e-6))).astype(np.uint8)
+def colourise_depth(depth: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    finite = np.isfinite(depth)
+
+    if args.view == "unity-raw":
+        # Exact CPU equivalent of DepthSensorShader.shader for _Buffer == 0:
+        # saturate((depth - _RawMin) / (_RawMax - _RawMin)).
+        normalized = ((np.where(finite, depth, args.raw_min) - args.raw_min) /
+                      max(args.raw_max - args.raw_min, 1e-6))
+        normalized = np.clip(normalized, 0.0, 1.0)
+        if args.unity_color_space == "linear":
+            # The project uses Linear color space. Unity converts the shader's
+            # linear output to sRGB, while OpenCV byte images are already sRGB.
+            normalized = np.where(
+                normalized <= 0.0031308,
+                normalized * 12.92,
+                1.055 * np.power(normalized, 1.0 / 2.4) - 0.055,
+            )
+        grey = np.rint(normalized * 255.0).astype(np.uint8)
+        grey[~finite] = 0
+        return cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
+
+    valid = finite & (depth > 0)
+    clipped = np.clip(np.where(valid, depth, args.near), args.near, args.far)
+    grey = ((clipped - args.near) *
+            (255.0 / max(args.far - args.near, 1e-6))).astype(np.uint8)
     grey[~valid] = 0
     colour = cv2.applyColorMap(255 - grey, cv2.COLORMAP_TURBO)
     colour[~valid] = 0
@@ -162,12 +183,13 @@ def run(args: argparse.Namespace) -> None:
                         print("OpenCV camera matrix:\n", intrinsics.camera_matrix, flush=True)
                         print("OpenCV distortion coefficients:",
                               intrinsics.distortion_coefficients, flush=True)
-                    display = colourise_depth(depth, args.near, args.far)
+                    display = colourise_depth(depth, args)
                     valid = np.isfinite(depth) & (depth > 0)
                     if np.any(valid):
                         minimum = float(depth[valid].min())
                         maximum = float(depth[valid].max())
-                        label = f"frame {frame.frame_id}  depth {minimum:.2f}-{maximum:.2f} m"
+                        unit = "raw" if args.view == "unity-raw" else "m"
+                        label = f"frame {frame.frame_id}  range {minimum:.2f}-{maximum:.2f} {unit}"
                     else:
                         label = f"frame {frame.frame_id}  no valid depth"
                     cv2.putText(display, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
@@ -200,8 +222,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1",
                         help="ML Wi-Fi IP, or 127.0.0.1 when using adb forward")
     parser.add_argument("--port", type=int, default=50777)
-    parser.add_argument("--near", type=float, default=0.2, help="Display near plane in metres")
-    parser.add_argument("--far", type=float, default=5.0, help="Display far plane in metres")
+    parser.add_argument("--view", choices=("unity-raw", "turbo"), default="unity-raw",
+                        help="Display mapping; unity-raw matches DepthRawMat")
+    parser.add_argument("--raw-min", type=float, default=5.0,
+                        help="Unity raw grayscale minimum (_RawMin)")
+    parser.add_argument("--raw-max", type=float, default=3000.0,
+                        help="Unity raw grayscale maximum (_RawMax)")
+    parser.add_argument("--unity-color-space", choices=("linear", "gamma"), default="linear",
+                        help="Match the Unity project's active color space")
+    parser.add_argument("--near", type=float, default=0.2,
+                        help="Turbo view near plane in metres")
+    parser.add_argument("--far", type=float, default=5.0,
+                        help="Turbo view far plane in metres")
     parser.add_argument("--save-dir", help="Directory used when S is pressed")
     parser.add_argument("--connect-timeout", type=float, default=5.0)
     parser.add_argument("--frame-timeout", type=float, default=10.0,
