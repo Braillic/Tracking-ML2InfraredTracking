@@ -1,9 +1,9 @@
 {
-    "m_SelectedDeviceId": "G182XT100014",
+    "m_SelectedDeviceId": "192.168.123.16:5555",
     "m_SelectedProcess": {
-        "deviceId": "",
-        "name": "",
-        "processId": 0,
+        "deviceId": "G572XT10018Y",
+        "name": "com.braillic.depthstreaming",
+        "processId": 2142,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -48,6 +48,24 @@
             "deviceId": "G182XT100014",
             "name": "com.UnityTechnologies.com.GitHubrepotrackingtest",
             "processId": 7024,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.UnityTechnologies.com.GitHubrepotrackingtest",
+            "processId": 13983,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 29172,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 2142,
             "exited": false
         }
     ],

@@ -12,8 +12,8 @@ PlayerSettings:
   targetDevice: 2
   useOnDemandResources: 0
   accelerometerFrequency: 60
-  companyName: DefaultCompany
-  productName: GitHub repo tracking test
+  companyName: Braillic
+  productName: DepthRaw Streaming
   defaultCursor: {fileID: 0}
   cursorHotspot: {x: 0, y: 0}
   m_SplashScreenBackgroundColor: {r: 0.13725491, g: 0.12156863, b: 0.1254902, a: 1}
@@ -143,6 +143,10 @@ PlayerSettings:
   bundleVersion: 0.1.0
   preloadedAssets:
   - {fileID: -944628639613478452, guid: bb4daeceea261404d9e9069323220d1b, type: 3}
+  - {fileID: 11400000, guid: 46eb174601bc4384f8481fe881e8da53, type: 2}
+  - {fileID: 7133843875722913235, guid: b511854fdac94b741ba0574913c3cfd5, type: 2}
+  - {fileID: -6444401511562071017, guid: d46ec6dd97e59a54ca4c2b9edd86f92d, type: 2}
+  - {fileID: 11400000, guid: ad34cd5a270bbf8459eb6dd78b429593, type: 2}
   metroInputSource: 0
   wsaTransparentSwapchain: 0
   m_HolographicPauseOnTrackingLoss: 1
@@ -164,7 +168,7 @@ PlayerSettings:
   androidMaxAspectRatio: 2.1
   androidMinAspectRatio: 1
   applicationIdentifier:
-    Android: com.UnityTechnologies.com.GitHubrepotrackingtest
+    Android: com.braillic.depthstreaming
     Standalone: com.Unity-Technologies.com.unity.template.urp-blank
     iPhone: com.Unity-Technologies.com.unity.template.urp-blank
   buildNumber:
@@ -944,7 +948,7 @@ PlayerSettings:
   qnxGraphicConfPath: 
   apiCompatibilityLevel: 6
   captureStartupLogs: {}
-  activeInputHandler: 2
+  activeInputHandler: 1
   windowsGamepadBackendHint: 0
   cloudProjectId: 
   framebufferDepthMemorylessMode: 0

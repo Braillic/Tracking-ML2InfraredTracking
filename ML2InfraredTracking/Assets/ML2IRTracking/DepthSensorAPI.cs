@@ -14,7 +14,7 @@ public class DepthSensorAPI : MonoBehaviour
 {
 
     [Header("General Configuration")] // change between ML2ToolTrackingManager or IRToolTrack if you are using the ML2IRTracking plugin or the scripts in C#
-    public ML2ToolTrackingManager streamVisualizer;
+    public ML2DepthRawStream streamVisualizer;
     //public IRToolTrack streamVisualizer;
 
     [SerializeField] XROrigin xrOrigin;
@@ -252,7 +252,6 @@ public class DepthSensorAPI : MonoBehaviour
 
             foreach (uint stream in configuredStreams)
             {
-                
 
                 if (pixelSensorFeature.GetSensorData(sensorId.Value, stream, out var frame, out var metaData,
                         Allocator.Temp, shouldFlipTexture: true))
@@ -269,8 +268,15 @@ public class DepthSensorAPI : MonoBehaviour
 
                     Debug.Log("Sensor Pose:" + sensorPose);
                     streamVisualizer.ProcessFrame(frame, metaData, sensorPose);
-                    
-                }
+
+                    // Proces the metadata if needed
+                    foreach (var entry in metaData)
+                    {
+                        if (entry is PixelSensorPinholeIntrinsics pinhole)
+                        {
+                            // Handle pinhole intrinsics metadata here if needed.
+                        }
+                    }
 
                 yield return null;
             }
