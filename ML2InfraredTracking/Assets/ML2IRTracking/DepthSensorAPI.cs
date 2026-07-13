@@ -219,7 +219,7 @@ public class DepthSensorAPI : MonoBehaviour
             if (pixelSensorFeature.EnumeratePixelSensorMetaDataTypes(sensorId.Value, stream, out var metaDataTypes))
             {
                 supportedMetadataTypes[stream] = metaDataTypes;
-                
+
             }
         }
 
@@ -240,11 +240,11 @@ public class DepthSensorAPI : MonoBehaviour
     }
 
     private IEnumerator MonitorSensorData()
-    {   
+    {
 
         // Initialize Stream ...
         streamVisualizer.Initialize(configuredStreams[0], pixelSensorFeature, sensorId.Value);
-        
+
 
         while (pixelSensorFeature.GetSensorStatus(sensorId.Value) ==
                PixelSensorStatus.Started)
@@ -257,7 +257,7 @@ public class DepthSensorAPI : MonoBehaviour
                         Allocator.Temp, shouldFlipTexture: true))
                 {
                     // Process Frames ...
-                    Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value,frame.CaptureTime);
+                    Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value, frame.CaptureTime);
 
                     if (xrOrigin)
                     {
@@ -278,7 +278,8 @@ public class DepthSensorAPI : MonoBehaviour
                         }
                     }
 
-                yield return null;
+                    yield return null;
+                }
             }
         }
     }
