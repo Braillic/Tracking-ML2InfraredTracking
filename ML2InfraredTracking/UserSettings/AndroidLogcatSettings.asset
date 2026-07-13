@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "G572XT10018Y",
         "name": "com.braillic.depthstreaming",
-        "processId": 10722,
+        "processId": 6439,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -52,38 +52,80 @@
         },
         {
             "deviceId": "G572XT10018Y",
-            "name": "com.UnityTechnologies.com.GitHubrepotrackingtest",
-            "processId": 13983,
-            "exited": false
-        },
-        {
-            "deviceId": "G572XT10018Y",
-            "name": "com.braillic.depthstreaming",
-            "processId": 29172,
-            "exited": false
-        },
-        {
-            "deviceId": "G572XT10018Y",
             "name": "com.braillic.depthstreaming",
             "processId": 2142,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "G572XT10018Y",
             "name": "com.braillic.depthstreaming",
             "processId": 29289,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "G572XT10018Y",
             "name": "com.braillic.depthstreaming",
             "processId": 31816,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "G572XT10018Y",
             "name": "com.braillic.depthstreaming",
             "processId": 10722,
+            "exited": true
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.magicleap.homemenu",
+            "processId": 5755,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 13004,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 14344,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 21397,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 25574,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 27323,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 31972,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 993,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 6439,
             "exited": false
         }
     ],

@@ -1,27 +1,55 @@
 ﻿using UnityEngine;
 using System;
-using System.Collections.Generic;
 using MagicLeap.OpenXR.Features.PixelSensors;
-using System.Text;
-using System.Linq;
+public readonly struct DepthCameraIntrinsics
+{
+    public const int BinarySize = 11 * sizeof(double);
+
+    public readonly double Fx, Fy, Cx, Cy, FovX, FovY;
+    public readonly double K1, K2, P1, P2, K3;
+
+    public DepthCameraIntrinsics(Vector2 focalLength, Vector2 principalPoint, Vector2 fov,
+        double[] distortion)
+    {
+        Fx = focalLength.x;
+        Fy = focalLength.y;
+        Cx = principalPoint.x;
+        Cy = principalPoint.y;
+        FovX = fov.x;
+        FovY = fov.y;
+        K1 = GetDistortion(distortion, 0);
+        K2 = GetDistortion(distortion, 1);
+        P1 = GetDistortion(distortion, 2);
+        P2 = GetDistortion(distortion, 3);
+        K3 = GetDistortion(distortion, 4);
+    }
+
+    private static double GetDistortion(double[] values, int index) =>
+        values != null && index < values.Length ? values[index] : 0.0;
+
+    public override string ToString() =>
+        $"Pinhole intrinsics\nFocal: ({Fx:F3}, {Fy:F3}) px\n" +
+        $"Principal: ({Cx:F3}, {Cy:F3}) px\nFOV: ({FovX:F3}, {FovY:F3}) deg\n" +
+        $"Distortion: [{K1:F6}, {K2:F6}, {P1:F6}, {P2:F6}, {K3:F6}]";
+}
 
 public class ML2DepthRawStream : MonoBehaviour
 {
     [Header("Tracking Data")]
     public Renderer targetRenderer;          // Renderer that previews the depth texture
     [SerializeField] private PixelSensorMaterialTable materialList = new();
+    [Tooltip("Optional. If omitted, a DepthFrameTcpServer is added at runtime with its default settings.")]
+    [SerializeField] private DepthFrameTcpServer depthTcpServer;
 
     Texture2D targetTexture, filteredTexture;
 
-    private float[] _cameraMatrixNative = new float[9];  // 3x3 fx,fy,cx,cy
-    private float[] _distCoeffsNative;                   // k1,k2,p1,p2,k3
     private float[] _floatBuffer;                        // CPU-side float[] depth map (meters) 
-    public String intrinsics = null;
-    private ulong _processedFrameCount;
+    private DepthCameraIntrinsics? intrinsics;
 
     // --- Rendering helpers ---
-    private MaterialPropertyBlock _mpb;
     private float minDepth = 0, maxDepth = 5;
+    private bool _loggedFloatFormat;
+    private bool _loggedUnexpectedBuffer;
 
     // ----------------- Helpers -----------------
 
@@ -38,24 +66,87 @@ public class ML2DepthRawStream : MonoBehaviour
             return null;
         }
 
-        var asFloat = firstPlane.ByteData.Reinterpret<float>(sizeof(float));
-        if (asFloat.Length == size)
+        if (firstPlane.ByteData.Length % sizeof(float) == 0)
         {
+            var asFloat = firstPlane.ByteData.Reinterpret<float>(sizeof(float));
             if (buffer == null || buffer.Length != size) buffer = new float[size];
-            asFloat.CopyTo(buffer);
-            Debug.LogWarning("[ML2Tracking] Depth interpreted as FLOAT32.");
-            return buffer;
+
+            if (asFloat.Length == size)
+            {
+                asFloat.CopyTo(buffer);
+                LogFloatFormat(firstPlane, false);
+                return buffer;
+            }
+
+            int rowStrideFloats = firstPlane.Stride % sizeof(float) == 0
+                ? (int)firstPlane.Stride / sizeof(float)
+                : 0;
+            if (rowStrideFloats >= (int)firstPlane.Width &&
+                asFloat.Length >= rowStrideFloats * (int)firstPlane.Height)
+            {
+                int width = (int)firstPlane.Width;
+                int height = (int)firstPlane.Height;
+                for (int y = 0; y < height; y++)
+                {
+                    int sourceOffset = y * rowStrideFloats;
+                    int targetOffset = y * width;
+                    for (int x = 0; x < width; x++)
+                        buffer[targetOffset + x] = asFloat[sourceOffset + x];
+                }
+
+                LogFloatFormat(firstPlane, true);
+                return buffer;
+            }
         }
 
+        if (!_loggedUnexpectedBuffer)
+        {
+            Debug.LogError($"[ML2Tracking] Cannot stream DepthRaw plane as FLOAT32: " +
+                           $"{firstPlane.Width}x{firstPlane.Height}, bytes={firstPlane.ByteData.Length}, " +
+                           $"bytesPerPixel={firstPlane.BytesPerPixel}, stride={firstPlane.Stride}.");
+            _loggedUnexpectedBuffer = true;
+        }
 
         return null;
+    }
+
+    private void LogFloatFormat(in PixelSensorPlane plane, bool removedRowPadding)
+    {
+        if (_loggedFloatFormat) return;
+
+        Debug.Log($"[ML2Tracking] Depth interpreted as FLOAT32" +
+                  $"{(removedRowPadding ? " (row padding removed)" : string.Empty)}. " +
+                  $"{plane.Width}x{plane.Height}, stride={plane.Stride}.");
+        _loggedFloatFormat = true;
+    }
+
+    private void CaptureIntrinsicsOnce(in PixelSensorMetaData[] metaData)
+    {
+        if (intrinsics.HasValue) return;
+
+        foreach (var entry in metaData)
+        {
+            if (entry is not PixelSensorPinholeIntrinsics pinhole) continue;
+
+            intrinsics = new DepthCameraIntrinsics(pinhole.FocalLength, pinhole.PrincipalPoint,
+                pinhole.FOV, pinhole.Distortion);
+            Debug.Log($"[ML2Tracking] Captured intrinsics for one-time transmission.\n{intrinsics}");
+            return;
+        }
     }
 
     private void Start()
     {
         Debug.Log("[ML2Tracking] Start() - initializing preview, native handles and calibration.");
 
-        _mpb = new MaterialPropertyBlock();
+        // OnEnable runs before Start, so this also prevents a stale serialized
+        // reference from feeding a duplicate server that could not bind the port.
+        if (DepthFrameTcpServer.ActiveServer != null)
+            depthTcpServer = DepthFrameTcpServer.ActiveServer;
+        else if (depthTcpServer == null)
+            depthTcpServer = GetComponent<DepthFrameTcpServer>();
+        if (depthTcpServer == null)
+            depthTcpServer = gameObject.AddComponent<DepthFrameTcpServer>();
 
         // Assign the material 
         var mat = materialList.GetMaterialForFrameType(PixelSensorFrameType.DepthRaw);
@@ -114,33 +205,18 @@ public class ML2DepthRawStream : MonoBehaviour
         {
             case PixelSensorFrameType.DepthRaw:
                 {
+                    CaptureIntrinsicsOnce(metaData);
+
                     // Build a CPU float[] depth map (meters) for the native pipeline
                     var depthData = GetRawDepthData(in frame, ref _floatBuffer);
                     if (depthData == null) return;
 
-                    targetRenderer.material.mainTexture = targetTexture;
+                    depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics);
+
+                    if (targetRenderer != null)
+                        targetRenderer.material.mainTexture = targetTexture;
 
                     //Matrix4x4 worldTsensor = Matrix4x4.TRS(sensorPose.position, sensorPose.rotation, Vector3.one);
-
-
-                    // Proces the metadata if needed
-                    if (intrinsics is null)
-                        foreach (var entry in metaData)
-                        {
-                            if (entry is PixelSensorPinholeIntrinsics pinhole)
-                            {
-                                StringBuilder builder = new();
-                                //out_pinholeIntrinsics = pinholeIntrinsics;
-                                builder.AppendLine($"[Pinhole Intrinsics]");
-                                builder.AppendLine($"FOV: {pinhole.FOV}");
-                                builder.AppendLine($"Focal Length: {pinhole.FocalLength}");
-                                builder.AppendLine($"Principal Point: {pinhole.PrincipalPoint}");
-                                builder.AppendLine(
-                                    $"Pinhole Distortion [k1, k2, p1, p2, k3]: [{string.Join(',', pinhole.Distortion.Select(val => val.ToString("F1")))}]");
-
-                                intrinsics = builder.ToString();
-                            }
-                        }
                 }
                 break;
             default:

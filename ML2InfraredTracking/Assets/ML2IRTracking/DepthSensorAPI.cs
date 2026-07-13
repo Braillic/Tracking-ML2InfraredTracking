@@ -191,7 +191,18 @@ public class DepthSensorAPI : MonoBehaviour
                 else if (range.CapabilityType == PixelSensorCapabilityType.Format)
                 {
                     var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    configData.IntValue = (uint)range.FrameFormats[UseRawDepth ? 1 : 0];
+                    PixelSensorFrameFormat desiredFormat = UseRawDepth
+                        ? PixelSensorFrameFormat.DepthRaw
+                        : PixelSensorFrameFormat.Depth32;
+                    if (range.FrameFormats == null || !range.FrameFormats.Contains(desiredFormat))
+                    {
+                        Debug.LogError($"Requested pixel sensor format {desiredFormat} is unavailable. " +
+                                       $"Supported: {string.Join(", ", range.FrameFormats ?? Array.Empty<PixelSensorFrameFormat>())}");
+                        continue;
+                    }
+
+                    Debug.Log($"Configuring pixel sensor format: {desiredFormat}");
+                    configData.IntValue = (uint)desiredFormat;
                     pixelSensorFeature.ApplySensorConfig(sensorId.Value, configData);
                 }
                 else if (range.CapabilityType == PixelSensorCapabilityType.Resolution)
