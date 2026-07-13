@@ -2434,9 +2434,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   streamVisualizer: {fileID: 1591841588}
   xrOrigin: {fileID: 1387163547}
-  UseRawDepth: 1
-  DepthRange: 0.5
-  SRUpdateRate: 30
+  UseRawDepth: 0
+  DepthRange: 1
+  SRUpdateRate: 60
   LRUpdateRate: 5
 --- !u!114 &1591841588
 MonoBehaviour:

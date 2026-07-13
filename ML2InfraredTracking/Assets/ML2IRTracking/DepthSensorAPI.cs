@@ -24,19 +24,19 @@ public class DepthSensorAPI : MonoBehaviour
 
     [Range(0.2f, 5.00f)] public float DepthRange;
 
-    [Header("ShortRange =< 1m")] public ShortRangeUpdateRate SRUpdateRate;
+    // [Header("ShortRange =< 1m")] public ShortRangeUpdateRate SRUpdateRate;
 
-    [Header("LongRange > 1m")] public LongRangeUpdateRate LRUpdateRate;
+    // [Header("LongRange > 1m")] public LongRangeUpdateRate LRUpdateRate;
 
-    public enum LongRangeUpdateRate
-    {
-        OneFps = 1, FiveFps = 5
+    // public enum LongRangeUpdateRate
+    // {
+    //     OneFps = 1, FiveFps = 5
 
-    }
-    public enum ShortRangeUpdateRate
-    {
-        FiveFps = 5, ThirtyFps = 30, SixtyFps = 60
-    }
+    // }
+    // public enum ShortRangeUpdateRate
+    // {
+    //     FiveFps = 5, ThirtyFps = 30, SixtyFps = 60
+    // }
 
     private const string depthCameraSensorPath = "/pixelsensor/depth/center";
 
@@ -166,8 +166,24 @@ public class DepthSensorAPI : MonoBehaviour
                 if (range.CapabilityType == PixelSensorCapabilityType.UpdateRate)
                 {
                     var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    configData.IntValue = DepthRange > 1 ? (uint)LRUpdateRate : (uint)SRUpdateRate;
+                    
+                    uint maxUpdateRate = 5; 
+                    if (range.IntValues != null && range.IntValues.Length > 0)
+                    {
+                        foreach (uint intValue in range.IntValues)
+                        {
+                            Debug.Log($"UpdateRate RangeIntValues : {intValue}");
+                            if (intValue > maxUpdateRate)
+                            {
+                                maxUpdateRate = intValue;
+                            }
+                        }
+
+                        configData.IntValue = maxUpdateRate;
+                    }
+
                     pixelSensorFeature.ApplySensorConfig(sensorId.Value, configData);
+
                 }
                 else if (range.CapabilityType == PixelSensorCapabilityType.Format)
                 {
