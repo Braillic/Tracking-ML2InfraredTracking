@@ -1,6 +1,7 @@
 ﻿#region
 
 using System;
+using System.Reflection;
 using MagicLeap.SetupTool.Editor.Interfaces;
 using MagicLeap.SetupTool.Editor.Utilities;
 using UnityEditor;
@@ -81,14 +82,27 @@ namespace MagicLeap.SetupTool.Editor.Setup
 			EditorPrefs.SetInt(SWITCHING_PLATFORM_PREF, 0);
 			Refresh();
 			bool success = EditorUserBuildSettings.SwitchActiveBuildTargetAsync(BuildTargetGroup.Android, BuildTarget.Android);
+
+#if UNITY_2023_1_OR_NEWER
+			//Required to avoid issues with reloading
+			UnityProjectSettingsUtility.ShowBuildProfileWindowViaReflection();
+#endif
 			if (!success)
 			{
 				
 				var openBuildTargetMenu = EditorUtility.DisplayDialog(FAILD_TO_SWITCH_BUILD_TARGET_DIALOG_HEADER, FAILD_TO_SWITCH_BUILD_TARGET_DIALOG_BODY, FAILD_TO_SWITCH_BUILD_TARGET_DIALOG_OK, FAILD_TO_SWITCH_BUILD_TARGET_DIALOG_CANCEL);
 				if (openBuildTargetMenu)
 				{
-					EditorWindow.GetWindow(System.Type.GetType("UnityEditor.BuildPlayerWindow,UnityEditor"));
+					
+#if UNITY_2023_1_OR_NEWER
+					UnityProjectSettingsUtility.ShowBuildProfileWindowViaReflection();
+
+#else
+      				EditorWindow.GetWindow(System.Type.GetType("UnityEditor.BuildPlayerWindow,UnityEditor"));
 					EditorApplication.ExecuteMenuItem("File/Build Settings...");
+#endif
+
+
 				}
 				else
 				{

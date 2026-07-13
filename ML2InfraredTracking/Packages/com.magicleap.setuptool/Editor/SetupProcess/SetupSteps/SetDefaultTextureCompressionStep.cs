@@ -36,13 +36,18 @@ namespace MagicLeap.SetupTool.Editor.Setup
 		public void Refresh()
 		{
 			_isNormalMapCompressionSet = UnityProjectSettingsUtility.IsNormalMapCompressionSet(BuildTargetGroup.Android,REQUIRED_NORMAL_MAP_COMPRESSION_LABEL);
-			_isTextureCompressionSet = UnityProjectSettingsUtility.IsTextureCompressionSet(BuildTargetGroup.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC_RGTC) || UnityProjectSettingsUtility.IsTextureCompressionSet(BuildTargetGroup.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC);
-		
+
+#if UNITY_2023_1_OR_NEWER
+			_isTextureCompressionSet = UnityProjectSettingsUtility.IsTextureCompressionSet(BuildTarget.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC_RGTC) || UnityProjectSettingsUtility.IsTextureCompressionSet(BuildTarget.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC);
+#else
+		_isTextureCompressionSet = UnityProjectSettingsUtility.IsTextureCompressionSet(BuildTargetGroup.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC_RGTC) || UnityProjectSettingsUtility.IsTextureCompressionSet(BuildTargetGroup.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC);
+#endif
+	
 		}
 
 		private bool EnableGUI()
 		{
-			var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android && MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+			var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android && XRPackageUtility.IsMagicLeapSDKInstalled;
 			return correctBuildTarget;
 		}
 		/// <inheritdoc />
@@ -98,7 +103,12 @@ namespace MagicLeap.SetupTool.Editor.Setup
 			}
 			if (!_isTextureCompressionSet)
 			{
+#if UNITY_2023_1_OR_NEWER
+				UnityProjectSettingsUtility.SetTextureCompression(BuildTarget.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC_RGTC);
+#else
 				UnityProjectSettingsUtility.SetTextureCompression(BuildTargetGroup.Android, REQUIRED_TEXTURE_COMPRESSION_LABEL_DXTC_RGTC);
+#endif
+
 			}
 
 			Refresh();
@@ -117,7 +127,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 			if (!EnableGUI())
 			{
 				var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-				var hasSdkInstalled =  MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+				var hasSdkInstalled =  XRPackageUtility.IsMagicLeapSDKInstalled;
 				info += "\nDisabling GUI: ";
 				if (!correctBuildTarget)
 				{

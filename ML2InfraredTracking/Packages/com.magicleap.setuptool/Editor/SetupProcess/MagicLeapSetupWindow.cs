@@ -1,4 +1,5 @@
 #region
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -53,7 +54,7 @@ namespace MagicLeap.SetupTool.Editor
         private static MagicLeapSetupWindow _setupWindow;
         private static  ApplyAllRunner _applyAllRunner;
         private static Texture2D _logo;
-
+        private static bool _stepsComplete;
         private static bool _loading
         {
             get
@@ -93,20 +94,11 @@ namespace MagicLeap.SetupTool.Editor
         {
 
          _stepsToComplete = new ISetupStep[] {
-                                                 new SetSdkFolderSetupStep(),
                                                  new BuildTargetSetupStep(),
                                                  new ImportMagicLeapSdkStep(),
-                                                 #if USE_MLSDK
-                                                 new EnablePluginStep(),
-                                                 #else
                                                  new EnableOpenXRPluginStep(),
-                                                 #endif
                                                  new SetDefaultTextureCompressionStep(),
-                                                 #if USE_MLSDK
-                                                 new FixValidationSetup(),
-                                                 #else
                                                  new FixOpenXRValidationSetup(),
-                                                 #endif
                                                  new ColorSpaceSetupStep(),
                                                  new SetTargetArchitectureStep(),
                                                  new SetScriptingBackendStep(),
@@ -206,60 +198,12 @@ namespace MagicLeap.SetupTool.Editor
         }
 
         
-        public bool IsDrawingMissingSdkInfo()
-        {
 
-            if (string.IsNullOrWhiteSpace(MagicLeapPackageUtility.GetLatestSDKPath()))
-            {
-                EditorGUILayout.Space(10);
-                EditorGUILayout.HelpBox(NO_SDK_FOUND_LABEL, MessageType.Warning, true);
-                EditorGUILayout.Space(5);
-                GUILayout.BeginHorizontal();
-                {
-                    GUILayout.FlexibleSpace();
-                    if (GUILayout.Button(DOWNLOAD_HUB_BUTTON_LABEL, GUILayout.MinWidth(100), GUILayout.MinHeight(22)))
-                    {
-                        Process.Start(DOWNLOAD_HUB_URL);
-                    }
-
-                    if (GUILayout.Button(SET_PATH_BUTTON_LABEL, GUILayout.MinWidth(100), GUILayout.MinHeight(22)))
-                    {
-                        var root = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                        if (string.IsNullOrEmpty(root))
-                        {
-                            root = Environment.GetEnvironmentVariable("HOME");
-                        }
-
-                        var directoryToUse = root;
-                        if (!string.IsNullOrEmpty(root))
-                        {
-                            var sdkRoot = Path.Combine(root, "MagicLeap/mlsdk/").Replace("\\", "/");
-                            if (Directory.Exists(sdkRoot))
-                            {
-                                directoryToUse = sdkRoot;
-                            }
-                        }
-                       
-                       
-
-                        var path = EditorUtility.OpenFolderPanel(SELECT_SDK_LOCATION_TITLE, directoryToUse,null);
-                        MagicLeapPackageUtility.SetSDKEditorPrefLocation(path);
-                    }
-                }
-                GUILayout.EndHorizontal();
-                return true;
-            }
-
-            return false;
-        }
         public void OnGUI()
         {
             DrawHeader();
         
-            if (IsDrawingMissingSdkInfo())
-            {
-                return;
-            }
+       
        
             if (_loading || ApplyAllRunner.Running)
             {
@@ -309,11 +253,14 @@ namespace MagicLeap.SetupTool.Editor
             foreach (var setupStep in _stepsToComplete)
             {
                 setupStep.Refresh();
+
             }
+
+            _stepsComplete = _applyAllRunner.AllAutoStepsComplete;
 #if ML_SETUP_DEBUG
             Debug.Log($"Setup Step Info:\n----\n{string.Join("\n----\n",_stepsToComplete.ToList())}\n----");
 #endif
-       
+
         }
 
         private static void Open()
@@ -466,7 +413,7 @@ namespace MagicLeap.SetupTool.Editor
             var currentGUIEnabledStatus = GUI.enabled;
             GUI.enabled = !_loading;
 
-            if (_applyAllRunner.AllAutoStepsComplete)
+            if (_stepsComplete)
             {
                 GUI.backgroundColor = Color.green;
                 if (GUILayout.Button(CLOSE_BUTTON_LABEL, GUILayout.MinWidth(20), GUILayout.MinHeight(30))) Close();

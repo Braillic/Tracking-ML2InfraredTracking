@@ -1,6 +1,6 @@
 using System;
 using UnityEditor;
-using UnityEngine;
+
 
 namespace MagicLeap.SetupTool.Editor.Utilities
 {
@@ -18,14 +18,25 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 			{
 				if (targetGroup == BuildTargetGroup.Unknown || IsObsolete(targetGroup)) continue;
 
-				var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+			
+				
+#if UNITY_2023_1_OR_NEWER
+				var namedBuildTarget = UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(targetGroup);
+				var defineSymbols = PlayerSettings.GetScriptingDefineSymbols(namedBuildTarget);
+#else
+            	var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#endif
 
 				if (defineSymbols.Contains(define))
 				{
 					defineSymbols = defineSymbols.Replace($"{define};", "");
 					defineSymbols = defineSymbols.Replace(define, "");
 
-					PlayerSettings.SetScriptingDefineSymbolsForGroup(targetGroup, defineSymbols);
+#if UNITY_2023_1_OR_NEWER
+					PlayerSettings.SetScriptingDefineSymbols(namedBuildTarget, defineSymbols);
+#else
+      				PlayerSettings.SetScriptingDefineSymbolsForGroup(targetGroup, defineSymbols);
+#endif
 				}
 			}
 		}
@@ -37,7 +48,12 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 			{
 				if (targetGroup == BuildTargetGroup.Unknown || IsObsolete(targetGroup)) continue;
 
-				var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#if UNITY_2023_1_OR_NEWER
+				var namedBuildTarget = UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(targetGroup);
+				var defineSymbols = PlayerSettings.GetScriptingDefineSymbols(namedBuildTarget);
+#else
+            	var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#endif
 
 				if (!defineSymbols.Contains(define))
 				{
@@ -48,7 +64,12 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 					else
 						defineSymbols = $"{defineSymbols};{define}";
 
-					PlayerSettings.SetScriptingDefineSymbolsForGroup(targetGroup, defineSymbols);
+#if UNITY_2023_1_OR_NEWER
+					PlayerSettings.SetScriptingDefineSymbols(namedBuildTarget, defineSymbols);
+#else
+      				PlayerSettings.SetScriptingDefineSymbolsForGroup(targetGroup, defineSymbols);
+#endif
+	
 				}
 			}
 		}
@@ -61,7 +82,12 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 			{
 				if (targetGroup== BuildTargetGroup.EmbeddedLinux || targetGroup== BuildTargetGroup.LinuxHeadlessSimulation || targetGroup == BuildTargetGroup.Unknown || IsObsolete(targetGroup)) continue;
 
-				var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#if UNITY_2023_1_OR_NEWER
+				var namedBuildTarget = UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(targetGroup);
+				var defineSymbols = PlayerSettings.GetScriptingDefineSymbols(namedBuildTarget);
+#else
+            	var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#endif
 				contains = defineSymbols.Contains(symbol);
 				if (!contains)
 				{
@@ -79,7 +105,12 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 			{
 				if (targetGroup == BuildTargetGroup.Unknown || IsObsolete(targetGroup)) continue;
 
-				var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#if UNITY_2023_1_OR_NEWER
+				var namedBuildTarget = UnityEditor.Build.NamedBuildTarget.FromBuildTargetGroup(targetGroup);
+				var defineSymbols = PlayerSettings.GetScriptingDefineSymbols(namedBuildTarget);
+#else
+            	var defineSymbols = PlayerSettings.GetScriptingDefineSymbolsForGroup(targetGroup);
+#endif
 				contains = defineSymbols.Contains(symbol);
 				if (contains)
 				{

@@ -48,7 +48,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 		private bool EnableGUI()
 		{
 			var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-			var hasSdkInstalled = MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+			var hasSdkInstalled =XRPackageUtility.IsMagicLeapSDKInstalled;
 			return correctBuildTarget && hasSdkInstalled;
 
 		}
@@ -140,7 +140,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 			if (!EnableGUI())
 			{
 				var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-				var hasSdkInstalled =  MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+				var hasSdkInstalled =  XRPackageUtility.IsMagicLeapSDKInstalled;
 				info += "\nDisabling GUI: ";
 				if (!correctBuildTarget)
 				{

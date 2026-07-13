@@ -27,7 +27,21 @@ namespace MagicLeap.SetupTool.Editor.Utilities
             url = "https://registry.npmjs.org",
             scopes = new[] {"com.magicleap"}
         };
-        public static async Task<bool> AddRegistry()
+        public static void AddRegistry(Action complete)
+        {
+            if (!ContainsMLRegistry(PackageManifest))
+            {
+                AddMLRegistryToManifest(PackageManifest);
+            }
+
+            EditorApplication.delayCall += DelayEditorCall;
+
+            void DelayEditorCall()
+            {
+                complete?.Invoke();
+            }
+        }
+        public static async Task<bool> AddRegistryAsync()
         {
             var tcs = new TaskCompletionSource<bool>();
             try
@@ -36,6 +50,7 @@ namespace MagicLeap.SetupTool.Editor.Utilities
                 {
                     AddMLRegistryToManifest(PackageManifest);
                 }
+
                 EditorApplication.delayCall += () =>
                 {
                     tcs.SetResult(true);
@@ -43,19 +58,38 @@ namespace MagicLeap.SetupTool.Editor.Utilities
             }
             catch (Exception e)
             {
-                tcs.SetResult(false);
                 Debug.LogError($"Cannot add registry: {e}");
+                tcs.SetResult(false);
             }
+
             return await tcs.Task;
         }
+        public static async Task RefreshAndUpdate()
+        {
+            AssetDatabase.SaveAssets();
+            AssetDatabase.RefreshSettings();
+            AssetDatabase.Refresh();
+  
+            var tcs = new TaskCompletionSource<bool>();
+            EditorApplication.delayCall += () =>
+            {
+                SettingsService.RepaintAllSettingsWindow();
+                tcs.SetResult(true);
+            };
 
-        public static async Task<bool> InstallSdkPackage()
+             await tcs.Task;
+        }
+        public static async Task<bool> InstallSdkPackageAsync()
         {
             var tcs = new TaskCompletionSource<bool>();
-            InstallMlsdkPackage((success) =>
+            EditorApplication.delayCall += () =>
             {
-                tcs.SetResult(success);
-            });
+                InstallSdkPackage((success) =>
+                {
+                    tcs.SetResult(success);
+                });
+            };
+
             return await tcs.Task;
         }
         
@@ -66,7 +100,7 @@ namespace MagicLeap.SetupTool.Editor.Utilities
                 AddMLRegistryToManifest(PackageManifest);
             }
 
-            EditorApplication.delayCall += () => { InstallMlsdkPackage(success); };
+            EditorApplication.delayCall += () => { InstallSdkPackage(success); };
         }
         private static void InstallOpenXrPackage(Action<bool> success)
         {
@@ -89,7 +123,7 @@ namespace MagicLeap.SetupTool.Editor.Utilities
             }
         }
 
-        private static void InstallMlsdkPackage(Action<bool> success)
+        public static void InstallSdkPackage(Action<bool> success)
         {
             AddRequest addRequest = Client.Add(ML_UNITY_SDK);
 
@@ -104,7 +138,11 @@ namespace MagicLeap.SetupTool.Editor.Utilities
                         Debug.LogError(addRequest.Error.message);
                     }
 
-                    success.Invoke(addRequest.Status == StatusCode.Success);
+                    EditorApplication.delayCall +=()=> EditorHelpers.CallWhenNotBusy(() =>
+                    {
+                        success.Invoke(addRequest.Status == StatusCode.Success);
+                    });
+            
                     EditorApplication.update -= AddPackageProgress;
                 }
             }
@@ -114,7 +152,6 @@ namespace MagicLeap.SetupTool.Editor.Utilities
         {
             try
             {
-                Debug.Log($"Add {ML_UNITY_ML_SDK}");
                 AddRequest addRequest = Client.Add(ML_UNITY_ML_SDK);
 
                 EditorApplication.update += AddPackageProgress;
@@ -258,6 +295,9 @@ namespace MagicLeap.SetupTool.Editor.Utilities
                 stringBuilder.Append(jsonString.Substring(endIndex, jsonString.Length - endIndex));
 
                 File.WriteAllText(Path, stringBuilder.ToString());
+                AssetDatabase.SaveAssets();
+                AssetDatabase.Refresh();
+                Client.Resolve();
             }
 
             static int GetDependenciesStart(string json)

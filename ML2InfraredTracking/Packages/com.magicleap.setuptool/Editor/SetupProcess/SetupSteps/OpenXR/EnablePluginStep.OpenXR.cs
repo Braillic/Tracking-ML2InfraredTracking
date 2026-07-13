@@ -69,7 +69,6 @@ namespace MagicLeap.SetupTool.Editor.Setup
         public void Refresh()
         {
            
-            _hasRootSDKPath = MagicLeapPackageUtility.HasRootSDKPath;
             _correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
             _xrPluginSettingsEnabled = XRPackageUtility.XRPluginEnabled(LOADER_ID, BuildTargetGroup.Android);
             _xrFeatureSetEnabled = XRPackageUtility.XRFeatureSetEnabled(FEATURE_SET_ID, BuildTargetGroup.Android);
@@ -79,7 +78,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
    
         private bool EnableGUI()
         {
-            return _hasRootSDKPath && _correctBuildTarget && XRPackageUtility.HasSDKInstalled;
+            return _correctBuildTarget && XRPackageUtility.HasSDKInstalled;
         }
 
        
@@ -102,6 +101,10 @@ namespace MagicLeap.SetupTool.Editor.Setup
                 if (CustomGuiContent.CustomButtons.DrawConditionButton(ENABLE_FEATURE_SET_SETTINGS_LABEL, _xrFeatureSetEnabled,
                         CONDITION_MET_LABEL, ENABLE_FEATURE_SET_LABEL, Styles.FixButtonStyle))
                 {
+                    SettingsService.RepaintAllSettingsWindow();
+                    AssetDatabase.SaveAssets();
+                    AssetDatabase.RefreshSettings();
+                    AssetDatabase.Refresh();
                     Execute();
                     return true;
                 }
@@ -129,11 +132,11 @@ namespace MagicLeap.SetupTool.Editor.Setup
             }
 
       
-         
+         Debug.Log($"Set Settings");
             if (!_xrPluginSettingsEnabled)
             {
                 BusyCounter++;
-                XRPackageUtility.EnableXRPluginFinished += OnEnablXRPluginFinished;
+                XRPackageUtility.EnableXRPluginFinished += OnEnableXrPluginFinished;
 #if (OpenXR) 
                 XRPackageUtility.EnableXRPlugin<OpenXRLoader>(BuildTargetGroup.Android);
 #endif
@@ -153,8 +156,9 @@ namespace MagicLeap.SetupTool.Editor.Setup
 
         
 
-            void OnEnablXRPluginFinished(bool success)
+            void OnEnableXrPluginFinished(bool success)
             {
+                Debug.Log($"OnEnableXrPluginFinished: {success}");
                 if (success)
                 {
                     _xrPluginSettingsEnabled = XRPackageUtility.XRPluginEnabled(LOADER_ID, BuildTargetGroup.Android);
@@ -185,7 +189,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 #endif
                 BusyCounter--;
                 OnExecuteFinished?.Invoke();
-                XRPackageUtility.EnableXRPluginFinished -= OnEnablXRPluginFinished;
+                XRPackageUtility.EnableXRPluginFinished -= OnEnableXrPluginFinished;
             }
 
             UnityProjectSettingsUtility.OpenXRManagementWindow();

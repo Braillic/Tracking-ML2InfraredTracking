@@ -108,8 +108,7 @@ namespace MagicLeap.SetupTool.Editor
                 autoShow = EditorPrefs.GetBool(EditorKeyUtility.AutoShowEditorPrefKey, true);
             }
       
-            if (!MagicLeapPackageUtility.HasRootSDKPath
-                || !_hasMagicLeapInstalled
+            if ( !_hasMagicLeapInstalled
                 || EditorUserBuildSettings.activeBuildTarget != BuildTarget.Android)
             {
                 autoShow = true;

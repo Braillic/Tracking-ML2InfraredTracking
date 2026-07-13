@@ -164,7 +164,7 @@ namespace MagicLeap.SetupTool.Editor
         public static void CheckLastAutoSetupState()
         {
              var runnerStarted = EditorPrefs.GetInt(RUNNER_STARTED_PREF, 0);
-             if (runnerStarted == 1 && MagicLeapPackageUtility.IsMagicLeapSDKInstalled && EditorPrefs.GetInt(string.Format(CURRENT_INPUT_SYSTEM_PREF, EditorKeyUtility.GetProjectKey()), 0) != (int)UnityProjectSettingsUtility.InputSystemType)
+             if (runnerStarted == 1 && XRPackageUtility.IsMagicLeapSDKInstalled && EditorPrefs.GetInt(string.Format(CURRENT_INPUT_SYSTEM_PREF, EditorKeyUtility.GetProjectKey()), 0) != (int)UnityProjectSettingsUtility.InputSystemType)
              {
 #if ML_SETUP_DEBUG
                  Debug.Log($"resume");

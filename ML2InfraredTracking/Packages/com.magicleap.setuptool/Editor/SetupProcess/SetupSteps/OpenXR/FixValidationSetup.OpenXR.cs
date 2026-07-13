@@ -43,10 +43,11 @@ namespace MagicLeap.SetupTool.Editor.Setup
 		public bool IsComplete => _validationComplete;
 
 		/// <inheritdoc />
-		public bool CanExecute => MagicLeapPackageUtility.IsMagicLeapSDKInstalled &&  XRPackageUtility.HasSDKInstalled;
+		public bool CanExecute => XRPackageUtility.IsMagicLeapSDKInstalled &&  XRPackageUtility.HasSDKInstalled;
 
 		private bool _hasInteractionFeature;
 		private bool _automaticValidationStepsComplete;
+
 		/// <inheritdoc />
 		public bool Required => true;
 		
@@ -54,20 +55,37 @@ namespace MagicLeap.SetupTool.Editor.Setup
 		public void Refresh()
 		{
 #if (OpenXR)
-			OpenXRProjectValidation.GetCurrentValidationIssues(_unityValidationFailures, BuildTargetGroup.Android);
-			_hasInteractionFeature = HasInteractionFeature();
-			_automaticValidationStepsComplete = (NoValidationSteps()|| !_unityValidationFailures.Any(i => i.fixIt != null && i.fixItAutomatic));
+			EditorHelpers.CallWhenNotBusy(UpdateStatus,true);
 
-			_validationComplete =_hasInteractionFeature && _automaticValidationStepsComplete;
-		
-	
+
 #endif
 
 		}
+#if (OpenXR)
+		private void UpdateStatus()
+		{
+
+			if (EnableGUI() == false)
+			{
+				return;
+			}
+		
+			_hasInteractionFeature = HasInteractionFeature();
+			if (_hasInteractionFeature)
+			{
+				OpenXRProjectValidation.GetCurrentValidationIssues(_unityValidationFailures, BuildTargetGroup.Android);
+				_automaticValidationStepsComplete = (NoValidationSteps() ||
+				                                     !_unityValidationFailures.Any(i =>
+					                                     i.fixIt != null && i.fixItAutomatic));
+		
+			}
+			_validationComplete =_hasInteractionFeature && _automaticValidationStepsComplete;
+		}
+#endif
 		private bool EnableGUI()
 		{
 			var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-			var hasSdkInstalled = MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+			var hasSdkInstalled = XRPackageUtility.IsMagicLeapSDKInstalled;
 			return correctBuildTarget && hasSdkInstalled && XRPackageUtility.IsMagicLeapOpenXREnabled();
 
 		}
@@ -200,8 +218,19 @@ namespace MagicLeap.SetupTool.Editor.Setup
 		public bool HasInteractionFeature()
 		{
 #if (OpenXR)
+			if (OpenXRSettings.ActiveBuildTargetInstance == null)
+			{
+				Debug.LogWarning("ActiveBuildTargetInstance is null");
+				return false;
+			}
 			var settings = OpenXRSettings.GetSettingsForBuildTargetGroup(BuildTargetGroup.Android);
-			return settings != null && settings.GetFeatures<OpenXRInteractionFeature>().Any(f => f.enabled);
+			if (settings == false)
+			{
+				Debug.LogWarning("OpenXRSettings.GetSettingsForBuildTargetGroup(BuildTargetGroup.Android) is null");
+				return false;
+			}
+			var features = settings.GetFeatures<OpenXRInteractionFeature>();
+			return features.Any(f => f.enabled);
 #else
 			return false;
 #endif
@@ -214,7 +243,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 			if (!EnableGUI())
 			{
 				var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-				var hasSdkInstalled = MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+				var hasSdkInstalled = XRPackageUtility.IsMagicLeapSDKInstalled;
 				info += "\nDisabling GUI: ";
 				if (!XRPackageUtility.IsMagicLeapOpenXREnabled())
 				{
@@ -230,7 +259,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 				}
 			}
 			info += $"\nMore Info: AutomaticValidationStepsComplete: {_automaticValidationStepsComplete}, HasInteractionFeature: {_hasInteractionFeature}," +
-			        $" IsMagicLeapOpenXREnabled: {XRPackageUtility.IsMagicLeapOpenXREnabled()}, HasSDKInstalled: {MagicLeapPackageUtility.IsMagicLeapSDKInstalled}";
+			        $" IsMagicLeapOpenXREnabled: {XRPackageUtility.IsMagicLeapOpenXREnabled()}, HasSDKInstalled: {XRPackageUtility.IsMagicLeapSDKInstalled}";
 
 			return info;
 		}

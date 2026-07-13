@@ -2,6 +2,7 @@
 using MagicLeap.SetupTool.Editor.Interfaces;
 using MagicLeap.SetupTool.Editor.Utilities;
 using UnityEditor;
+using UnityEditor.Build;
 using UnityEngine;
 
 namespace MagicLeap.SetupTool.Editor.Setup
@@ -29,13 +30,17 @@ namespace MagicLeap.SetupTool.Editor.Setup
 		/// <inheritdoc />
 		public void Refresh()
 		{
-			
+#if UNITY_2023_1_OR_NEWER
+			_correctScriptingBackend = PlayerSettings.GetScriptingBackend(NamedBuildTarget.Android) == ScriptingImplementation.IL2CPP;
+#else
 			_correctScriptingBackend = PlayerSettings.GetScriptingBackend(BuildTargetGroup.Android) == ScriptingImplementation.IL2CPP;
+#endif
+
 		}
 
 		private bool EnableGUI()
 		{
-			var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android && MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+			var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android && XRPackageUtility.IsMagicLeapSDKInstalled;
 			return correctBuildTarget;
 		}
 		/// <inheritdoc />
@@ -62,8 +67,14 @@ namespace MagicLeap.SetupTool.Editor.Setup
 				Busy = false;
 				return;
 			}
+#if UNITY_2023_1_OR_NEWER
+			PlayerSettings.SetScriptingBackend(NamedBuildTarget.Android, ScriptingImplementation.IL2CPP);
+			_correctScriptingBackend = PlayerSettings.GetScriptingBackend(NamedBuildTarget.Android) == ScriptingImplementation.IL2CPP;
+#else
 			PlayerSettings.SetScriptingBackend(BuildTargetGroup.Android, ScriptingImplementation.IL2CPP);
 			_correctScriptingBackend = PlayerSettings.GetScriptingBackend(BuildTargetGroup.Android) == ScriptingImplementation.IL2CPP;
+#endif
+
 			Busy = false;
 			OnExecuteFinished?.Invoke();
 #if ML_SETUP_DEBUG
@@ -80,7 +91,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
 			if (!EnableGUI())
 			{
 				var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-				var hasSdkInstalled =  MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+				var hasSdkInstalled =  XRPackageUtility.IsMagicLeapSDKInstalled;
 				info += "\nDisabling GUI: ";
 				if (!correctBuildTarget)
 				{
@@ -91,7 +102,14 @@ namespace MagicLeap.SetupTool.Editor.Setup
 					info += "[Package is not installed]";
 				}
 			}
+			
+#if UNITY_2023_1_OR_NEWER
+			info += $"\nMore Info: CorrectScriptingBackend: {_correctScriptingBackend} | {PlayerSettings.GetScriptingBackend(NamedBuildTarget.Android)}";
+
+#else
 			info += $"\nMore Info: CorrectScriptingBackend: {_correctScriptingBackend} | {PlayerSettings.GetScriptingBackend(BuildTargetGroup.Android)}";
+#endif
+
 
 			return info;
 		}

@@ -189,8 +189,137 @@ namespace MagicLeap.SetupTool.Editor.Utilities
         {
             SettingsService.OpenProjectSettings("Project/XR Plug-in Management");
         }
+        
+#if SETUP_TOOL_TESTING
+     [MenuItem("Tools/Force Close Project Settings")]
+#endif
+        public static void ForceCloseProjectSettings()
+        {
+            // Use reflection to find the Project Settings window type
+            var projectSettingsType = typeof(UnityEditor.Editor).Assembly.GetType("UnityEditor.SettingsWindow");
+            if (projectSettingsType == null)
+            {
+                Debug.LogError("Could not find Project Settings window type.");
+                return;
+            }
 
-    
+            // Get the currently open Project Settings window, if any
+            var projectSettingsWindow = EditorWindow.GetWindow(projectSettingsType, false, "Project Settings", false);
+            if (projectSettingsWindow != null)
+            {
+                // Close the window
+                projectSettingsWindow.Close();
+                Debug.Log("Project Settings window closed.");
+            }
+            else
+            {
+                Debug.Log("Project Settings window is not open.");
+            }
+        }
+#if SETUP_TOOL_TESTING
+     [MenuItem("Tools/Refresh XR Plug-in Management Settings")]
+#endif
+        public static void RefreshXRSettings()
+        {
+            // Open the XR Plug-in Management settings
+            SettingsService.OpenProjectSettings("Project/XR Plug-in Management");
+
+            // Repaint the window to ensure UI updates
+            EditorApplication.delayCall += RepaintXRSettingsWindow;
+        
+            Debug.Log("XR Plug-in Management settings refreshed.");
+        }
+#if SETUP_TOOL_TESTING
+     [MenuItem("Tools/Show Build Profile Window")]
+#endif
+        public static void ShowBuildProfileWindowViaReflection()
+        {
+            // Fully qualified name of the class including namespace
+            var typeName = "UnityEditor.Build.Profile.BuildProfileWindow, UnityEditor";
+        
+            // Get the Type
+            var type = Type.GetType(typeName);
+            if (type == null)
+            {
+                EditorApplication.ExecuteMenuItem("File/Build Profiles");
+                return;
+            }
+
+            // Find the static method 'ShowBuildProfileWindow'
+            var method = type.GetMethod("ShowBuildProfileWindow", BindingFlags.Static | BindingFlags.Public);
+            if (method == null)
+            {
+                EditorApplication.ExecuteMenuItem("File/Build Profiles");
+                return;
+            }
+
+            // Invoke the method (null for static methods)
+            method.Invoke(null, null);
+            EditorApplication.ExecuteMenuItem("File/Build Profiles");
+        }
+        private static void RepaintXRSettingsWindow()
+        {
+            // Get the Settings window using reflection
+            var settingsWindowType = typeof(UnityEditor.Editor).Assembly.GetType("UnityEditor.SettingsWindow");
+            if (settingsWindowType == null)
+            {
+                Debug.LogError("Settings window type not found.");
+                return;
+            }
+
+            // Find the open Settings window
+            var settingsWindow = EditorWindow.GetWindow(settingsWindowType, false, "Project Settings");
+            if (settingsWindow != null)
+            {
+                // Force repaint to refresh UI
+                settingsWindow.Repaint();
+                Debug.Log("Settings window repainted.");
+            }
+        }
+        
+#if UNITY_2023_1_OR_NEWER
+        /// <summary>
+        /// Checks if the current compression is set to a specified value:<br/>
+        /// - Unknown<br/>
+        /// - ETC<br/>
+        /// - ETC2<br/>
+        /// - ASTC<br/>
+        /// - PCRTC<br/>
+        /// - DXTC<br/>
+        /// - BPTC<br/>
+        /// checked using reflections <a href="https://github.com/Unity-Technologies/UnityCsReference/blob/master/Editor/Mono/PlayerSettings.bindings.cs">See source</a> .
+        /// </summary>
+        /// <param name="buildTarget"> </param>
+        /// <param name="label"></param>
+        /// <returns></returns>
+        public static bool IsTextureCompressionSet(BuildTarget buildTarget, string label)
+        {
+          
+            var textureCompressionFormat = GetTextureCompressionFormat(label);
+            if (textureCompressionFormat == null)
+            {
+                Debug.LogWarningFormat(CANNOT_FIND, label);
+                return false;
+            }
+
+            try
+            {
+                var getDefaultTextureCompressionMethodInfo = _playerSettingsType.GetMethod("GetDefaultTextureCompressionFormat", BindingFlags.Static | BindingFlags.NonPublic);
+               
+                var enabledStateResult = getDefaultTextureCompressionMethodInfo.Invoke(null, new object[] { buildTarget });
+                return Convert.ToInt32(textureCompressionFormat) == Convert.ToInt32(enabledStateResult);
+               
+            }
+            catch 
+            {
+                Debug.LogWarningFormat(CANNOT_CALL, "UnityEditor.PlayerSettings.GetDefaultTextureCompressionFormat(BuildTarget buildTarget)");
+            }
+
+            return false;
+        }
+
+#else
+        
         /// <summary>
         /// Checks if the current compression is set to a specified value:<br/>
         /// - Unknown<br/>
@@ -219,8 +348,8 @@ namespace MagicLeap.SetupTool.Editor.Utilities
             {
                 var getDefaultTextureCompressionMethodInfo = _playerSettingsType.GetMethod("GetDefaultTextureCompressionFormat", BindingFlags.Static | BindingFlags.NonPublic);
                
-                    var enabledStateResult = getDefaultTextureCompressionMethodInfo.Invoke(null, new object[] { buildTargetGroup });
-                    return Convert.ToInt32(textureCompressionFormat) == Convert.ToInt32(enabledStateResult);
+                var enabledStateResult = getDefaultTextureCompressionMethodInfo.Invoke(null, new object[] { buildTargetGroup });
+                return Convert.ToInt32(textureCompressionFormat) == Convert.ToInt32(enabledStateResult);
                
             }
             catch 
@@ -230,6 +359,9 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 
             return false;
         }
+#endif
+
+
         
         /// <summary>
         /// Checks if the current normal map compression is set to a specified value:<br/>
@@ -296,6 +428,39 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 
    
         }
+#if UNITY_2023_1_OR_NEWER
+        /// <summary>
+        /// Sets the Default Texture Compression Format.
+        /// <a href="https://github.com/Unity-Technologies/UnityCsReference/blob/master/Editor/Mono/PlayerSettings.bindings.cs">See source</a> .
+        /// </summary>
+        /// <param name="buildTarget"> </param>
+        /// <param name="label"></param>
+        /// <returns></returns>
+        public static void SetTextureCompression(BuildTarget buildTarget, string label)
+        {
+       
+            var textureCompressionFormat = GetTextureCompressionFormat(label);
+            if (textureCompressionFormat == null)
+            {
+                Debug.LogWarning($"Could not find [{label}]");
+                return;
+            }
+            try
+            {
+                var setDefaultTextureCompressionMethodInfo = _playerSettingsType.GetMethod("SetDefaultTextureCompressionFormat", BindingFlags.Static | BindingFlags.NonPublic);
+                
+                setDefaultTextureCompressionMethodInfo.Invoke(null, new object[] { buildTarget, textureCompressionFormat});
+
+            }
+            catch (Exception)
+            {
+                Debug.LogWarningFormat(CANNOT_CALL, "UnityEditor.PlayerSettings.SetDefaultTextureCompressionFormat(BuildTarget, TextureCompressionFormat)");
+            }
+
+   
+        }
+
+#else
         
         /// <summary>
         /// Sets the Default Texture Compression Format.
@@ -310,8 +475,8 @@ namespace MagicLeap.SetupTool.Editor.Utilities
             var textureCompressionFormat = GetTextureCompressionFormat(label);
             if (textureCompressionFormat == null)
             {
-              Debug.LogWarning($"Could not find [{label}]");
-              return;
+                Debug.LogWarning($"Could not find [{label}]");
+                return;
             }
             try
             {
@@ -327,6 +492,8 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 
    
         }
+#endif
+
 
         /// <summary>
         /// Gets the object value of the Texture Compression Format Enum for reflection calls.

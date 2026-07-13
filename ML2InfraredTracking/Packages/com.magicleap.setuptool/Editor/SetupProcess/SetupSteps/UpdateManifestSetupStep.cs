@@ -39,7 +39,6 @@ namespace MagicLeap.SetupTool.Editor.Setup
         public bool Required => !HasRequiredPermissions();
         
         private static int _busyCounter;
-        private int _maxSdkApiLevel;
         private static bool _manifestIsUpdated;
         /// <inheritdoc />
         public Action OnExecuteFinished { get; set; }
@@ -81,11 +80,9 @@ namespace MagicLeap.SetupTool.Editor.Setup
         }
         /// <inheritdoc />
         public void Refresh()
-        {   
-          
-                _maxSdkApiLevel = MagicLeapPackageUtility.GetMaxAPILevel();
-               
-                _manifestIsUpdated = IsValidManifest();
+        {
+
+            _manifestIsUpdated = IsValidManifest();
           
             
         }
@@ -114,13 +111,13 @@ namespace MagicLeap.SetupTool.Editor.Setup
 
         bool IsValidManifest()
         {
-            return MagicLeapPackageUtility.MinimumAPILevel == _maxSdkApiLevel && HasRequiredPermissions();
+            return HasRequiredPermissions();
         }
 
         private bool EnableGUI()
         {
             
-            var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android && MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+            var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android && XRPackageUtility.IsMagicLeapSDKInstalled;
             return correctBuildTarget;
         }
         /// <inheritdoc />
@@ -159,7 +156,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
          
 
          
-            MagicLeapPackageUtility.MinimumAPILevel = _maxSdkApiLevel;
+
 
             for (var i = 0; i < RequiredPermissions.Length; i++)
             {
@@ -184,7 +181,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
             if (!EnableGUI())
             {
                 var correctBuildTarget = EditorUserBuildSettings.activeBuildTarget == BuildTarget.Android;
-                var hasSdkInstalled =  MagicLeapPackageUtility.IsMagicLeapSDKInstalled;
+                var hasSdkInstalled = XRPackageUtility.IsMagicLeapSDKInstalled;
                 info += "\nDisabling GUI: ";
                 if (!correctBuildTarget)
                 {
@@ -195,8 +192,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
                     info += "[Package is not installed]";
                 }
             }
-            info += $"\nMore Info: MinimumAPILevel: {MagicLeapPackageUtility.MinimumAPILevel}, MaxAPILevel: {MagicLeapPackageUtility.GetMaxAPILevel()}," +
-                    $" HasProjectManifest: {File.Exists(PROJECT_MANIFEST_PATH)}";
+            info += $"\n HasProjectManifest: {File.Exists(PROJECT_MANIFEST_PATH)}";
 
             return info;
         }

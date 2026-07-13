@@ -45,15 +45,6 @@ namespace MagicLeap.SetupTool.Editor.Setup
         private const string REGISTRY_PACKAGE_OPTION_BODY = "Would you like to install remote version of the Magic Leap SDK via Magic Leap's Registry?";
         private const string REGISTRY_PACKAGE_OPTION_OK = "Use Magic Leap Registry";
         private const string REGISTRY_PACKAGE_OPTION_CANCEL = "Use Local Copy";
-        private const string SELECT_SDK_DIALOG_USE_OPENXR_OPTION = "Use OpenXR";
-        private const string SELECT_SDK_DIALOG_USE_MLSDK_OPTION = "Use Magic Leap Sdk (deprecated)";
-        private const string SELECT_SDK_DIALOG_TITLE = "Use OpenXR SDK";
-        private const string SELECT_SDK_DIALOG_BODY = "Would you like to use the OpenXR or Magic Leap Sdk (deprecated)?";
-        private const string FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_OK = "Try again";
-        private const string FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_CANCEL = "Cancel";
-        private const string FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_TITLE = "Failed to import package";
-        private const string FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_BODY = "Would you like to try again?";
-        private const string FAILED_TO_IMPORT_PACKAGE_ERROR = "Failed to import package: {0}";
         
         public static bool HasMagicLeapSdkInPackageManager;
         private static int _busyCounter;
@@ -132,92 +123,24 @@ namespace MagicLeap.SetupTool.Editor.Setup
          
         }
 
-#if USE_ML_OPENXR  
-        [MenuItem("Magic Leap/Downgrade To MLSDK")]
-        public static async void DowngradeToMLSDK()
-        {
-            BusyCounter++;
-            var result = await PackageUtility.AddPackageAsync("com.unity.xr.magicleap");
-            
-            if (result)
-            {
-                Debug.Log("Added com.unity.xr.magicleap package");
-                BusyCounter++;
-                DefineSymbolUtility.RemoveDefineSymbol("USE_ML_OPENXR");
-                await EditorHelpers.WaitUntilNotBusy();
-                DefineSymbolUtility.AddDefineSymbol("USE_MLSDK");
-                AssetDatabase.SaveAssets();
-                AssetDatabase.RefreshSettings();
-                AssetDatabase.Refresh(ImportAssetOptions.Default);
-                BusyCounter--;
-                
-            }
-            else
-            {
-                Debug.LogError("Failed to remove package.");
-            }
-            
-        }
-#endif
+
     
 
         void CheckUnityMagicLeapPackage()
         {
             if (_loading || _dontTryImportAgain) return;
-              if (!DefineSymbolUtility.ContainsDefineSymbolInAllBuildTargets("USE_MLSDK") && !DefineSymbolUtility.ContainsDefineSymbolInAllBuildTargets("USE_ML_OPENXR"))
+              if (!DefineSymbolUtility.ContainsDefineSymbolInAllBuildTargets("USE_MLSDK"))
               {
-                  var useOpenXR = EditorUtility.DisplayDialog(SELECT_SDK_DIALOG_TITLE, SELECT_SDK_DIALOG_BODY, SELECT_SDK_DIALOG_USE_OPENXR_OPTION, SELECT_SDK_DIALOG_USE_MLSDK_OPTION);
-                  if (useOpenXR)
-                  {
-                      Debug.Log("Using OpenXR");
 #if UNITY_MAGICLEAP
-                  
                       UpgradeToOpenXR();
 #else
-                      DefineSymbolUtility.AddDefineSymbol("USE_ML_OPENXR");
+                  DefineSymbolUtility.AddDefineSymbol("USE_ML_OPENXR");
 #endif
-                  }
-                  else
-                  {
-                      Debug.Log("Using deprecated Magic Leap Sdk");
-                      DefineSymbolUtility.AddDefineSymbol("USE_MLSDK");
-
-                  }
               }
               
-                                                   
-#if USE_MLSDK && !UNITY_MAGICLEAP
-            ImportUnityMagicLeapPackage();
-#endif
+              
         }
 
-        private void ImportUnityMagicLeapPackage()
-        {
-
-            BusyCounter++;
-            MagicLeapRegistryPackageImporter.InstallUnityMLPackage(OnAddedPackage);
-            void OnAddedPackage(bool success)
-            {
-                if (!success)
-                {
-                    Debug.LogErrorFormat(FAILED_TO_IMPORT_PACKAGE_ERROR,"com.unity.xr.magicleap");
-                    var tryAgain = EditorUtility.DisplayDialog(FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_TITLE, FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_BODY, FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_OK, FAILED_TO_IMPORT_UNITY_MAGICLEAP_DIALOG_CANCEL);
-                    if (tryAgain)
-                    {
-                        ImportUnityMagicLeapPackage();
-                    }
-                    else
-                    {
-                        _dontTryImportAgain = true;
-                    }
-                }
-                else
-                {
-                    _dontTryImportAgain = true;
-                }
-                BusyCounter--;
-            }
-        }
 
         
 
@@ -242,7 +165,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
                 _installedFromRegistry = getPackageInfoResult.source == PackageSource.Registry;
                 if (_installedFromRegistry)
                 {
-                    var versionComparer = new MagicLeapPackageUtility.VersionComparer();
+                    var versionComparer = new MagicLeapSdkVersionComparer();
                     var latestVersion = getPackageInfoResult.versions.latest;
                     var isCurrentVersion =
                         versionComparer.Compare(getPackageInfoResult.versions.latest, getPackageInfoResult.version) <=
@@ -257,12 +180,12 @@ namespace MagicLeap.SetupTool.Editor.Setup
                 }
                 else
                 {
-                    var latestSDKPath = MagicLeapPackageUtility.GetLatestUnityPackagePath();
+                    var latestSDKPath = PathHelper.GetLatestUnityPackagePath();
                     var directoryInfo = new DirectoryInfo(latestSDKPath).Parent;
 
                     if (directoryInfo != null)
                     {
-                        var versionComparer = new MagicLeapPackageUtility.VersionComparer();
+                        var versionComparer = new MagicLeapSdkVersionComparer();
                         var isCurrentVersion = versionComparer.Compare(directoryInfo.Name, getPackageInfoResult.version) <= 0;
                         _isCurrent = isCurrentVersion;
                         if ((!isCurrentVersion))
@@ -339,59 +262,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
             return false;
         }
 
-        private string GetPackageDirectory()
-        {
-            string directoryToUse = Environment.GetEnvironmentVariable("USERPROFILE") ?? Environment.GetEnvironmentVariable("HOME");
 
-
-            var sdkRoot = MagicLeapPackageUtility.GetUnityPackageDirectory();
-            if (!string.IsNullOrEmpty(sdkRoot))
-            {
-                directoryToUse = sdkRoot;
-            }
-
-            if (File.Exists(MagicLeapPackageUtility.DefaultUnityPackagePath))
-            {
-                var directoryInfo = new DirectoryInfo(MagicLeapPackageUtility.DefaultUnityPackagePath).Parent;
-                if (directoryInfo != null)
-                {
-                    directoryToUse = directoryInfo.FullName;
-                }
-            }
-            else
-            {
-                var latestUnityPackageFolder = MagicLeapPackageUtility.GetLatestUnityPackagePath();
-
-                if (File.Exists(latestUnityPackageFolder))
-                {
-                    var directoryInfo = new DirectoryInfo(latestUnityPackageFolder).Parent;
-                    if (directoryInfo != null)
-                    {
-                        directoryToUse = directoryInfo.FullName;
-                    }
-             
-                }
-            }
-            var path = EditorUtility.OpenFilePanel(SDK_PACKAGE_FILE_BROWSER_TITLE, directoryToUse, "tgz");
-            return path;
-        }
-
-        private string GetPackageInProject()
-        {
-            var packageZip = Path.GetFullPath(Application.dataPath + "/../Packages/com.magicleap.unitysdk.tgz");
-            var packageFolder = Path.GetFullPath(Application.dataPath + "/../Packages/com.magicleap.unitysdk");
-            if (File.Exists(packageZip))
-            {
-                return packageZip;
-            }
-
-            if (Directory.Exists(packageFolder))
-            {
-                return packageFolder;
-            }
-
-            return null;
-        }
         public async void DeleteAndExecute()
         {
 
@@ -448,7 +319,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
                 EditorUtility.DisplayProgressBar(DELETING_PACKAGE_PROGRESS_HEADER, DELETING_PACKAGE_PROGRESS_HEADER, .3f);
 
              
-                var pathToPackagesFolder = GetPackageInProject();
+                var pathToPackagesFolder = PathHelper.GetPackageInProject();
                 if (!string.IsNullOrWhiteSpace(pathToPackagesFolder))
                 {
                     FileUtil.DeleteFileOrDirectory(pathToPackagesFolder);
@@ -472,7 +343,7 @@ namespace MagicLeap.SetupTool.Editor.Setup
             else
             {
                
-                var pathToPackageTarball = GetPackageInProject();
+                var pathToPackageTarball = PathHelper.GetPackageInProject();
 
                 if (!string.IsNullOrWhiteSpace(pathToPackageTarball))
                 {
@@ -602,72 +473,91 @@ namespace MagicLeap.SetupTool.Editor.Setup
 
         }
 
-        private async void AddRegistryAndImport()
+        private void ImportPackageFromRegistryV2()
         {
+           Running = true;
+        
 
-#if ML_SETUP_DEBUG
-            Debug.Log($"{this.GetType().Name} Adding Registry And Importing Package...");
-#endif
-            Running = true;
-            var success = await MagicLeapRegistryPackageImporter.AddRegistry();
-#if ML_SETUP_DEBUG
-            Debug.Log($"{this.GetType().Name} Added Registry: {success}");
-#endif
-            if (success)
+            Debug.Log("Installing Package...");
+            MagicLeapRegistryPackageImporter.InstallSdkPackage((packageSuccess) =>
             {
-#if ML_SETUP_DEBUG
-                Debug.Log($"{this.GetType().Name} Adding Package...");
-#endif
-                Running = true;
-                var packageSuccess = await MagicLeapRegistryPackageImporter.InstallSdkPackage();
-#if ML_SETUP_DEBUG
                 Debug.Log($"{this.GetType().Name} Added Package: {packageSuccess}");
-#endif
                 if (packageSuccess)
                 {
+                    EditorHelpers.CallWhenNotBusyAndAfterDelay(() =>
+                    {
+                        Running = true;
+                        UnityProjectSettingsUtility.ForceCloseProjectSettings();
+                        SettingsService.RepaintAllSettingsWindow();
+                        AssetDatabase.SaveAssets();
+                        AssetDatabase.Refresh();
+                        Client.Resolve();
+                        EditorHelpers.CallWhenNotBusy(CheckForPackage);
 #if ML_SETUP_DEBUG
                     Debug.Log($"{this.GetType().Name} finished.");
 #endif
+                    },2);
+                
+
                 }
                 else
                 {
                     Debug.LogError("Failed to import com.magicleap.unitysdk.");
+                    EditorHelpers.CallWhenNotBusy(CheckForPackage);
                 }
-            }
-            else
-            {
-                Debug.LogError("Failed to add registry");
-            }
-            Running = true;
+            
+      
+            });
+          
 
-            await EditorHelpers.WaitUntilNotBusy();
+
+
+            
+        }
+
+        private void CheckForPackage()
+        {
+            Running = true;
             _checkingForPackage = false;
             CheckForMagicLeapSdkPackage(() =>
             {
-
-                BusyCounter--;
-                OnExecuteFinished?.Invoke();
-                Running = false;
+                EditorHelpers.CallWhenNotBusy(() =>
+                {
+                    BusyCounter--;
+                    OnExecuteFinished?.Invoke();
+                    Running = false;
+                    Debug.Log("Finished!");
+                });
+           
             });
-          
         }
 
-        /// <summary>
-        /// Updates the variables based on if the Magic Leap SDK are installed (async)
-        /// </summary>
-        private async void CheckForMagicLeapSdkPackageRequest(Action onFinished = null)
+        private void AddRegistryAndImport()
         {
-      
-            if (!_checkingForPackage)
+        
+#if ML_SETUP_DEBUG
+            Debug.Log($"{this.GetType().Name} Adding Registry And Importing Package...");
+#endif
+            Running = true;
+ 
+            MagicLeapRegistryPackageImporter.AddRegistry(() =>
             {
-                _checkingForPackage = true;
-                 var result = await PackageUtility.HasPackageInstalledAsync(MAGIC_LEAP_PACKAGE_ID, true, true);
-                HasMagicLeapSdkInPackageManager = result.hasPackage;
-                onFinished?.Invoke();
-                _checkingForPackage = false;
-                Running = false;
-           
-            }
+                Debug.Log("Added Magic Leap Registry");
+                Running = true;
+                EditorHelpers.CallWhenNotBusy(()=>
+                {
+                    Running = true;
+                    EditorHelpers.CallWhenNotBusyAndAfterDelay(() =>
+                    {
+                        Running = true;
+                        SettingsService.RepaintAllSettingsWindow();
+                        EditorApplication.RepaintProjectWindow();
+                        Debug.Log("Request Package Install");
+                        EditorHelpers.CallWhenNotBusyAndAfterDelay(ImportPackageFromRegistryV2,2);
+                    },15);
+                    
+                });
+            });
 
         }
         /// <summary>
@@ -691,15 +581,19 @@ namespace MagicLeap.SetupTool.Editor.Setup
                 Running = false;
             }
         }
-        
 
+        private string GetPackageTgz()
+        {
+            var path = EditorUtility.OpenFilePanel(SDK_PACKAGE_FILE_BROWSER_TITLE, PathHelper.GetPackageDirectory(), "tgz");
+            return path;
+        }
 
         private void AddCopyPastePackageRefresh(string packagePath = null)
         {
 
             if (string.IsNullOrWhiteSpace(packagePath))
             {
-                packagePath = GetPackageDirectory();
+                packagePath = GetPackageTgz();
             }
        
             if (string.IsNullOrWhiteSpace(packagePath))

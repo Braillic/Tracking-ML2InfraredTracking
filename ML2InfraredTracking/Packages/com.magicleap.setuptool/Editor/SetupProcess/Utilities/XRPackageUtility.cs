@@ -45,6 +45,19 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 		private const string FAILED_TO_ENABLE_XR_PLUGIN_ERROR = "Could not enable XR Loader of type <{0}>. Please enable it manually.";
 
 	#endregion
+	const string k_XRPath = "Assets/XR";
+	
+	public static bool IsMagicLeapSDKInstalled
+	{
+		get
+		{
+#if (MAGICLEAP || OpenXR||USE_INPUT_SYSTEM_POSE_CONTROL)
+			return true;
+#else
+                return  false;
+#endif
+		}
+	}
 	
 	private const string LOADER_ID = "OpenXRLoader"; // Used to test if the loader is installed and active.
 	private const string FEATURE_SET_ID = "com.magicleap.openxr.featuregroup";
@@ -231,9 +244,16 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 
 		public static bool XRFeatureSetEnabled(string featureSetId, BuildTargetGroup buildTargetGroup)
 		{
+
 #if (OpenXR)
-			var featureSet = OpenXRFeatureSetManager.FeatureSetsForBuildTarget(buildTargetGroup).FirstOrDefault((set => set.featureSetId == featureSetId));
-			return featureSet!=null && featureSet.isEnabled;
+			var featuresForGroup = OpenXRFeatureSetManager.FeatureSetsForBuildTarget(buildTargetGroup);
+			if (featuresForGroup != null && featuresForGroup.Count > 0)
+			{
+				var featureSet = featuresForGroup.FirstOrDefault((set => set.featureSetId == featureSetId));
+				return featureSet!=null && featureSet.isEnabled;
+			}
+
+			return false;
 #else
 			return false;
 #endif
@@ -245,6 +265,7 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 		{
 #if OpenXR
 			var settings = OpenXRSettings.GetSettingsForBuildTargetGroup(buildTargetGroup);
+			
 			if (settings == null)
 			{
 				Debug.LogWarning("Cannot setup interaction profile. XR Settings do not exist.");
@@ -302,6 +323,58 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 #endif
 		}
 #if (OpenXR)
+		
+		
+		public static void CreateSettings()
+		{
+			FeatureHelpers.RefreshFeatures(EditorUserBuildSettings.selectedBuildTargetGroup);
+			FeatureHelpers.RefreshFeatures(BuildTargetGroup.Android);
+			EditorUtility.SetDirty(OpenXRSettings.ActiveBuildTargetInstance);
+			AssetDatabase.SaveAssets();
+		}
+
+		private static bool GetXrGeneralSettingsPerBuildTarget(out XRGeneralSettingsPerBuildTarget xrGeneralSettingsPerBuildTarget)
+		{
+			EditorBuildSettings.TryGetConfigObject(XRGeneralSettings.k_SettingsKey,
+				out  xrGeneralSettingsPerBuildTarget);
+			
+			CreateSettings();
+			if (xrGeneralSettingsPerBuildTarget == null)
+			{
+				Debug.LogError($"creating XR General Settings Per Build Target...");
+				xrGeneralSettingsPerBuildTarget =
+					ScriptableObject.CreateInstance(typeof(XRGeneralSettingsPerBuildTarget)) as
+						XRGeneralSettingsPerBuildTarget;
+				var assetPath = k_XRPath;
+				if (!string.IsNullOrEmpty(assetPath))
+				{
+					if (!AssetDatabase.IsValidFolder(k_XRPath))
+					{
+						AssetDatabase.CreateFolder("Assets", "XR");
+					}
+
+					assetPath = Path.Combine(assetPath, "XRGeneralSettings.asset");
+					AssetDatabase.CreateAsset(xrGeneralSettingsPerBuildTarget, assetPath);
+					Debug.Log($"Creating: {assetPath}");
+		
+					AssetDatabase.SaveAssets();
+				}
+
+				
+				EditorBuildSettings.AddConfigObject(XRGeneralSettings.k_SettingsKey, xrGeneralSettingsPerBuildTarget,
+					true);
+				Debug.Log($"Add Config: {XRGeneralSettings.k_SettingsKey}");
+				//Test before returning
+				EditorBuildSettings.TryGetConfigObject(XRGeneralSettings.k_SettingsKey, out  xrGeneralSettingsPerBuildTarget);
+				return xrGeneralSettingsPerBuildTarget;
+			}
+			else
+			{
+				return true;
+			}
+
+		}
+
 		/// <summary>
 		/// Enables the XR plugin on the available Build Target Group
 		/// </summary>
@@ -311,18 +384,16 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 
 			_cachedCreateXRSettingsMethod.Invoke(_cachedXRSettingsManagerType, null);
 			_cachedCreateAllChildSettingsProvidersMethod.Invoke(_cachedXRSettingsManagerType, null);
-
+	
 
 			UpdateLoader(buildTargetGroup);
 		
-
-			EditorBuildSettings.TryGetConfigObject(XRGeneralSettings.k_SettingsKey,
-													out XRGeneralSettingsPerBuildTarget xrGeneralSettingsPerBuildTarget);
-
-			if (xrGeneralSettingsPerBuildTarget)
+			
+		
+			if (GetXrGeneralSettingsPerBuildTarget(out XRGeneralSettingsPerBuildTarget xrGeneralSettingsPerBuildTarget))
 			{
 				var androidSettings = xrGeneralSettingsPerBuildTarget.SettingsForBuildTarget(buildTargetGroup);
-
+			
 				
 				var loader = ScriptableObjectUtility.FindAsset<T>();
 				var worked =  androidSettings.Manager.TryAddLoader(loader);
@@ -337,6 +408,7 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 			{
 				EnableXRPluginFinished.Invoke(false);
 				Debug.LogWarning(SETTINGS_NOT_FOUND);
+				
 			}
 
 
@@ -368,6 +440,7 @@ namespace MagicLeap.SetupTool.Editor.Utilities
 																				var fullName = e.GetType().FullName;
 																				return fullName != null && fullName.Contains(loaderId);
 																			});
+
 				}
 			
 			}
