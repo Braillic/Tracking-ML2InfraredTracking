@@ -2,6 +2,8 @@
 using System;
 using System.Collections.Generic;
 using MagicLeap.OpenXR.Features.PixelSensors;
+using System.Text;
+using System.Linq;
 
 public class ML2DepthRawStream : MonoBehaviour
 {
@@ -14,6 +16,8 @@ public class ML2DepthRawStream : MonoBehaviour
     private float[] _cameraMatrixNative = new float[9];  // 3x3 fx,fy,cx,cy
     private float[] _distCoeffsNative;                   // k1,k2,p1,p2,k3
     private float[] _floatBuffer;                        // CPU-side float[] depth map (meters) 
+    public String intrinsics = null;
+    private ulong _processedFrameCount;
 
     // --- Rendering helpers ---
     private MaterialPropertyBlock _mpb;
@@ -43,7 +47,7 @@ public class ML2DepthRawStream : MonoBehaviour
             return buffer;
         }
 
-       
+
         return null;
     }
 
@@ -60,7 +64,7 @@ public class ML2DepthRawStream : MonoBehaviour
         Debug.Log("[ML2Tracking] Initialization completed.");
     }
 
-  
+
     public void Initialize(uint streamId, MagicLeapPixelSensorFeature feature, PixelSensorId sensorType)
     {
         if (!sensorType.SensorName.Contains("depth", StringComparison.CurrentCultureIgnoreCase)) return;
@@ -114,10 +118,29 @@ public class ML2DepthRawStream : MonoBehaviour
                     var depthData = GetRawDepthData(in frame, ref _floatBuffer);
                     if (depthData == null) return;
 
-
                     targetRenderer.material.mainTexture = targetTexture;
 
                     //Matrix4x4 worldTsensor = Matrix4x4.TRS(sensorPose.position, sensorPose.rotation, Vector3.one);
+
+
+                    // Proces the metadata if needed
+                    if (intrinsics is null)
+                        foreach (var entry in metaData)
+                        {
+                            if (entry is PixelSensorPinholeIntrinsics pinhole)
+                            {
+                                StringBuilder builder = new();
+                                //out_pinholeIntrinsics = pinholeIntrinsics;
+                                builder.AppendLine($"[Pinhole Intrinsics]");
+                                builder.AppendLine($"FOV: {pinhole.FOV}");
+                                builder.AppendLine($"Focal Length: {pinhole.FocalLength}");
+                                builder.AppendLine($"Principal Point: {pinhole.PrincipalPoint}");
+                                builder.AppendLine(
+                                    $"Pinhole Distortion [k1, k2, p1, p2, k3]: [{string.Join(',', pinhole.Distortion.Select(val => val.ToString("F1")))}]");
+
+                                intrinsics = builder.ToString();
+                            }
+                        }
                 }
                 break;
             default:

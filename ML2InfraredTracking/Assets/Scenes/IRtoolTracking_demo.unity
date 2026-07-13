@@ -2434,10 +2434,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   streamVisualizer: {fileID: 1591841588}
   xrOrigin: {fileID: 1387163547}
-  UseRawDepth: 0
+  UseRawDepth: 1
   DepthRange: 1
-  SRUpdateRate: 60
-  LRUpdateRate: 5
 --- !u!114 &1591841588
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2457,6 +2455,7 @@ MonoBehaviour:
     - frameType: 5
       frameTypeMaterial: {fileID: 2100000, guid: 6c77b5a522d2b734cb08291e2a786d40,
         type: 2}
+  intrinsics: 
 --- !u!114 &1591841589
 MonoBehaviour:
   m_ObjectHideFlags: 0

@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "G572XT10018Y",
         "name": "com.braillic.depthstreaming",
-        "processId": 31816,
+        "processId": 10722,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -78,6 +78,12 @@
             "deviceId": "G572XT10018Y",
             "name": "com.braillic.depthstreaming",
             "processId": 31816,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10018Y",
+            "name": "com.braillic.depthstreaming",
+            "processId": 10722,
             "exited": false
         }
     ],

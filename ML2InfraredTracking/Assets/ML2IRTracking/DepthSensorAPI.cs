@@ -8,6 +8,8 @@ using UnityEngine.XR.MagicLeap;
 using UnityEngine.XR.OpenXR;
 using MagicLeap.OpenXR.Features.PixelSensors;
 using Unity.XR.CoreUtils;
+using System.Text;
+using System;
 
 
 public class DepthSensorAPI : MonoBehaviour
@@ -43,6 +45,7 @@ public class DepthSensorAPI : MonoBehaviour
     private MagicLeapPixelSensorFeature pixelSensorFeature;
     private PixelSensorId? sensorId;
     private List<uint> configuredStreams = new List<uint>();
+
 
     public uint targetStream
     {
@@ -166,8 +169,8 @@ public class DepthSensorAPI : MonoBehaviour
                 if (range.CapabilityType == PixelSensorCapabilityType.UpdateRate)
                 {
                     var configData = new PixelSensorConfigData(range.CapabilityType, targetStream);
-                    
-                    uint maxUpdateRate = 5; 
+
+                    uint maxUpdateRate = 5;
                     if (range.IntValues != null && range.IntValues.Length > 0)
                     {
                         foreach (uint intValue in range.IntValues)
@@ -284,15 +287,6 @@ public class DepthSensorAPI : MonoBehaviour
 
                     Debug.Log("Sensor Pose:" + sensorPose);
                     streamVisualizer.ProcessFrame(frame, metaData, sensorPose);
-
-                    // Proces the metadata if needed
-                    foreach (var entry in metaData)
-                    {
-                        if (entry is PixelSensorPinholeIntrinsics pinhole)
-                        {
-                            // Handle pinhole intrinsics metadata here if needed.
-                        }
-                    }
 
                     yield return null;
                 }
