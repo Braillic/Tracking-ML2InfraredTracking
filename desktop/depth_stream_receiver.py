@@ -22,6 +22,14 @@ INTRINSICS = struct.Struct("<11d")
 MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
 WINDOW_TITLE = "Magic Leap 2 depth"
 ANALYSIS_WINDOW_TITLE = "Analysis (f=fixed, p=percentile)"
+MARKER_MIN_AREA = 2
+MARKER_MAX_AREA = 2000
+MARKER_MAX_ASPECT = 4.0
+MARKER_RING_RADIUS = 10
+MARKER_MIN_AREA = 2
+MARKER_MAX_AREA = 2000
+MARKER_MAX_ASPECT = 4.0
+MARKER_RING_RADIUS = 10
 
 
 @dataclass(frozen=True)
@@ -177,19 +185,78 @@ def apply_threshold(
     return thresholded, cutoff
 
 
-def render_analysis(
+def detect_marker_centers(
     colourised: np.ndarray,
     threshold_method: str,
     fixed_threshold: float,
     top_p: tuple[float, float],
-) -> np.ndarray:
-    """Build the Analysis window from an already-colourised frame."""
-    analysis, cutoff = apply_threshold(
+) -> tuple[np.ndarray, float, list[tuple[int, int]]]:
+    """Threshold a colourised frame and locate bright marker blobs."""
+    thresholded, cutoff = apply_threshold(
         colourised,
         threshold_method,
         fixed_threshold=fixed_threshold,
         top_p=top_p,
     )
+
+    if colourised.ndim == 3:
+        intensity = colourised.max(axis=2).astype(np.float32)
+    else:
+        intensity = colourised.astype(np.float32)
+
+    mask = (intensity >= cutoff).astype(np.uint8) * 255
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+    candidates: list[tuple[float, tuple[int, int]]] = []
+    for label in range(1, n_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        aspect = max(width, height) / max(1, min(width, height))
+
+        if area < MARKER_MIN_AREA or area > MARKER_MAX_AREA or aspect > MARKER_MAX_ASPECT:
+            continue
+
+        ys, xs = np.where(labels == label)
+        weights = intensity[ys, xs]
+        if weights.size == 0:
+            continue
+
+        weight_sum = float(weights.sum())
+        cx = float((xs * weights).sum() / weight_sum)
+        cy = float((ys * weights).sum() / weight_sum)
+        mean_intensity = float(weights.mean())
+        candidates.append((mean_intensity, (int(round(cx)), int(round(cy)))))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    centers = [center for _, center in candidates[:5]]
+    return thresholded, cutoff, centers
+
+
+def annotate_markers(image: np.ndarray, centers: list[tuple[int, int]]) -> np.ndarray:
+    """Draw a ring and index around each detected marker."""
+    overlay = image.copy()
+    for index, (x, y) in enumerate(centers):
+        cv2.circle(overlay, (x, y), MARKER_RING_RADIUS, (0, 0, 255), 1, cv2.LINE_AA)
+        cv2.putText(overlay, str(index), (x + 12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+    return overlay
+
+
+def render_analysis(
+    colourised: np.ndarray,
+    threshold_method: str,
+    fixed_threshold: float,
+    top_p: tuple[float, float],
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    """Build the Analysis window from an already-colourised frame."""
+    analysis, cutoff, centers = detect_marker_centers(
+        colourised,
+        threshold_method,
+        fixed_threshold=fixed_threshold,
+        top_p=top_p,
+    )
+    analysis = annotate_markers(analysis, centers)
     if threshold_method == "fixed":
         mode_label = f"fixed >= {fixed_threshold:g}  (cutoff {cutoff:.1f})"
     else:
@@ -200,7 +267,7 @@ def render_analysis(
                 0.55, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(analysis, "keys: f=fixed  p=percentile  q=quit", (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-    return analysis
+    return analysis, centers
 
 
 def show_waiting_window(host: str, port: int) -> None:
@@ -253,9 +320,10 @@ def run(args: argparse.Namespace) -> None:
                               intrinsics.distortion_coefficients, flush=True)
 
                     display = colourise_depth(depth, args)
-                    analysis = render_analysis(
+                    analysis, centers = render_analysis(
                         display, threshold_method, fixed_threshold, top_p
                     )
+                    display = annotate_markers(display, centers)
 
                     valid = np.isfinite(depth) & (depth > 0)
                     if np.any(valid):
@@ -283,7 +351,7 @@ def run(args: argparse.Namespace) -> None:
                     if key == ord("f"):
                         threshold_method = "fixed"
                         print("Analysis: fixed threshold", flush=True)
-                        analysis = render_analysis(
+                        analysis, centers = render_analysis(
                             colourise_depth(depth, args),
                             threshold_method, fixed_threshold, top_p,
                         )
@@ -291,7 +359,7 @@ def run(args: argparse.Namespace) -> None:
                     elif key == ord("p"):
                         threshold_method = "percentile"
                         print("Analysis: percentile threshold", flush=True)
-                        analysis = render_analysis(
+                        analysis, centers = render_analysis(
                             colourise_depth(depth, args),
                             threshold_method, fixed_threshold, top_p,
                         )
