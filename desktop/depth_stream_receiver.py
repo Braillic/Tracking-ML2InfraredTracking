@@ -297,14 +297,19 @@ def run(args: argparse.Namespace) -> None:
                         )
                         cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
                     elif key == ord("s"):
+                        # prompt for save name
+                        save_name = input("Enter save name: ")
+                        if not save_name:
+                            print("Save name cannot be empty")
+                            continue
                         target = ((save_directory or Path.cwd()) /
-                                  f"ml2_depth_{frame.frame_id}_{frame.timestamp:.3f}.npy")
+                                  f"ml2_depth_{save_name}.npy")
                         np.save(target, depth)
                         display_target = ((save_directory or Path.cwd()) /
-                                  f"ml2_display_{frame.frame_id}_{frame.timestamp:.3f}.png")
+                                  f"ml2_display_{save_name}.png")
                         cv2.imwrite(display_target, display)
                         analysis_target = ((save_directory or Path.cwd()) /
-                                  f"ml2_analysis_{frame.frame_id}_{frame.timestamp:.3f}")
+                                  f"ml2_analysis_{save_name}.npy")
                         np.save(f"{analysis_target}.npy", analysis)
                         cv2.imwrite(f"{analysis_target}.png", analysis)
                         print(f"Saved {target}")

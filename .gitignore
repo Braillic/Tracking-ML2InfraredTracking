@@ -25,3 +25,6 @@ Thumbs.db
 # Visual Studio Code
 .vscode/
 */.venv/
+
+# saves
+*.npy
