@@ -21,9 +21,11 @@ HEADER = struct.Struct("<4sHHIIIIQd3f4fI")
 INTRINSICS = struct.Struct("<11d")
 MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
 WINDOW_TITLE = "Magic Leap 2 depth"
+ANALYSIS_WINDOW_TITLE = "Analysis (f=fixed, p=percentile)"
 
 
 @dataclass(frozen=True)
+# intrinsics recieved once per TCP connection
 class CameraIntrinsics:
     fx: float
     fy: float
@@ -140,6 +142,66 @@ def colourise_depth(depth: np.ndarray, args: argparse.Namespace) -> np.ndarray:
     colour[~valid] = 0
     return colour
 
+def apply_threshold(
+    image: np.ndarray,
+    threshold_method: str,
+    fixed_threshold: float = 200.0,
+    top_p: tuple[float, float] = (100.0, 90.0),
+) -> tuple[np.ndarray, float]:
+    """Threshold a colourised uint8 image. top_p is (absolute floor, percentile).
+
+    Intensity is the max channel per pixel (works for grey unity-raw and turbo).
+    Pixels below the cutoff are set to 0; others keep their original colour.
+    """
+    if image.ndim == 3:
+        intensity = image.max(axis=2).astype(np.float32)
+    else:
+        intensity = image.astype(np.float32)
+
+    if threshold_method == "fixed":
+        cutoff = float(fixed_threshold)
+    elif threshold_method == "percentile":
+        floor, percentile = top_p
+        if intensity.size == 0:
+            cutoff = float(floor)
+        else:
+            cutoff = max(float(floor), float(np.percentile(intensity, percentile)))
+    else:
+        raise ValueError(f"Invalid threshold method: {threshold_method}")
+
+    keep = intensity >= cutoff
+    if image.ndim == 3:
+        thresholded = np.where(keep[..., None], image, 0).astype(np.uint8)
+    else:
+        thresholded = np.where(keep, image, 0).astype(np.uint8)
+    return thresholded, cutoff
+
+
+def render_analysis(
+    colourised: np.ndarray,
+    threshold_method: str,
+    fixed_threshold: float,
+    top_p: tuple[float, float],
+) -> np.ndarray:
+    """Build the Analysis window from an already-colourised frame."""
+    analysis, cutoff = apply_threshold(
+        colourised,
+        threshold_method,
+        fixed_threshold=fixed_threshold,
+        top_p=top_p,
+    )
+    if threshold_method == "fixed":
+        mode_label = f"fixed >= {fixed_threshold:g}  (cutoff {cutoff:.1f})"
+    else:
+        mode_label = (
+            f"percentile p{top_p[1]:g} floor {top_p[0]:g}  (cutoff {cutoff:.1f})"
+        )
+    cv2.putText(analysis, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(analysis, "keys: f=fixed  p=percentile  q=quit", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    return analysis
+
 
 def show_waiting_window(host: str, port: int) -> None:
     waiting = np.zeros((360, 640, 3), dtype=np.uint8)
@@ -150,7 +212,9 @@ def show_waiting_window(host: str, port: int) -> None:
     cv2.putText(waiting, "Check the ML status: queued should become > 0", (40, 230),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1, cv2.LINE_AA)
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(ANALYSIS_WINDOW_TITLE, cv2.WINDOW_NORMAL)
     cv2.imshow(WINDOW_TITLE, waiting)
+    cv2.imshow(ANALYSIS_WINDOW_TITLE, waiting)
     cv2.waitKey(1)
 
 
@@ -158,6 +222,10 @@ def run(args: argparse.Namespace) -> None:
     save_directory = Path(args.save_dir) if args.save_dir else None
     if save_directory:
         save_directory.mkdir(parents=True, exist_ok=True)
+
+    threshold_method = args.threshold_method
+    fixed_threshold = args.fixed_threshold
+    top_p = (args.percentile_floor, args.percentile)
 
     while True:
         try:
@@ -183,7 +251,12 @@ def run(args: argparse.Namespace) -> None:
                         print("OpenCV camera matrix:\n", intrinsics.camera_matrix, flush=True)
                         print("OpenCV distortion coefficients:",
                               intrinsics.distortion_coefficients, flush=True)
+
                     display = colourise_depth(depth, args)
+                    analysis = render_analysis(
+                        display, threshold_method, fixed_threshold, top_p
+                    )
+
                     valid = np.isfinite(depth) & (depth > 0)
                     if np.any(valid):
                         minimum = float(depth[valid].min())
@@ -200,16 +273,44 @@ def run(args: argparse.Namespace) -> None:
                                   f"Q=({q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f})")
                     cv2.putText(display, pose_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
                     cv2.imshow(WINDOW_TITLE, display)
+                    cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
 
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord("q")):
                         return
-                    if key == ord("s"):
+                    if key == ord("f"):
+                        threshold_method = "fixed"
+                        print("Analysis: fixed threshold", flush=True)
+                        analysis = render_analysis(
+                            colourise_depth(depth, args),
+                            threshold_method, fixed_threshold, top_p,
+                        )
+                        cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
+                    elif key == ord("p"):
+                        threshold_method = "percentile"
+                        print("Analysis: percentile threshold", flush=True)
+                        analysis = render_analysis(
+                            colourise_depth(depth, args),
+                            threshold_method, fixed_threshold, top_p,
+                        )
+                        cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
+                    elif key == ord("s"):
                         target = ((save_directory or Path.cwd()) /
                                   f"ml2_depth_{frame.frame_id}_{frame.timestamp:.3f}.npy")
                         np.save(target, depth)
+                        display_target = ((save_directory or Path.cwd()) /
+                                  f"ml2_display_{frame.frame_id}_{frame.timestamp:.3f}.png")
+                        cv2.imwrite(display_target, display)
+                        analysis_target = ((save_directory or Path.cwd()) /
+                                  f"ml2_analysis_{frame.frame_id}_{frame.timestamp:.3f}")
+                        np.save(f"{analysis_target}.npy", analysis)
+                        cv2.imwrite(f"{analysis_target}.png", analysis)
                         print(f"Saved {target}")
+                        print(f"Saved {display_target}")
+                        print(f"Saved {analysis_target}")
+
         except (ConnectionError, OSError, ValueError) as error:
             if not args.reconnect:
                 raise
@@ -234,7 +335,16 @@ def parse_args() -> argparse.Namespace:
                         help="Turbo view near plane in metres")
     parser.add_argument("--far", type=float, default=5.0,
                         help="Turbo view far plane in metres")
-    parser.add_argument("--save-dir", help="Directory used when S is pressed")
+    parser.add_argument("--save-dir", default="./saves", help="Directory used when S is pressed")
+    parser.add_argument("--threshold-method", choices=("fixed", "percentile"),
+                        default="percentile",
+                        help="Initial Analysis-window threshold mode (toggle with f/p)")
+    parser.add_argument("--fixed-threshold", type=float, default=200.0,
+                        help="Cutoff on colourised 0-255 intensity when mode is fixed")
+    parser.add_argument("--percentile", type=float, default=90.0,
+                        help="Percentile of colourised intensity when mode is percentile")
+    parser.add_argument("--percentile-floor", type=float, default=100.0,
+                        help="Absolute 0-255 floor combined with percentile cutoff")
     parser.add_argument("--connect-timeout", type=float, default=5.0)
     parser.add_argument("--frame-timeout", type=float, default=10.0,
                         help="Reconnect if no complete frame data arrives for this many seconds")
