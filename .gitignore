@@ -28,4 +28,5 @@ Thumbs.db
 
 # saves
 *.npy
-saves
+desktop/saves
+desktop/processing

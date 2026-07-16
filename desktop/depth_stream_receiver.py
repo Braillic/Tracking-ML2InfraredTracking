@@ -190,6 +190,7 @@ def detect_marker_centers(
     threshold_method: str,
     fixed_threshold: float,
     top_p: tuple[float, float],
+    max_markers: int = 5,
 ) -> tuple[np.ndarray, float, list[tuple[int, int]]]:
     """Threshold a colourised frame and locate bright marker blobs."""
     thresholded, cutoff = apply_threshold(
@@ -229,7 +230,7 @@ def detect_marker_centers(
         candidates.append((mean_intensity, (int(round(cx)), int(round(cy)))))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-    centers = [center for _, center in candidates[:5]]
+    centers = [center for _, center in candidates[:max_markers]]
     return thresholded, cutoff, centers
 
 
@@ -248,7 +249,7 @@ def render_analysis(
     threshold_method: str,
     fixed_threshold: float,
     top_p: tuple[float, float],
-) -> tuple[np.ndarray, list[tuple[int, int]]]:
+) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]]]:
     """Build the Analysis window from an already-colourised frame."""
     analysis, cutoff, centers = detect_marker_centers(
         colourised,
@@ -256,18 +257,18 @@ def render_analysis(
         fixed_threshold=fixed_threshold,
         top_p=top_p,
     )
-    analysis = annotate_markers(analysis, centers)
+    annotated_image = annotate_markers(analysis, centers)
     if threshold_method == "fixed":
         mode_label = f"fixed >= {fixed_threshold:g}  (cutoff {cutoff:.1f})"
     else:
         mode_label = (
             f"percentile p{top_p[1]:g} floor {top_p[0]:g}  (cutoff {cutoff:.1f})"
         )
-    cv2.putText(analysis, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+    cv2.putText(annotated_image, mode_label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(analysis, "keys: f=fixed  p=percentile  q=quit", (10, 50),
+    cv2.putText(annotated_image, "keys: f=fixed  p=percentile  q=quit", (10, 50),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-    return analysis, centers
+    return annotated_image, analysis, centers
 
 
 def show_waiting_window(host: str, port: int) -> None:
@@ -284,6 +285,22 @@ def show_waiting_window(host: str, port: int) -> None:
     cv2.imshow(ANALYSIS_WINDOW_TITLE, waiting)
     cv2.waitKey(1)
 
+def _new_recording_dir(base_dir: Path) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    # Keep it deterministic and filesystem-friendly.
+    path = base_dir / f"recording_{stamp}"
+    path.mkdir(parents=True, exist_ok=False)
+    # also make subdirs for depth, display, analysis
+    depth_dir = path / "depth"
+    display_dir = path / "display"
+    analysis_dir = path / "analysis"
+    centers_dir = path / "centers"
+    depth_dir.mkdir(parents=True, exist_ok=True)
+    display_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    centers_dir.mkdir(parents=True, exist_ok=True)
+    return path
+
 
 def run(args: argparse.Namespace) -> None:
     save_directory = Path(args.save_dir) if args.save_dir else None
@@ -293,6 +310,10 @@ def run(args: argparse.Namespace) -> None:
     threshold_method = args.threshold_method
     fixed_threshold = args.fixed_threshold
     top_p = (args.percentile_floor, args.percentile)
+
+    recording = False
+    recording_dir: Path | None = None
+    recording_index = 0
 
     while True:
         try:
@@ -320,10 +341,10 @@ def run(args: argparse.Namespace) -> None:
                               intrinsics.distortion_coefficients, flush=True)
 
                     display = colourise_depth(depth, args)
-                    analysis, centers = render_analysis(
+                    annotated_thresholded, analysis, centers = render_analysis(
                         display, threshold_method, fixed_threshold, top_p
-                    )
-                    display = annotate_markers(display, centers)
+                    ) # this already annotates the markers
+                    annotated_display = annotate_markers(display, centers) # additionally do it for display window
 
                     valid = np.isfinite(depth) & (depth > 0)
                     if np.any(valid):
@@ -342,28 +363,47 @@ def run(args: argparse.Namespace) -> None:
                     cv2.putText(display, pose_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-                    cv2.imshow(WINDOW_TITLE, display)
-                    cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
+                    if recording:
+                        cv2.putText(display, f"REC {recording_index:06d}", (10, 75),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+                    cv2.imshow(WINDOW_TITLE, annotated_display)
+                    cv2.imshow(ANALYSIS_WINDOW_TITLE, annotated_thresholded)
 
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord("q")):
                         return
+                    if key == ord("r"):
+                        if not recording:
+                            base = save_directory or (Path.cwd() / "saves")
+                            base.mkdir(parents=True, exist_ok=True)
+                            recording_dir = _new_recording_dir(base)
+                            recording = True
+                            recording_index = 0
+                            print(f"Recording started: {recording_dir}", flush=True)
+                        else:
+                            recording = False
+                            print(
+                                f"Recording stopped: {recording_dir} ({recording_index} frames)",
+                                flush=True,
+                            )
+                            recording_dir = None
                     if key == ord("f"):
                         threshold_method = "fixed"
                         print("Analysis: fixed threshold", flush=True)
-                        analysis, centers = render_analysis(
+                        annotated_thresholded, analysis, centers = render_analysis(
                             colourise_depth(depth, args),
                             threshold_method, fixed_threshold, top_p,
                         )
-                        cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
+                        cv2.imshow(ANALYSIS_WINDOW_TITLE, annotated_thresholded)
                     elif key == ord("p"):
                         threshold_method = "percentile"
                         print("Analysis: percentile threshold", flush=True)
-                        analysis, centers = render_analysis(
+                        annotated_thresholded, analysis, centers = render_analysis(
                             colourise_depth(depth, args),
                             threshold_method, fixed_threshold, top_p,
                         )
-                        cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis)
+                        cv2.imshow(ANALYSIS_WINDOW_TITLE, annotated_thresholded)
                     elif key == ord("s"):
                         # prompt for save name
                         save_name = input("Enter save name: ")
@@ -371,18 +411,31 @@ def run(args: argparse.Namespace) -> None:
                             print("Save name cannot be empty")
                             continue
                         target = ((save_directory or Path.cwd()) /
-                                  f"ml2_depth_{save_name}.npy")
+                                  f"depth_{save_name}")
                         np.save(target, depth)
                         display_target = ((save_directory or Path.cwd()) /
-                                  f"ml2_display_{save_name}.png")
+                                  f"display_{save_name}.png")
                         cv2.imwrite(display_target, display)
                         analysis_target = ((save_directory or Path.cwd()) /
-                                  f"ml2_analysis_{save_name}.npy")
+                                  f"analysis_{save_name}")
                         np.save(f"{analysis_target}.npy", analysis)
                         cv2.imwrite(f"{analysis_target}.png", analysis)
                         print(f"Saved {target}")
                         print(f"Saved {display_target}")
                         print(f"Saved {analysis_target}")
+
+                    if recording:
+                        # Save current frame to the active recording directory.
+                        # We save depth + display + analysis (+ centers) for easy offline inspection.
+                        assert recording_dir is not None
+                        stem = f"{recording_index:06d}_{frame.frame_id}_{frame.timestamp:.3f}"
+                        np.save(recording_dir / "depth" / f"depth_{stem}.npy", depth)
+                        np.save(recording_dir / "analysis" / f"analysis_{stem}.npy", analysis)
+                        # cv2.imwrite(str(recording_dir / f"display_{stem}.png"), display)
+
+                        cv2.imwrite(str(recording_dir / "analysis" / f"analysis_{stem}.png"), analysis)
+                        np.save(recording_dir / "centers" / f"centers_{stem}.npy", np.array(centers, dtype=np.int32))
+                        recording_index += 1
 
         except (ConnectionError, OSError, ValueError) as error:
             if not args.reconnect:
