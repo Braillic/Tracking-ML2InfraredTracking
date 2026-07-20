@@ -429,6 +429,11 @@ def run(args: argparse.Namespace) -> None:
                         # We save depth + display + analysis (+ centers) for easy offline inspection.
                         assert recording_dir is not None
                         stem = f"{recording_index:06d}_{frame.frame_id}_{frame.timestamp:.3f}"
+                        # save intrinsics and distortion coefficients only once
+                        if recording_index == 0:
+                            np.save(recording_dir / "intrinsics" / f"camera_matrix.npy", intrinsics.camera_matrix)
+                            np.save(recording_dir / "intrinsics" / f"dist_coeffs.npy", intrinsics.distortion_coefficients)
+
                         np.save(recording_dir / "depth" / f"depth_{stem}.npy", depth)
                         np.save(recording_dir / "analysis" / f"analysis_{stem}.npy", analysis)
                         # cv2.imwrite(str(recording_dir / f"display_{stem}.png"), display)
