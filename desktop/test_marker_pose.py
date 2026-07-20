@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
+from types import SimpleNamespace
 import cv2
 import numpy as np
-
 from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker
-
-
+from depth_stream_receiver import colourise_depth, detect_marker_centers, annotate_markers
+# camera matrix and distortion coefficients fom running depth_stream_receiver
 DEFAULT_CAMERA_MATRIX = np.array([[363.10574341,   0.          , 267.85662842],
                                    [  0.         , 363.10574341, 237.83192444],
                                    [  0.         ,  0.         ,  1.        ]], dtype=np.float64)
@@ -36,7 +35,7 @@ def _stem_key(path: Path) -> str:
 
 
 def _draw_overlay(
-    analysis_bgr: np.ndarray,
+    depth_bgr: np.ndarray,
     detections: np.ndarray,
     projected: np.ndarray | None,
     est_ok: bool,
@@ -45,7 +44,7 @@ def _draw_overlay(
     reproj: float,
     conf: float,
 ) -> np.ndarray:
-    out = analysis_bgr.copy()
+    out = depth_bgr.copy()
     if out.ndim == 2:
         out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
 
@@ -96,7 +95,7 @@ def run_recording(
     max_frames: int | None = None,
 ) -> None:
     centers_dir = recording_path / "centers"
-    analysis_dir = recording_path / "analysis"
+    depth_dir = recording_path / "depth"
     overlay_dir = recording_path / "pose_overlay"
     if not centers_dir.is_dir():
         raise FileNotFoundError(f"missing centers/: {centers_dir}")
@@ -118,6 +117,7 @@ def run_recording(
         overlay_dir.mkdir(parents=True, exist_ok=True)
 
     n_ok = 0
+    overlays: list[np.ndarray] = []
     reprojs: list[float] = []
     for path in center_files:
         pts = np.load(path).astype(np.float64).reshape(-1, 2)
@@ -145,20 +145,12 @@ def run_recording(
 
         if save_overlay:
             stem = _stem_key(path)
-            analysis_png = analysis_dir / f"analysis_{stem}.png"
-            analysis_npy = analysis_dir / f"analysis_{stem}.npy"
-            if analysis_png.is_file():
-                canvas = cv2.imread(str(analysis_png), cv2.IMREAD_COLOR)
-            elif analysis_npy.is_file():
-                raw = np.load(analysis_npy)
-                canvas = raw if raw.ndim == 3 else cv2.cvtColor(
-                    raw.astype(np.uint8), cv2.COLOR_GRAY2BGR
-                )
-            else:
-                h = int(max(480, pts[:, 1].max() + 40)) if len(pts) else 480
-                w = int(max(544, pts[:, 0].max() + 40)) if len(pts) else 544
-                canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
+            depth_png = depth_dir / f"depth_{stem}.png"
+            depth_npy = depth_dir / f"depth_{stem}.npy"
+            raw = np.load(depth_npy)
+            process_args = SimpleNamespace(raw_min=5, raw_max=3000, view="unity-raw", unity_color_space="linear", threshold_method="fixed", fixed_threshold=200, top_p=(100, 90))
+            gray =colourise_depth(raw, process_args)
+            canvas = gray
             overlay = _draw_overlay(
                 canvas,
                 pts,
@@ -169,7 +161,9 @@ def run_recording(
                 est.mean_reproj_px if est.ok else float("inf"),
                 est.confidence if est.ok else 0.0,
             )
-            cv2.imwrite(str(overlay_dir / f"overlay_{stem}.png"), overlay)
+            # add to list of overlays
+            overlays.append(overlay)
+            #cv2.imwrite(str(overlay_dir / f"overlay_{stem}.png"), overlay)
 
     print(
         f"\nsummary: {n_ok}/{len(center_files)} ok"
@@ -182,8 +176,19 @@ def run_recording(
     )
     if save_overlay:
         print(f"overlays → {overlay_dir}")
+    return overlays
 
-
+def video_save_overlay(recording_path: Path, overlays: list[np.ndarray]) -> None: # instead of saving the overlays, save a video of the overlays
+    h, w = overlays[0].shape[:2]
+    if overlays[0].ndim == 2:
+        h, w = overlays[0].shape
+    writer = cv2.VideoWriter(str(recording_path / "pose_overlay.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (w, h))
+    for frame in overlays:
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        writer.write(np.ascontiguousarray(frame, dtype=np.uint8))
+    writer.release()
+    print(f"video saved to {recording_path / 'pose_overlay.mp4'}")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -201,7 +206,7 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    run_recording(
+    overlays = run_recording(
         recording_path=args.recording,
         camera_matrix=DEFAULT_CAMERA_MATRIX,
         dist_coeffs=DEFAULT_DIST_COEFFS,
@@ -209,3 +214,4 @@ if __name__ == "__main__":
         save_overlay=args.save_overlay,
         max_frames=args.max_frames,
     )
+    video_save_overlay(args.recording, overlays)
