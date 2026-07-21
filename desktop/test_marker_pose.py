@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker
-from depth_stream_receiver import colourise_depth, detect_marker_centers, annotate_markers
+from depth_stream_receiver import colourise_depth #, detect_marker_centers, annotate_markers
 # camera matrix and distortion coefficients fom running depth_stream_receiver
 DEFAULT_CAMERA_MATRIX = np.array([[363.10574341,   0.          , 267.85662842],
                                    [  0.         , 363.10574341, 237.83192444],
@@ -43,6 +43,8 @@ def _draw_overlay(
     image_indices: tuple[int, ...],
     reproj: float,
     conf: float,
+    coverage: float = 1.0,
+    unmatched_det: int = 0,
 ) -> np.ndarray:
     out = depth_bgr.copy()
     if out.ndim == 2:
@@ -75,7 +77,8 @@ def _draw_overlay(
             )
 
     label = (
-        f"ok={est_ok} ids={model_indices} reproj={reproj:.2f}px conf={conf:.2f}"
+        f"ok={est_ok} ids={model_indices} reproj={reproj:.2f}px cov={coverage:.2f} "
+        f"unmatched={unmatched_det} conf={conf:.2f}"
         if est_ok
         else "ok=False"
     )
@@ -137,7 +140,8 @@ def run_recording(
             projected = projected.reshape(-1, 2)
             print(
                 f"{path.name}  n={len(pts)}  ok  ids={est.model_indices}  "
-                f"reproj={est.mean_reproj_px:.2f}px  conf={est.confidence:.2f}  "
+                f"reproj={est.mean_reproj_px:.2f}px  cov={est.coverage:.2f}  "
+                f"unmatched={est.n_unmatched_detections}  conf={est.confidence:.2f}  "
                 f"t=({est.tvec[0,0]:.3f},{est.tvec[1,0]:.3f},{est.tvec[2,0]:.3f})"
             )
         else:
@@ -160,6 +164,8 @@ def run_recording(
                 est.image_indices,
                 est.mean_reproj_px if est.ok else float("inf"),
                 est.confidence if est.ok else 0.0,
+                coverage=est.coverage if est.ok else 0.0,
+                unmatched_det=est.n_unmatched_detections if est.ok else 0,
             )
             # add to list of overlays
             overlays.append(overlay)
@@ -178,17 +184,27 @@ def run_recording(
         print(f"overlays → {overlay_dir}")
     return overlays
 
-def video_save_overlay(recording_path: Path, overlays: list[np.ndarray]) -> None: # instead of saving the overlays, save a video of the overlays
+
+def video_save_overlay(recording_path: Path, overlays: list[np.ndarray]) -> None:
+    if not overlays:
+        return
     h, w = overlays[0].shape[:2]
     if overlays[0].ndim == 2:
         h, w = overlays[0].shape
-    writer = cv2.VideoWriter(str(recording_path / "pose_overlay.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 15, (w, h))
+    writer = cv2.VideoWriter(
+        str(recording_path / "pose_overlay.mp4"),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        15,
+        (w, h),
+    )
     for frame in overlays:
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         writer.write(np.ascontiguousarray(frame, dtype=np.uint8))
     writer.release()
     print(f"video saved to {recording_path / 'pose_overlay.mp4'}")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -214,4 +230,5 @@ if __name__ == "__main__":
         save_overlay=args.save_overlay,
         max_frames=args.max_frames,
     )
-    video_save_overlay(args.recording, overlays)
+    if args.save_overlay and overlays:
+        video_save_overlay(args.recording, overlays)
