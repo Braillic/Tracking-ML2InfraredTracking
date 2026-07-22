@@ -21,7 +21,7 @@ TEST_MARKER_COORDS = np.array(
     (
         (0, 0.0501, 0), # top
         (-0.0131, 0.0126, 0), # left
-        (0, 0, 0), # center 
+        (0, 0, 0), # center
         (0, -0.0391 , 0) # bottom
     ),
     dtype=np.float64,
@@ -93,7 +93,7 @@ class MarkerPoseTracker:
         if self.model_points.shape[0] < self.min_markers:
             raise ValueError("model_points shorter than min_markers")
         if self.min_markers < 3:
-            raise ValueError("PnP needs at least 3 markers")    
+            raise ValueError("PnP needs at least 3 markers")
 
     def reset(self) -> None:
         self._prev_rvec = None
@@ -103,6 +103,13 @@ class MarkerPoseTracker:
 
     def _expected_matches(self, n_detected: int) -> int:
         return min(n_detected, self.model_points.shape[0])
+
+    def _commit(self, estimate: PoseEstimate) -> PoseEstimate:
+        self._prev_rvec = estimate.rvec
+        self._prev_tvec = estimate.tvec
+        self._prev_model_indices = estimate.model_indices
+        self._prev_image_indices = estimate.image_indices
+        return estimate
 
     def estimate(
         self,
@@ -123,22 +130,15 @@ class MarkerPoseTracker:
         # default to temporal association if already tracking
         if self._prev_rvec is not None and self._prev_tvec is not None:
             temporal = self._estimate_temporal(pts, K, dist, n_detected)
+            # if the pose is valid and the confidence is high enough, update the previous pose
+            # otherwise, use combinatorial estimation
             if temporal.ok and temporal.confidence >= self.min_confidence:
-                self._prev_rvec = temporal.rvec
-                self._prev_tvec = temporal.tvec
-                self._prev_model_indices = temporal.model_indices
-                self._prev_image_indices = temporal.image_indices
-                return temporal
+                return self._commit(temporal)
 
         combinatorial = self._estimate_combinatorial(pts, K, dist, n_detected)
         if combinatorial.ok:
-            self._prev_rvec = combinatorial.rvec
-            self._prev_tvec = combinatorial.tvec
-            self._prev_model_indices = combinatorial.model_indices
-            self._prev_image_indices = combinatorial.image_indices
-        else:
-            # keep last pose only if we never found anything this frame
-            pass
+            return self._commit(combinatorial)
+        # keep last pose only if we never found anything this frame
         return combinatorial
 
     # ------------------------------------------------------------------
@@ -152,65 +152,23 @@ class MarkerPoseTracker:
         dist_coeffs: np.ndarray,
         n_detected: int,
     ) -> PoseEstimate:
-        # Seed assignment from previous correspondences when still visible.
-        model_idx: list[int] = []
-        image_idx: list[int] = []
-        if self._prev_model_indices and self._prev_image_indices:
-            projected_prev, _ = cv2.projectPoints(
-                self.model_points[list(self._prev_model_indices)].reshape(-1, 1, 3),
-                self._prev_rvec,
-                self._prev_tvec,
-                camera_matrix,
-                dist_coeffs,
-            )
-            projected_prev = projected_prev.reshape(-1, 2)
-            used_image: set[int] = set()
-            for k, mi in enumerate(self._prev_model_indices):
-                d = np.linalg.norm(image_points - projected_prev[k], axis=1)
-                order = np.argsort(d)
-                for ji in order:
-                    ji = int(ji)
-                    if ji in used_image or d[ji] > self.max_assoc_px:
-                        continue
-                    used_image.add(ji)
-                    model_idx.append(int(mi))
-                    image_idx.append(ji)
-                    break
-
-        if len(model_idx) < self.min_markers:
-            projected, _ = cv2.projectPoints(
-                self.model_points,
-                self._prev_rvec,
-                self._prev_tvec,
-                camera_matrix,
-                dist_coeffs,
-            )
-            projected = projected.reshape(-1, 2)
-            dmat = np.linalg.norm(
-                projected[:, None, :] - image_points[None, :, :], axis=2
-            )
-            model_idx = []
-            image_idx = []
-            used_model: set[int] = set()
-            used_image = set()
-            flat = [(float(dmat[i, j]), i, j)
-                    for i in range(dmat.shape[0])
-                    for j in range(dmat.shape[1])]
-            flat.sort()
-            for dist, i, j in flat:
-                if dist > self.max_assoc_px:
-                    break
-                if i in used_model or j in used_image:
-                    continue
-                if int(np.argmin(dmat[i])) != j:
-                    continue
-                if int(np.argmin(dmat[:, j])) != i:
-                    continue
-                used_model.add(i)
-                used_image.add(j)
-                model_idx.append(i)
-                image_idx.append(j)
-
+        # use previous pose to project model points and find correspondences
+        # using mutual nearest assignment to find correspondences
+        # (prefer previous correspondences when still close)
+        projected, _ = cv2.projectPoints(
+            self.model_points.reshape(-1, 1, 3),
+            self._prev_rvec,
+            self._prev_tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        model_idx, image_idx = _assign_mutual_nearest(
+            projected.reshape(-1, 2),
+            image_points,
+            self.max_assoc_px,
+            preferred_model=self._prev_model_indices,
+            preferred_image=self._prev_image_indices,
+        )
         if len(model_idx) < self.min_markers:
             return PoseEstimate.failed()
 
@@ -218,8 +176,8 @@ class MarkerPoseTracker:
             image_points,
             camera_matrix,
             dist_coeffs,
-            tuple(model_idx),
-            tuple(image_idx),
+            model_idx,
+            image_idx,
             n_detected,
             use_extrinsic_guess=True,
         )
@@ -262,12 +220,11 @@ class MarkerPoseTracker:
                     if sig_err > hard_gate:
                         continue
 
-                    assign_tol = float(self.max_distance_ratio_error)
                     for image_idx in _candidate_assignments( # correspondences between image and model points
                         img_pts,
                         model_pts,
                         img_combo,
-                        assign_tol,
+                        hard_gate,
                         exhaustive=(k <= 5),
                     ):
                         paired_img = image_points[list(image_idx)]
@@ -284,25 +241,17 @@ class MarkerPoseTracker:
                         )
                         if not estimate.ok:
                             continue
-                        # Soft signature term only helps when coplanar-ish.
-                        cost = _ranking_cost(estimate, self, signature_error=0.0)
+                        cost = _ranking_cost(estimate, self)
                         if cost < best_cost:
                             best_cost = cost
                             best = estimate
 
+            # good enough at this subset size — no need to try smaller k
             if (
                 best.ok
                 and best.n_used == k
-                and best.support >= k
                 and best.confidence >= 0.7
-            ):
-                break
-
-            if (
-                best.ok
-                and best.n_used == k
-                and best.coverage >= 1.0
-                and best.confidence >= 0.7
+                and (best.support >= k or best.coverage >= 1.0)
             ):
                 break
 
@@ -320,8 +269,7 @@ class MarkerPoseTracker:
     ) -> PoseEstimate:
         obj = self.model_points[list(model_indices)].astype(np.float64)
         img = image_points[list(image_indices)].astype(np.float64)
-        n = obj.shape[0]
-        if n < self.min_markers:
+        if obj.shape[0] < self.min_markers:
             return PoseEstimate.failed()
 
         rvec0 = (
@@ -335,28 +283,20 @@ class MarkerPoseTracker:
             else np.zeros((3, 1), dtype=np.float64)
         )
 
-        flags_to_try = [cv2.SOLVEPNP_SQPNP]
-        rvecs: list[np.ndarray] = []
-        tvecs: list[np.ndarray] = []
-        for flags in flags_to_try:
-            try:
-                ok, rs, ts, _ = cv2.solvePnPGeneric(
-                    obj.reshape(-1, 1, 3),
-                    img.reshape(-1, 1, 2),
-                    camera_matrix,
-                    dist_coeffs,
-                    flags=flags,
-                    rvec=rvec0,
-                    tvec=tvec0,
-                    useExtrinsicGuess=use_extrinsic_guess,
-                )
-            except cv2.error:
-                continue
-            if ok and rs:
-                rvecs.extend(rs)
-                tvecs.extend(ts)
-
-        if not rvecs:
+        try:
+            ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(
+                obj.reshape(-1, 1, 3),
+                img.reshape(-1, 1, 2),
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_SQPNP,
+                rvec=rvec0,
+                tvec=tvec0,
+                useExtrinsicGuess=use_extrinsic_guess,
+            )
+        except cv2.error:
+            return PoseEstimate.failed()
+        if not ok or not rvecs:
             return PoseEstimate.failed()
 
         best_est = PoseEstimate.failed()
@@ -379,23 +319,26 @@ class MarkerPoseTracker:
                 refine=self.refine_pose,
                 iterations=self.refine_iterations,
             )
+            # keeping track of # of markers pose predicts as a ratio to how many are expected based on detections
             n_used = len(mi_f)
             coverage = n_used / max(expected, 1)
             unmatched_det = max(0, n_detected - len(set(ii_f)))
 
-            obj_f = self.model_points[list(mi_f)]
-            img_f = image_points[list(ii_f)]
-            mean_reproj = _mean_reprojection_error(
-                obj_f, img_f, rvec_f, tvec_f, camera_matrix, dist_coeffs
-            )
-            penalized_reproj = mean_reproj + self.unmatched_det_penalty_px * unmatched_det
-
-            if mean_reproj > self.max_reproj_px:
-                continue
             if n_used < self.min_markers:
                 continue
             # When enough markers are visible, require full min-side coverage.
             if n_detected >= self.min_markers and n_used < expected:
+                continue
+
+            mean_reproj = _mean_reprojection_error(
+                self.model_points[list(mi_f)],
+                image_points[list(ii_f)],
+                rvec_f,
+                tvec_f,
+                camera_matrix,
+                dist_coeffs,
+            )
+            if mean_reproj > self.max_reproj_px:
                 continue
 
             support = _model_support(
@@ -412,7 +355,6 @@ class MarkerPoseTracker:
 
             confidence = _confidence(
                 mean_reproj_px=mean_reproj,
-                n_used=n_used,
                 n_model=self.model_points.shape[0],
                 n_detected=n_detected,
                 support=support,
@@ -544,9 +486,14 @@ def _refine_pose_and_reassign(
 
     for _ in range(max(1, iterations)):
         if refine and len(mi) >= 3:
-            obj = model_points[list(mi)]
-            img = image_points[list(ii)]
-            r, t = _refine_pose_lm(obj, img, camera_matrix, dist_coeffs, r, t)
+            r, t = _refine_pose_lm(
+                model_points[list(mi)],
+                image_points[list(ii)],
+                camera_matrix,
+                dist_coeffs,
+                r,
+                t,
+            )
 
         projected, _ = cv2.projectPoints(
             model_points.reshape(-1, 1, 3),
@@ -622,13 +569,14 @@ def _orientation_consistent(image_pts: np.ndarray, model_pts: np.ndarray) -> boo
 
 
 def _point_fingerprints(pts: np.ndarray) -> np.ndarray:
-    """(n, n-1) sorted neighbour distances per point, row-normalized."""
+    """how the points are arranged relative to each other, in terms of normalized distance to every other point"""
     pts = np.asarray(pts, dtype=np.float64)
     n = pts.shape[0]
     out = np.zeros((n, n - 1), dtype=np.float64)
     for i in range(n):
         d = np.sort(np.linalg.norm(pts - pts[i], axis=1))[1:]
         scale = d[-1] if d[-1] > 1e-12 else 1.0
+        # per row normalization
         out[i] = d / scale
     return out
 
@@ -673,7 +621,7 @@ def _candidate_assignments(
             scored.append((err, tuple(img_combo[perm[mi]] for mi in range(k))))
         scored.sort()
         limit = min(len(scored), 120 if exhaustive else 6)
-        for err, assignment in scored[:limit]:
+        for _, assignment in scored[:limit]:
             if assignment not in assignments:
                 assignments.append(assignment)
     return assignments
@@ -728,25 +676,12 @@ def _model_support(
         camera_matrix,
         dist_coeffs,
     )
-    projected = projected.reshape(-1, 2)
-    dmat = np.linalg.norm(projected[:, None, :] - image_points[None, :, :], axis=2)
-    used_image: set[int] = set()
-    support = 0
-    flat = sorted(
-        (float(dmat[i, j]), i, j)
-        for i in range(dmat.shape[0])
-        for j in range(dmat.shape[1])
+    mi, _ = _assign_mutual_nearest(
+        projected.reshape(-1, 2),
+        image_points,
+        max_assoc_px,
     )
-    used_model: set[int] = set()
-    for dist, i, j in flat:
-        if dist > max_assoc_px:
-            break
-        if i in used_model or j in used_image:
-            continue
-        used_model.add(i)
-        used_image.add(j)
-        support += 1
-    return support
+    return len(mi)
 
 
 def _rotation_angle(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
@@ -757,9 +692,20 @@ def _rotation_angle(rvec_a: np.ndarray, rvec_b: np.ndarray) -> float:
     return float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
 
 
+def _pose_delta(
+    rvec: np.ndarray,
+    tvec: np.ndarray,
+    prev_rvec: np.ndarray,
+    prev_tvec: np.ndarray,
+) -> tuple[float, float]:
+    # how much the pose has changed since last frame
+    dt = float(np.linalg.norm(tvec.reshape(3) - prev_tvec.reshape(3)))
+    dtheta = _rotation_angle(rvec, prev_rvec)
+    return dt, dtheta
+
+
 def _confidence(
     mean_reproj_px: float,
-    n_used: int,
     n_model: int,
     n_detected: int,
     support: int,
@@ -775,11 +721,11 @@ def _confidence(
     expected = min(n_detected, n_model)
     coverage_term = coverage if expected > 0 else 0.0
     model_term = support / max(n_model, 1)
+    # if detection not paired to a model point, penalize
     orphan_penalty = float(np.exp(-0.75 * unmatched_det))
     temporal = 1.0
     if prev_rvec is not None and prev_tvec is not None:
-        dt = float(np.linalg.norm(tvec.reshape(3) - prev_tvec.reshape(3)))
-        dtheta = _rotation_angle(rvec, prev_rvec)
+        dt, dtheta = _pose_delta(rvec, tvec, prev_rvec, prev_tvec)
         temporal = float(np.exp(-dt / 0.05) * np.exp(-dtheta / 0.35))
     return float(
         np.clip(
@@ -792,10 +738,10 @@ def _confidence(
         )
     )
 
+
 def _ranking_cost(
     estimate: PoseEstimate,
     tracker: MarkerPoseTracker,
-    signature_error: float = 0.0,
 ) -> float:
     """Lower is better. Mixes reprojection, coverage, and temporal delta."""
     expected = tracker._expected_matches(estimate.n_detected)
@@ -803,7 +749,6 @@ def _ranking_cost(
     cost += tracker.unmatched_det_penalty_px * estimate.n_unmatched_detections
     cost += 8.0 * max(0, expected - estimate.n_used)
     cost += 3.0 * (tracker.model_points.shape[0] - estimate.support)
-    cost += 8.0 * signature_error
     if estimate.coverage < 1.0 and estimate.n_detected >= tracker.min_markers:
         cost += 20.0 * (1.0 - estimate.coverage)
     if (
@@ -812,8 +757,9 @@ def _ranking_cost(
         and estimate.rvec is not None
         and estimate.tvec is not None
     ):
-        dt = float(np.linalg.norm(estimate.tvec.reshape(3) - tracker._prev_tvec.reshape(3)))
-        dtheta = _rotation_angle(estimate.rvec, tracker._prev_rvec)
+        dt, dtheta = _pose_delta(
+            estimate.rvec, estimate.tvec, tracker._prev_rvec, tracker._prev_tvec
+        )
         cost += tracker.temporal_translation_weight * dt
         cost += tracker.temporal_rotation_weight * dtheta
     return cost
