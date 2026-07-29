@@ -288,20 +288,31 @@ public class DepthSensorAPI : MonoBehaviour
                 {
                     // Process Frames ...
                     Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value, frame.CaptureTime);
+                    sensorPose = DepthSensorPoseUtil.ToWorldPose(sensorPose, xrOrigin);
 
-                    if (xrOrigin)
-                    {
-                        var baseTf = xrOrigin.CameraFloorOffsetObject.transform;
-                        sensorPose.position = baseTf.TransformPoint(sensorPose.position);
-                        sensorPose.rotation = xrOrigin.transform.rotation * sensorPose.rotation;
-                    }
-
-                    Debug.Log("Sensor Pose:" + sensorPose);
                     streamVisualizer.ProcessFrame(frame, metaData, sensorPose);
 
                     yield return null;
                 }
             }
+        }
+    }
+
+    private void LateUpdate()
+    {
+        // Display-rate extrinsic for the debugger. Depth frames alone are often
+        // ~5 Hz, which looks like the axes "slowly chase" the head.
+        if (!sensorId.HasValue || pixelSensorFeature == null || streamVisualizer == null)
+            return;
+
+        var debugger = streamVisualizer.SensorPoseDebugger;
+        if (debugger == null || !debugger.isActiveAndEnabled)
+            return;
+
+        if (DepthSensorPoseUtil.TryGetLiveSensorPose(
+                pixelSensorFeature, sensorId.Value, xrOrigin, out Pose livePose))
+        {
+            debugger.SubmitLive(livePose);
         }
     }
 

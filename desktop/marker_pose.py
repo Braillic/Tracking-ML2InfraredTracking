@@ -16,6 +16,7 @@ from typing import Sequence
 
 import cv2
 import numpy as np
+from pathlib import Path
 # in meters, planar probe first
 TEST_MARKER_COORDS = np.array(
     (
@@ -515,9 +516,13 @@ def _refine_pose_and_reassign(
     return r, t, mi, ii
 
 
-def _pairwise_distance_signature(points: np.ndarray) -> np.ndarray:
-    """Sorted pairwise distances, normalized by the largest (scale-invariant)."""
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, points.shape[-1])
+def pairwise_distances(points: np.ndarray) -> np.ndarray:
+    """Upper-triangle pairwise distances for NxD points → length N*(N-1)/2."""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, pts.size)
+    elif pts.ndim > 2:
+        pts = pts.reshape(-1, pts.shape[-1])
     n = pts.shape[0]
     if n < 2:
         return np.zeros(0, dtype=np.float64)
@@ -525,17 +530,189 @@ def _pairwise_distance_signature(points: np.ndarray) -> np.ndarray:
     for i in range(n):
         for j in range(i + 1, n):
             dists.append(float(np.linalg.norm(pts[i] - pts[j])))
-    sig = np.sort(np.asarray(dists, dtype=np.float64))
-    scale = sig[-1]
+    return np.asarray(dists, dtype=np.float64)
+
+
+def pairwise_distance_signature(points: np.ndarray) -> np.ndarray:
+    """Sorted pairwise distances, normalized by the largest (scale-invariant)."""
+    sig = np.sort(pairwise_distances(points))
+    if sig.size == 0:
+        return sig
+    scale = float(sig[-1])
     if scale < 1e-12:
         return np.zeros_like(sig)
     return sig / scale
 
 
-def _signature_error(a: np.ndarray, b: np.ndarray) -> float:
+def signature_error(a: np.ndarray, b: np.ndarray) -> float:
+    """Max absolute difference between two distance signatures."""
     if a.shape != b.shape or a.size == 0:
         return float("inf")
     return float(np.max(np.abs(a - b)))
+
+
+# Back-compat private aliases (existing MarkerPoseTracker call sites).
+_pairwise_distance_signature = pairwise_distance_signature
+_signature_error = signature_error
+
+
+def nearest_neighbor_distances(points: np.ndarray) -> np.ndarray:
+    """Per-point distance to the nearest other point (inf if only one point)."""
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(-1, 1)
+    n = pts.shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    if n == 1:
+        return np.array([np.inf], dtype=np.float64)
+    nn = np.full(n, np.inf, dtype=np.float64)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            d = float(np.linalg.norm(pts[i] - pts[j]))
+            if d < nn[i]:
+                nn[i] = d
+    return nn
+
+
+def filter_isolated_centers(
+    centers: Sequence[tuple[float, float]] | np.ndarray,
+    *,
+    max_nearest_neighbor_px: float,
+) -> list[tuple[int, int]]:
+    """Drop detections whose nearest neighbor is farther than max_nearest_neighbor_px."""
+    pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] < 2:
+        return []
+    nn = nearest_neighbor_distances(pts)
+    return [
+        (int(round(pts[i, 0])), int(round(pts[i, 1])))
+        for i, d in enumerate(nn)
+        if d <= max_nearest_neighbor_px
+    ]
+
+
+def filter_centers_by_span(
+    centers: Sequence[tuple[float, float]] | np.ndarray,
+    *,
+    max_cluster_span_px: float,
+) -> list[tuple[int, int]]:
+    """Keep the densest subset whose diameter (max pairwise distance) is ≤ max span."""
+    pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] <= 1:
+        return []
+    n = pts.shape[0]
+    best: list[int] = []
+    best_span = float("inf")
+
+    for seed in range(n):
+        order = np.argsort(np.linalg.norm(pts - pts[seed], axis=1))
+        chosen: list[int] = []
+        for idx in order.tolist():
+            trial = chosen + [idx]
+            span = (
+                float(np.max(pairwise_distances(pts[trial]))) if len(trial) >= 2 else 0.0
+            )
+            if span <= max_cluster_span_px:
+                chosen = trial
+            elif chosen:
+                break
+        trial_span = (
+            float(np.max(pairwise_distances(pts[chosen]))) if len(chosen) >= 2 else 0.0
+        )
+        if len(chosen) > len(best) or (
+            len(chosen) == len(best) and len(chosen) >= 2 and trial_span < best_span
+        ):
+            best = chosen
+            best_span = trial_span
+
+    return [(int(round(pts[i, 0])), int(round(pts[i, 1]))) for i in best]
+
+
+def filter_centers_by_model_geometry(
+    centers: Sequence[tuple[float, float]] | np.ndarray,
+    model_points: np.ndarray,
+    *,
+    min_cluster_size: int,
+    max_geometry_ratio_error: float,
+) -> list[tuple[int, int]]:
+    """Keep the largest detection subset whose pairwise distance ratios match the model."""
+    pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+    model = np.asarray(model_points, dtype=np.float64).reshape(-1, 3)
+    n = pts.shape[0]
+    m = model.shape[0]
+    if n < min_cluster_size or m < min_cluster_size:
+        return []
+
+    best_idx: tuple[int, ...] = ()
+    best_err = float("inf")
+
+    for k in range(min(n, m), min_cluster_size - 1, -1):
+        model_sigs = [
+            (pairwise_distance_signature(model[list(mi)]), mi)
+            for mi in combinations(range(m), k)
+        ]
+        for img_i in combinations(range(n), k):
+            img_sig = pairwise_distance_signature(pts[list(img_i)])
+            for model_sig, _ in model_sigs:
+                err = signature_error(img_sig, model_sig)
+                if err <= max_geometry_ratio_error and (
+                    len(img_i) > len(best_idx)
+                    or (len(img_i) == len(best_idx) and err < best_err)
+                ):
+                    best_idx = img_i
+                    best_err = err
+        if best_idx:
+            break
+
+    return [(int(round(pts[i, 0])), int(round(pts[i, 1]))) for i in best_idx]
+
+
+def filter_marker_centers(
+    centers: Sequence[tuple[float, float]] | np.ndarray,
+    *,
+    model_points: np.ndarray | None = None,
+    max_nearest_neighbor_px: float = 90.0,
+    max_cluster_span_px: float = 220.0,
+    min_cluster_size: int = 3,
+    max_geometry_ratio_error: float = 0.35,
+) -> list[tuple[int, int]]:
+    """Remove isolated / geometrically implausible marker detections.
+
+    Pipeline:
+      1. Drop points with no neighbor within max_nearest_neighbor_px.
+      2. Keep a compact cluster (diameter ≤ max_cluster_span_px).
+      3. Keep the largest subset whose pairwise distance ratios match the 3D model.
+    """
+    pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] < min_cluster_size:
+        return []
+
+    model = TEST_MARKER_COORDS if model_points is None else model_points
+    as_tuples = [
+        (int(round(p[0])), int(round(p[1]))) for p in pts
+    ]
+    nearby = filter_isolated_centers(
+        as_tuples, max_nearest_neighbor_px=max_nearest_neighbor_px
+    )
+    if len(nearby) < min_cluster_size:
+        return []
+
+    compact = filter_centers_by_span(
+        nearby, max_cluster_span_px=max_cluster_span_px
+    )
+    if len(compact) < min_cluster_size:
+        return []
+
+    geometric = filter_centers_by_model_geometry(
+        compact,
+        model,
+        min_cluster_size=min_cluster_size,
+        max_geometry_ratio_error=max_geometry_ratio_error,
+    )
+    return geometric if geometric else compact
 
 
 def _orientation_consistent(image_pts: np.ndarray, model_pts: np.ndarray) -> bool:
@@ -767,3 +944,22 @@ def _ranking_cost(
 
 def centers_to_float(centers: Sequence[tuple[int, int]] | np.ndarray) -> np.ndarray:
     return np.asarray(centers, dtype=np.float64).reshape(-1, 2)
+
+def video_save_overlay(recording_path: Path, overlays: list[np.ndarray]) -> None:
+    if not overlays:
+        return
+    h, w = overlays[0].shape[:2]
+    if overlays[0].ndim == 2:
+        h, w = overlays[0].shape
+    writer = cv2.VideoWriter(
+        str(recording_path / "pose_overlay.mp4"),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        15,
+        (w, h),
+    )
+    for frame in overlays:
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        writer.write(np.ascontiguousarray(frame, dtype=np.uint8))
+    writer.release()
+    print(f"video saved to {recording_path / 'pose_overlay.mp4'}")

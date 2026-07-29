@@ -2736,6 +2736,8 @@ GameObject:
   - component: {fileID: 1591841588}
   - component: {fileID: 1591841589}
   - component: {fileID: 1591841590}
+  - component: {fileID: 1591841591}
+  - component: {fileID: 1591841592}
   m_Layer: 0
   m_Name: IRToolManager
   m_TagString: Untagged
@@ -2794,6 +2796,7 @@ MonoBehaviour:
       frameTypeMaterial: {fileID: 2100000, guid: 6c77b5a522d2b734cb08291e2a786d40,
         type: 2}
   depthTcpServer: {fileID: 1591841590}
+  sensorPoseDebugger: {fileID: 1591841592}
 --- !u!114 &1591841589
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2826,6 +2829,63 @@ MonoBehaviour:
   statusText: {fileID: 1301455982}
   sensorInfoText: {fileID: 0}
   showOnGuiOverlay: 1
+--- !u!114 &1591841591
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1591841582}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 2732916654d6e4fb3929eb0648f08875, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  startAutomatically: 1
+  bindAddress: 0.0.0.0
+  port: 50778
+  trackedTool: {fileID: 0}
+  minConfidence: 0
+  dropStaleFrames: 1
+  createMarkerSpheresOnFirstPose: 1
+  markerLocalPositions:
+  - {x: 0, y: 0.0501, z: 0}
+  - {x: -0.0131, y: 0.0126, z: 0}
+  - {x: 0, y: 0, z: 0}
+  - {x: 0, y: -0.0391, z: 0}
+  markerSphereRadius: 0.004
+  markerSphereColor: {r: 1, g: 0.2, b: 0.2, a: 0.9}
+  statusText: {fileID: 0}
+  showOnGuiOverlay: 1
+  rotationFollow: 1
+  positionFollow: 1
+--- !u!114 &1591841592
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1591841582}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 3b75827568357427e94ac8bf163abe20, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  showAxes: 0
+  showFrustum: 0
+  showLiveOrigin: 0
+  showFrameSyncedGhost: 0
+  axisLength: 0.08
+  frustumDepth: 0.35
+  lineWidth: 0.003
+  originSphereRadius: 0.008
+  ghostSphereRadius: 0.012
+  axisXColor: {r: 1, g: 0, b: 0, a: 1}
+  axisYColor: {r: 0, g: 1, b: 0, a: 1}
+  axisZColor: {r: 0, g: 0, b: 1, a: 1}
+  frustumColor: {r: 1, g: 0.85, b: 0.2, a: 1}
+  liveOriginColor: {r: 1, g: 1, b: 1, a: 0.95}
+  frameSyncedGhostColor: {r: 0.2, g: 0.9, b: 1, a: 0.7}
 --- !u!1 &1843026824
 GameObject:
   m_ObjectHideFlags: 0

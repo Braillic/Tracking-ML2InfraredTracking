@@ -40,11 +40,15 @@ public class ML2DepthRawStream : MonoBehaviour
     [SerializeField] private PixelSensorMaterialTable materialList = new();
     [Tooltip("Optional. If omitted, a DepthFrameTcpServer is added at runtime with its default settings.")]
     [SerializeField] private DepthFrameTcpServer depthTcpServer;
+    [Tooltip("Optional. Visualizes the same world_T_sensor packed into each depth TCP frame.")]
+    [SerializeField] private DepthSensorPoseDebugger sensorPoseDebugger;
 
     Texture2D targetTexture, filteredTexture;
 
     private float[] _floatBuffer;                        // CPU-side float[] depth map (meters) 
     private DepthCameraIntrinsics? intrinsics;
+
+    public DepthSensorPoseDebugger SensorPoseDebugger => sensorPoseDebugger;
 
     // --- Rendering helpers ---
     private float minDepth = 0, maxDepth = 5;
@@ -148,6 +152,11 @@ public class ML2DepthRawStream : MonoBehaviour
         if (depthTcpServer == null)
             depthTcpServer = gameObject.AddComponent<DepthFrameTcpServer>();
 
+        if (sensorPoseDebugger == null)
+            sensorPoseDebugger = GetComponent<DepthSensorPoseDebugger>();
+        if (sensorPoseDebugger == null)
+            sensorPoseDebugger = gameObject.AddComponent<DepthSensorPoseDebugger>();
+
         // Assign the material 
         var mat = materialList.GetMaterialForFrameType(PixelSensorFrameType.DepthRaw);
         if (targetRenderer) targetRenderer.sharedMaterial = mat;
@@ -212,6 +221,8 @@ public class ML2DepthRawStream : MonoBehaviour
                     if (depthData == null) return;
 
                     depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics);
+                    if (sensorPoseDebugger != null)
+                        sensorPoseDebugger.SubmitFrameSynced(sensorPose, intrinsics, w, h);
 
                     if (targetRenderer != null)
                         targetRenderer.material.mainTexture = targetTexture;

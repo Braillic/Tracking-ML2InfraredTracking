@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import cv2
 import numpy as np
-from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker
+from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker, video_save_overlay
 from depth_stream_receiver import colourise_depth #, detect_marker_centers, annotate_markers
 # camera matrix and distortion coefficients fom running depth_stream_receiver
 DEFAULT_CAMERA_MATRIX = np.array([[363.10574341,   0.          , 267.85662842],
@@ -183,26 +183,6 @@ def run_recording(
     if save_overlay:
         print(f"overlays → {overlay_dir}")
     return overlays
-
-
-def video_save_overlay(recording_path: Path, overlays: list[np.ndarray]) -> None:
-    if not overlays:
-        return
-    h, w = overlays[0].shape[:2]
-    if overlays[0].ndim == 2:
-        h, w = overlays[0].shape
-    writer = cv2.VideoWriter(
-        str(recording_path / "pose_overlay.mp4"),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        15,
-        (w, h),
-    )
-    for frame in overlays:
-        if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        writer.write(np.ascontiguousarray(frame, dtype=np.uint8))
-    writer.release()
-    print(f"video saved to {recording_path / 'pose_overlay.mp4'}")
 
 
 def parse_args() -> argparse.Namespace:
