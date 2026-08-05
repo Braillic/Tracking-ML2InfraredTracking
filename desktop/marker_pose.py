@@ -28,6 +28,16 @@ TEST_MARKER_COORDS = np.array(
     dtype=np.float64,
 )
 
+HEAD_MARKER_COORDS = np.array(
+    (
+        (0, 0, 0) # center M0
+        (0.0239, 0.0027, 0) # left M1
+        (0.0546, 0.0099, 0) # far left M2
+        (0, 0.0335, 0) # top M3
+    ),
+    dtype=np.float64,
+)
+
 
 @dataclass(frozen=True)
 class PoseEstimate:
