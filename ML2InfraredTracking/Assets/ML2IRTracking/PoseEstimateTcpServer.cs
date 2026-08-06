@@ -61,6 +61,12 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [SerializeField, Range(0f, 1f)] private float rotationFollow = 1f;
     [SerializeField, Range(0f, 1f)] private float positionFollow = 1f;
 
+    [Header("Latency (Debug.Log)")]
+    [Tooltip("Log throttled [ML2LAT] lines on the main thread when a pose is applied. " +
+             "Logging every frame can add measurable overhead — keep Every N >= 10.")]
+    [SerializeField] private bool logLatency = true;
+    [SerializeField, Min(1)] private int latencyLogEveryN = 15;
+
     private readonly object _poseLock = new object();
     private bool _hasPending;
     private ulong _pendingFrameId;
@@ -68,6 +74,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private float _pendingConfidence;
     private Vector3 _pendingPosition;
     private Quaternion _pendingRotation;
+    private double _pendingReceivedRealtime;
+    private int _latencyLogCounter;
 
     private Thread _serverThread;
     private TcpListener _listener;
@@ -186,6 +194,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     public void SubmitPose(ulong frameId, bool ok, float confidence, in Vector3 position,
         in Quaternion rotation)
     {
+        // realtimeSinceStartup is safe to read off the main thread; avoid Debug.Log here.
+        double receivedRealtime = Time.realtimeSinceStartupAsDouble;
         lock (_poseLock)
         {
             _pendingFrameId = frameId;
@@ -193,6 +203,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             _pendingConfidence = confidence;
             _pendingPosition = position;
             _pendingRotation = rotation;
+            _pendingReceivedRealtime = receivedRealtime;
             _hasPending = true;
         }
     }
@@ -204,6 +215,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         float confidence;
         Vector3 position;
         Quaternion rotation;
+        double receivedRealtime;
 
         lock (_poseLock)
         {
@@ -215,6 +227,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             confidence = _pendingConfidence;
             position = _pendingPosition;
             rotation = _pendingRotation;
+            receivedRealtime = _pendingReceivedRealtime;
             _hasPending = false;
         }
 
@@ -241,6 +254,43 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
         _lastAppliedFrameId = frameId;
         Interlocked.Increment(ref _appliedCount);
+        MaybeLogLatency(frameId, receivedRealtime);
+    }
+
+    private void MaybeLogLatency(ulong frameId, double receivedRealtime)
+    {
+        if (!logLatency)
+            return;
+
+        _latencyLogCounter++;
+        if (_latencyLogCounter % latencyLogEveryN != 0)
+            return;
+
+        double now = Time.realtimeSinceStartupAsDouble;
+        double applyWaitMs = (now - receivedRealtime) * 1000.0;
+
+        var depthServer = DepthFrameTcpServer.ActiveServer;
+        if (depthServer == null ||
+            !depthServer.TryGetFrameTiming(frameId, out double submit, out double sendDone, out bool hasSend))
+        {
+            Debug.Log($"[ML2LAT] frame={frameId} apply_wait={applyWaitMs:F1}ms " +
+                      "(no matching depth submit time — is DepthFrameTcpServer active?)");
+            return;
+        }
+
+        double e2eMs = (now - submit) * 1000.0;
+        if (!hasSend)
+        {
+            Debug.Log($"[ML2LAT] frame={frameId} e2e={e2eMs:F1}ms apply_wait={applyWaitMs:F1}ms " +
+                      "(send time missing)");
+            return;
+        }
+
+        double queueMs = (sendDone - submit) * 1000.0;
+        double afterSendMs = (now - sendDone) * 1000.0;
+        Debug.Log(
+            $"[ML2LAT] frame={frameId} e2e={e2eMs:F1}ms " +
+            $"(queue+tcp_write={queueMs:F1}ms | net+pc+apply={afterSendMs:F1}ms | apply_wait={applyWaitMs:F1}ms)");
     }
 
     /// <summary>

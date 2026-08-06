@@ -143,6 +143,10 @@ PlayerSettings:
   bundleVersion: 0.0.2
   preloadedAssets:
   - {fileID: -944628639613478452, guid: bb4daeceea261404d9e9069323220d1b, type: 3}
+  - {fileID: 11400000, guid: 46eb174601bc4384f8481fe881e8da53, type: 2}
+  - {fileID: 7133843875722913235, guid: b511854fdac94b741ba0574913c3cfd5, type: 2}
+  - {fileID: -6444401511562071017, guid: d46ec6dd97e59a54ca4c2b9edd86f92d, type: 2}
+  - {fileID: 11400000, guid: ad34cd5a270bbf8459eb6dd78b429593, type: 2}
   metroInputSource: 0
   wsaTransparentSwapchain: 0
   m_HolographicPauseOnTrackingLoss: 1
@@ -271,7 +275,7 @@ PlayerSettings:
   AndroidKeyaliasName: 
   AndroidEnableArmv9SecurityFeatures: 0
   AndroidEnableArm64MTE: 0
-  AndroidBuildApkPerCpuArchitecture: 1
+  AndroidBuildApkPerCpuArchitecture: 0
   AndroidTVCompatibility: 0
   AndroidIsGame: 1
   AndroidEnableTango: 0
