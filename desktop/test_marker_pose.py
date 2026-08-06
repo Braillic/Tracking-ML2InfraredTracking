@@ -27,36 +27,12 @@ DEFAULT_CAMERA_MATRIX = np.array([[363.10574341,   0.          , 267.85662842],
 DEFAULT_DIST_COEFFS = np.array(
     [-0.09079792,-0.01289384, -0.00013479,  0.00011443, -0.01124168], dtype=np.float64)
 
-class ClusterResult:
-    def __init__(
-        self,
-        estimate: PoseEstimate,
-        selected_indices: tuple[int, ...],
-        remaining_indices: tuple[int, ...],
-    ) -> None:
-        self.estimate = estimate
-        self.selected_indices = selected_indices # idx selected as head markers
-        self.remaining_indices = remaining_indices
-
 def _stem_key(path: Path) -> str:
     """centers_000000_7280_....npy → 000000_7280_...."""
     name = path.stem
     prefix = "centers_"
     return name[len(prefix):] if name.startswith(prefix) else name
 
-def identify_head_cluster(
-    detections: np.ndarray,
-    camera_matrix: np.ndarray,
-    dist_coeffs: np.ndarray,
-) -> ClusterResult | None:
-    """finding the four detected points that best match the head marker model"""
-    
-    detections = np.asarray(detections, dtype=np.float64).reshape(-1, 2)
-    
-    if len(detections) < 4:
-        return None
-    
-    
 
 def _draw_overlay(
     depth_bgr: np.ndarray,

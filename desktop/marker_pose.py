@@ -1,8 +1,8 @@
-"""2D↔3D marker correspondence and pose.
+"""2D↔3D probe-marker correspondence and pose.
 
 Per frame:
   1. Acquire image centers (e.g. from detect_marker_centers).
-  2. Build candidates: treat detections as a subset of the known 3D model,
+  2. Build candidates: treat detections as a subset of the known 3D probe model,
      can rule out using pairwise distance-ratio signatures.
   3. Rule out more using: geometric gate → solvePnP → reprojection + temporal score.
   4. Output pose and confidence.
@@ -27,17 +27,6 @@ TEST_MARKER_COORDS = np.array(
     ),
     dtype=np.float64,
 )
-
-HEAD_MARKER_COORDS = np.array(
-    (
-        (0, 0, 0) # center M0
-        (0.0239, 0.0027, 0) # left M1
-        (0.0546, 0.0099, 0) # far left M2
-        (0, 0.0335, 0) # top M3
-    ),
-    dtype=np.float64,
-)
-
 
 @dataclass(frozen=True)
 class PoseEstimate:
@@ -79,17 +68,28 @@ class MarkerPoseTracker:
     max_reproj_px: float = 2.0 # error in pixels between projected and detected points
     # Temporal nearest-neighbour association gate (pixels).
     max_assoc_px: float = 40.0
+    # Reject a solved pose that jumps more than this from the previous frame's
+    # committed translation (metres). Filters minimal-config (3-marker) depth flips.
+    max_translation_jump_m: float = 0.06
+    # After this many consecutive jump-gate rejects, the reference pose is
+    # assumed stale; drop it and re-acquire from scratch.
+    max_consecutive_rejects: int = 3
     # Soft weights for ranking candidates (lower is better before → confidence).
     temporal_translation_weight: float = 50.0  # px-equivalent per metre
     temporal_rotation_weight: float = 30.0  # px-equivalent per radian
     # Reject if confidence below this after ranking.
     min_confidence: float = 0.15
+    # Cold-start needs 4 markers: 3 coplanar points admit two equally-good
+    # poses, so acquiring on 3 (with no prior to disambiguate) can lock onto
+    # the collapsed branch. An already-running track still continues on 3.
+    min_acquire_markers: int = 4
     # LM polish after PnP + one reassignment pass from projected model points.
     refine_pose: bool = True
     refine_iterations: int = 2
     # Added to ranking error for each visible detection left unmatched.
     unmatched_det_penalty_px: float = 12.0
 
+    _reject_streak: int = field(default=0, init=False, repr=False)
     _prev_rvec: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_tvec: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_model_indices: tuple[int, ...] | None = field(default=None, init=False, repr=False)
@@ -111,6 +111,7 @@ class MarkerPoseTracker:
         self._prev_tvec = None
         self._prev_model_indices = None
         self._prev_image_indices = None
+        self._reject_streak = 0
 
     def _expected_matches(self, n_detected: int) -> int:
         return min(n_detected, self.model_points.shape[0])
@@ -138,19 +139,42 @@ class MarkerPoseTracker:
         ).reshape(-1)
         K = np.asarray(camera_matrix, dtype=np.float64)
 
-        # default to temporal association if already tracking
+        # A long reject streak means our reference pose is stale. Drop it and
+        # re-acquire this frame instead of comparing against a frozen pose.
+        if self._reject_streak >= self.max_consecutive_rejects:
+            print(f"[JUMP GATE] lost tracking after {self._reject_streak} rejects — re-acquiring")
+            self.reset()
+
         if self._prev_rvec is not None and self._prev_tvec is not None:
             temporal = self._estimate_temporal(pts, K, dist, n_detected)
-            # if the pose is valid and the confidence is high enough, update the previous pose
-            # otherwise, use combinatorial estimation
-            if temporal.ok and temporal.confidence >= self.min_confidence:
+            if (temporal.ok and temporal.confidence >= self.min_confidence
+                    and self._jump_plausible(temporal)):
+                self._reject_streak = 0
                 return self._commit(temporal)
+            
+        if self._prev_rvec is None and n_detected < self.min_acquire_markers:
+            self._reject_streak = 0
+            return PoseEstimate.failed()
 
         combinatorial = self._estimate_combinatorial(pts, K, dist, n_detected)
-        if combinatorial.ok:
+        # _jump_plausible returns True when there's no prev (fresh acquisition).
+        if combinatorial.ok and self._jump_plausible(combinatorial):
+            self._reject_streak = 0
             return self._commit(combinatorial)
-        # keep last pose only if we never found anything this frame
-        return combinatorial
+
+        self._reject_streak += 1
+        return PoseEstimate.failed()
+    
+    def _jump_plausible(self, est: PoseEstimate) -> bool:
+        if self._prev_tvec is None or est.tvec is None:
+            return True  # no reference yet (startup) — nothing to compare against
+        dt = float(np.linalg.norm(est.tvec.reshape(3) - self._prev_tvec.reshape(3)))
+        if dt > self.max_translation_jump_m:
+            print(f"[JUMP GATE] reject dt={dt*1000:.1f}mm  n_used={est.n_used}  "
+                  f"reproj={est.mean_reproj_px:.2f}px  "
+                  f"z={float(est.tvec[2,0]):.3f}  prev_z={float(self._prev_tvec.reshape(3)[2]):.3f}")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Temporal path: project previous pose, keep nearest detection

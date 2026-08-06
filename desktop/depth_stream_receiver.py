@@ -995,6 +995,8 @@ def parse_args() -> argparse.Namespace:
                         help="Initial Analysis-window threshold mode (toggle with f/p)")
     parser.add_argument("--fixed-threshold", type=float, default=200.0,
                         help="Cutoff on colourised 0-255 intensity when mode is fixed")
+    parser.add_argument("--max-detected-markers", type=int, default=4,
+                        help="Maximum number of probe markers to detect and save per frame")
     parser.add_argument("--percentile", type=float, default=90.0,
                         help="Percentile of colourised intensity when mode is percentile")
     parser.add_argument("--percentile-floor", type=float, default=100.0,
