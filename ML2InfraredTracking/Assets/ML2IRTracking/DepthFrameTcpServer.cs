@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -7,6 +9,7 @@ using System.Net.Sockets;
 using System.Threading;
 using TMPro;
 using UnityEngine;
+using Debug = UnityEngine.Debug;
 
 /// <summary>
 /// Listens for a desktop TCP client and sends the newest depth frame as FLOAT32 meters.
@@ -60,6 +63,14 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private double _nextSubmitTime;
     private double _nextStatusUpdate;
 
+    // Round-trip latency tracking (depth-sent → pose-received, keyed by frame ID).
+    // PoseEstimateTcpServer calls RecordPoseReceived when it gets a pose back.
+    private readonly ConcurrentDictionary<ulong, long> _frameSendTicks = new();
+    private long _latencySumTicks;
+    private long _latencyCount;
+    private long _latencyMaxTicks;
+    private double _nextLatencyLog;
+
     public int Port => port;
     public string Status => _status;
 
@@ -88,6 +99,14 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             _status = submitted == 0
                 ? $"PC connected: {_remoteEndpoint}\nWaiting for first DepthRaw frame..."
                 : $"PC connected: {_remoteEndpoint}\nDepth {_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}";
+        }
+
+        long pendingLatencySamples = Interlocked.Read(ref _latencyCount);
+        if (pendingLatencySamples >= 100)
+        {
+            var (avgMs, maxMs, count) = ConsumeLatencyStats();
+            if (count > 0)
+                Debug.Log($"[ML2Latency] last {count} poses: avg {avgMs:F1} ms, max {maxMs:F1} ms");
         }
 
         if (statusText != null)
@@ -156,6 +175,38 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         _listener = null;
         _serverThread = null;
         _status = "Depth stream stopped";
+    }
+
+    /// <summary>
+    /// Called by PoseEstimateTcpServer when a pose packet arrives for a given frame.
+    /// Computes round-trip latency (depth-sent → pose-received) and accumulates stats.
+    /// </summary>
+    public void RecordPoseReceived(ulong frameId)
+    {
+        if (!_frameSendTicks.TryRemove(frameId, out long sendTick))
+            return;
+
+        long dt = Stopwatch.GetTimestamp() - sendTick;
+        Interlocked.Add(ref _latencySumTicks, dt);
+        Interlocked.Increment(ref _latencyCount);
+
+        long prevMax;
+        do { prevMax = Interlocked.Read(ref _latencyMaxTicks); }
+        while (dt > prevMax && Interlocked.CompareExchange(ref _latencyMaxTicks, dt, prevMax) != prevMax);
+    }
+
+    /// <summary>
+    /// Returns (avgMs, maxMs, sampleCount) and resets the accumulators.
+    /// </summary>
+    public (double avgMs, double maxMs, long count) ConsumeLatencyStats()
+    {
+        long sum = Interlocked.Exchange(ref _latencySumTicks, 0);
+        long count = Interlocked.Exchange(ref _latencyCount, 0);
+        long max = Interlocked.Exchange(ref _latencyMaxTicks, 0);
+        double freq = Stopwatch.Frequency;
+        double avgMs = count > 0 ? (sum / freq * 1000.0 / count) : 0;
+        double maxMs = max / freq * 1000.0;
+        return (avgMs, maxMs, count);
     }
 
     /// <summary>
@@ -325,12 +376,21 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 stream.Write(intrinsicsBytes, 0, intrinsicsByteCount);
                 intrinsicsSent = true;
             }
+            _frameSendTicks[frameNumber] = Stopwatch.GetTimestamp();
             Interlocked.Increment(ref _sentFrameCount);
 
             lock (_frameLock)
             {
                 if (_sparePayload == null || _sparePayload.Length != payload.Length)
                     _sparePayload = payload;
+            }
+
+            // Evict stale entries so the dictionary doesn't grow unbounded
+            if (_frameSendTicks.Count > 120)
+            {
+                ulong cutoff = frameNumber > 100 ? frameNumber - 100 : 0;
+                foreach (var key in _frameSendTicks.Keys)
+                    if (key < cutoff) _frameSendTicks.TryRemove(key, out _);
             }
         }
     }

@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "GB62XT00008P",
         "name": "com.braillic.depthstreaming",
-        "processId": 14010,
+        "processId": 8951,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -137,49 +137,49 @@
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
-            "processId": 10885,
-            "exited": false
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 14962,
-            "exited": false
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 10486,
-            "exited": false
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 18517,
-            "exited": false
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
             "processId": 29586,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
             "processId": 22906,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
             "processId": 32252,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
             "processId": 14010,
+            "exited": true
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 7867,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 24781,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 30566,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 8951,
             "exited": false
         }
     ],
@@ -233,7 +233,7 @@
         "AutoCapture": true
     },
     "m_FilterOptions": {
-        "m_Filter": "",
+        "m_Filter": "latency",
         "m_UseRegularExpressions": false,
         "m_MatchCase": false
     },
@@ -271,5 +271,5 @@
             "exited": false
         }
     },
-    "m_AutoScroll": 2
+    "m_AutoScroll": 0
 }

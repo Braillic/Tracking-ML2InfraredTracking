@@ -60,6 +60,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [Tooltip("0 = snap. Small values reduce jitter but add a little lag.")]
     [SerializeField, Range(0f, 1f)] private float rotationFollow = 1f;
     [SerializeField, Range(0f, 1f)] private float positionFollow = 1f;
+    [SerializeField, Min(0f)] private float hideAfterNoPoseSeconds = 0.5f;
 
     private readonly object _poseLock = new object();
     private bool _hasPending;
@@ -81,6 +82,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private long _appliedCount;
     private double _nextStatusUpdate;
     private bool _markerVisualCreated;
+    private double _lastAcceptedPoseTime = double.NegativeInfinity;
 
     public int Port => port;
     public string Status => _status;
@@ -103,6 +105,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private void Update()
     {
         TryApplyPendingPose();
+        HideTrackedToolIfTimedOut();
 
         if (Time.unscaledTimeAsDouble >= _nextStatusUpdate)
         {
@@ -222,7 +225,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             return;
 
         if (dropStaleFrames && frameId < _lastAppliedFrameId)
+        {
             return;
+        }
 
         EnsureTrackedToolVisual();
         if (trackedTool == null)
@@ -240,7 +245,17 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             trackedTool.rotation = Quaternion.Slerp(trackedTool.rotation, rotation, rotationFollow);
 
         _lastAppliedFrameId = frameId;
+        _lastAcceptedPoseTime = Time.unscaledTimeAsDouble;
         Interlocked.Increment(ref _appliedCount);
+    }
+
+    private void HideTrackedToolIfTimedOut()
+    {
+        if (hideAfterNoPoseSeconds <= 0f || trackedTool == null || !trackedTool.gameObject.activeSelf)
+            return;
+
+        if (Time.unscaledTimeAsDouble - _lastAcceptedPoseTime > hideAfterNoPoseSeconds)
+            trackedTool.gameObject.SetActive(false);
     }
 
     /// <summary>
@@ -383,6 +398,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             }
 
             Interlocked.Increment(ref _receivedCount);
+            DepthFrameTcpServer.ActiveServer?.RecordPoseReceived(frameId);
             SubmitPose(frameId, ok, confidence, position, rotation);
         }
     }
