@@ -63,16 +63,76 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private double _nextSubmitTime;
     private double _nextStatusUpdate;
 
-    // Round-trip latency tracking (depth-sent → pose-received, keyed by frame ID).
-    // PoseEstimateTcpServer calls RecordPoseReceived when it gets a pose back.
-    private readonly ConcurrentDictionary<ulong, long> _frameSendTicks = new();
-    private long _latencySumTicks;
-    private long _latencyCount;
-    private long _latencyMaxTicks;
-    private double _nextLatencyLog;
+    // Ring of recent submit/send times for E2E latency (PoseEstimateTcpServer looks these up).
+    // Storage only — no Debug.Log on the TCP send thread.
+    private const int LatencyRingSize = 128;
+    private readonly object _latencyLock = new object();
+    private readonly ulong[] _latencyFrameIds = new ulong[LatencyRingSize];
+    private readonly double[] _latencySubmitRealtime = new double[LatencyRingSize];
+    private readonly double[] _latencySendDoneRealtime = new double[LatencyRingSize];
+    private readonly bool[] _latencyHasSend = new bool[LatencyRingSize];
+    private int _latencyWriteIndex;
 
     public int Port => port;
     public string Status => _status;
+
+    /// <summary>
+    /// Look up when this depth frame was queued / finished writing on the TCP thread.
+    /// Times are <see cref="Time.realtimeSinceStartupAsDouble"/> (same clock as pose apply).
+    /// </summary>
+    public bool TryGetFrameTiming(ulong frameId, out double submitRealtime, out double sendDoneRealtime,
+        out bool hasSendDone)
+    {
+        lock (_latencyLock)
+        {
+            for (int n = 0; n < LatencyRingSize; n++)
+            {
+                int i = (_latencyWriteIndex - 1 - n + LatencyRingSize) % LatencyRingSize;
+                if (_latencyFrameIds[i] != frameId)
+                    continue;
+
+                submitRealtime = _latencySubmitRealtime[i];
+                sendDoneRealtime = _latencySendDoneRealtime[i];
+                hasSendDone = _latencyHasSend[i];
+                return submitRealtime > 0.0;
+            }
+        }
+
+        submitRealtime = 0.0;
+        sendDoneRealtime = 0.0;
+        hasSendDone = false;
+        return false;
+    }
+
+    private void RecordLatencySubmit(ulong frameId, double submitRealtime)
+    {
+        lock (_latencyLock)
+        {
+            int i = _latencyWriteIndex;
+            _latencyFrameIds[i] = frameId;
+            _latencySubmitRealtime[i] = submitRealtime;
+            _latencySendDoneRealtime[i] = 0.0;
+            _latencyHasSend[i] = false;
+            _latencyWriteIndex = (i + 1) % LatencyRingSize;
+        }
+    }
+
+    private void RecordLatencySendDone(ulong frameId, double sendDoneRealtime)
+    {
+        lock (_latencyLock)
+        {
+            for (int n = 0; n < LatencyRingSize; n++)
+            {
+                int i = (_latencyWriteIndex - 1 - n + LatencyRingSize) % LatencyRingSize;
+                if (_latencyFrameIds[i] != frameId)
+                    continue;
+
+                _latencySendDoneRealtime[i] = sendDoneRealtime;
+                _latencyHasSend[i] = true;
+                return;
+            }
+        }
+    }
 
     private void OnEnable()
     {
@@ -265,6 +325,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             _lastWidth = width;
             _lastHeight = height;
             _sensorInfo = BuildSensorInfo(sensorPose, intrinsics);
+            RecordLatencySubmit(_pendingFrameNumber, now);
             long submitted = Interlocked.Increment(ref _submittedFrameCount);
             if (submitted == 1)
                 Debug.Log($"[ML2DepthTCP] First depth frame queued: {width}x{height}, {byteCount} bytes.");
@@ -376,7 +437,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 stream.Write(intrinsicsBytes, 0, intrinsicsByteCount);
                 intrinsicsSent = true;
             }
-            _frameSendTicks[frameNumber] = Stopwatch.GetTimestamp();
+            // Monotonic clock is safe to read off the main thread; do not Debug.Log here.
+            RecordLatencySendDone(frameNumber, Time.realtimeSinceStartupAsDouble);
             Interlocked.Increment(ref _sentFrameCount);
 
             lock (_frameLock)
