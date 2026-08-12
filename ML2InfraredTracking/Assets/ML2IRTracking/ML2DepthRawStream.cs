@@ -54,6 +54,7 @@ public class ML2DepthRawStream : MonoBehaviour
     private float minDepth = 0, maxDepth = 5;
     private bool _loggedFloatFormat;
     private bool _loggedUnexpectedBuffer;
+    private MarkerDetector markerDetector;
 
     // ----------------- Helpers -----------------
 
@@ -156,6 +157,9 @@ public class ML2DepthRawStream : MonoBehaviour
             sensorPoseDebugger = GetComponent<DepthSensorPoseDebugger>();
         if (sensorPoseDebugger == null)
             sensorPoseDebugger = gameObject.AddComponent<DepthSensorPoseDebugger>();
+        markerDetector = GetComponent<MarkerDetector>();
+        if (markerDetector == null)
+        markerDetector = gameObject.AddComponent<MarkerDetector>(); // make object MarkerDetector if it doesn't exist
 
         // Assign the material 
         var mat = materialList.GetMaterialForFrameType(PixelSensorFrameType.DepthRaw);
@@ -219,6 +223,12 @@ public class ML2DepthRawStream : MonoBehaviour
                     // Build a CPU float[] depth map (meters) for the native pipeline
                     var depthData = GetRawDepthData(in frame, ref _floatBuffer);
                     if (depthData == null) return;
+
+                    var detection = markerDetector.Detect(depthData, w, h);
+
+                    Debug.Log(
+                        $"[MarkerDetector] Found {detection.centers.Count} markers"
+                    );
 
                     depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics);
                     if (sensorPoseDebugger != null)
