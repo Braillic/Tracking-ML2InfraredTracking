@@ -11,19 +11,29 @@ using UnityEngine;
 /// valid estimate to a tool transform. Companion to <see cref="DepthFrameTcpServer"/>
 /// (ML → PC depth); uses a separate port so depth send stays write-only.
 ///
-/// Wire format (little-endian, fixed 52 bytes):
+/// Wire format (little-endian, fixed 80 bytes):
 ///   magic "ML2P"
-///   ushort version (=1), ushort packet_size (=52)
+///   ushort version (=3), ushort packet_size (=80)
 ///   ulong  frame_id   (matches depth header frame number)
 ///   uint   ok         (0 = reject, nonzero = apply)
 ///   float  confidence
 ///   float  px, py, pz           Unity world metres
 ///   float  qx, qy, qz, qw       Unity world quaternion
+///   float  detect_ms  PC marker detection duration (own clock, not synced to ML2)
+///   float  pnp_ms     PC PnP solve duration
+///   float  send_ms    PC world-space transform + struct pack duration (excludes the sendall syscall)
+///   double pc_recv_ml2  PC depth-frame-received time, translated into ML2's clock domain
+///   double pc_send_ml2  PC pose-about-to-send time, translated into ML2's clock domain
+///
+/// Also handles a same-size clock-sync request/reply pair on this socket (magic "ML2S" /
+/// "ML2R", see pose_packet.py:sync_clock_offset) so the desktop can translate its own
+/// perf_counter() timestamps above into this clock's domain, letting the latency log
+/// split the round trip into its two network legs instead of one lumped bucket.
 /// </summary>
 public sealed class PoseEstimateTcpServer : MonoBehaviour
 {
-    public const int ProtocolVersion = 1;
-    public const int PacketSize = 52;
+    public const int ProtocolVersion = 3;
+    public const int PacketSize = 80;
     public static PoseEstimateTcpServer ActiveServer { get; private set; }
 
     [Header("TCP server (Magic Leap listens; PC connects and sends poses)")]
@@ -76,6 +86,11 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private Vector3 _pendingPosition;
     private Quaternion _pendingRotation;
     private double _pendingReceivedRealtime;
+    private float _pendingDetectMs;
+    private float _pendingPnpMs;
+    private float _pendingSendMs;
+    private double _pendingPcRecvMl2;
+    private double _pendingPcSendMl2;
     private int _latencyLogCounter;
 
     private Thread _serverThread;
@@ -195,7 +210,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     /// Thread-safe mailbox used by the receive loop. Main thread consumes via Update.
     /// </summary>
     public void SubmitPose(ulong frameId, bool ok, float confidence, in Vector3 position,
-        in Quaternion rotation)
+        in Quaternion rotation, float detectMs, float pnpMs, float sendMs,
+        double pcRecvMl2, double pcSendMl2)
     {
         // realtimeSinceStartup is safe to read off the main thread; avoid Debug.Log here.
         double receivedRealtime = Time.realtimeSinceStartupAsDouble;
@@ -207,6 +223,11 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             _pendingPosition = position;
             _pendingRotation = rotation;
             _pendingReceivedRealtime = receivedRealtime;
+            _pendingDetectMs = detectMs;
+            _pendingPnpMs = pnpMs;
+            _pendingSendMs = sendMs;
+            _pendingPcRecvMl2 = pcRecvMl2;
+            _pendingPcSendMl2 = pcSendMl2;
             _hasPending = true;
         }
     }
@@ -219,6 +240,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         Vector3 position;
         Quaternion rotation;
         double receivedRealtime;
+        float detectMs, pnpMs, sendMs;
+        double pcRecvMl2, pcSendMl2;
 
         lock (_poseLock)
         {
@@ -231,6 +254,11 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             position = _pendingPosition;
             rotation = _pendingRotation;
             receivedRealtime = _pendingReceivedRealtime;
+            detectMs = _pendingDetectMs;
+            pnpMs = _pendingPnpMs;
+            sendMs = _pendingSendMs;
+            pcRecvMl2 = _pendingPcRecvMl2;
+            pcSendMl2 = _pendingPcSendMl2;
             _hasPending = false;
         }
 
@@ -260,10 +288,20 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         _lastAppliedFrameId = frameId;
         _lastAcceptedPoseTime = Time.unscaledTimeAsDouble;
         Interlocked.Increment(ref _appliedCount);
-        MaybeLogLatency(frameId, receivedRealtime);
+        MaybeLogLatency(frameId, receivedRealtime, detectMs, pnpMs, sendMs, pcRecvMl2, pcSendMl2);
     }
 
-    private void MaybeLogLatency(ulong frameId, double receivedRealtime)
+    /// <summary>
+    /// detectMs/pnpMs/sendMs are PC-side stage durations from its own perf_counter
+    /// (see pose_packet.py); pure durations need no clock sync. pcRecvMl2/pcSendMl2
+    /// are PC perf_counter timestamps already translated into this clock's domain via
+    /// the ML2S/ML2R sync handshake (see HandleSyncRequest), so they can be diffed
+    /// directly against ML2's own sendDone/receivedRealtime to isolate each network leg.
+    /// The split's accuracy is bounded by the sync handshake's assumption of symmetric
+    /// Wi-Fi latency (see the "Clock sync: ... sync_rtt=" line the desktop prints).
+    /// </summary>
+    private void MaybeLogLatency(ulong frameId, double receivedRealtime,
+        float detectMs, float pnpMs, float sendMs, double pcRecvMl2, double pcSendMl2)
     {
         if (!logLatency)
             return;
@@ -293,10 +331,16 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         }
 
         double queueMs = (sendDone - submit) * 1000.0;
-        double afterSendMs = (now - sendDone) * 1000.0;
+        double leg1Ms = (pcRecvMl2 - sendDone) * 1000.0; // network: ML2 -> PC
+        double leg2Ms = (receivedRealtime - pcSendMl2) * 1000.0; // network: PC -> ML2
+        double measuredMs = queueMs + leg1Ms + detectMs + pnpMs + sendMs + leg2Ms + applyWaitMs;
+        double unaccountedMs = e2eMs - measuredMs; // clock-sync/measurement slack; large values mean the symmetric-latency assumption is off
         Debug.Log(
             $"[ML2LAT] frame={frameId} e2e={e2eMs:F1}ms " +
-            $"(queue+tcp_write={queueMs:F1}ms | net+pc+apply={afterSendMs:F1}ms | apply_wait={applyWaitMs:F1}ms)");
+            $"(queue+tcp_write={queueMs:F1}ms | leg1_net(ML2->PC)={leg1Ms:F1}ms | " +
+            $"detect={detectMs:F1}ms | pnp={pnpMs:F1}ms | pack={sendMs:F1}ms | " +
+            $"leg2_net(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
+            $"unaccounted={unaccountedMs:F1}ms)");
     }
 
     private void HideTrackedToolIfTimedOut()
@@ -441,26 +485,80 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             if (!ReadExact(stream, packet, PacketSize))
                 return;
 
+            if (IsSyncRequest(packet))
+            {
+                HandleSyncRequest(stream, packet);
+                continue;
+            }
+
             if (!TryParsePacket(packet, out ulong frameId, out bool ok, out float confidence,
-                    out Vector3 position, out Quaternion rotation))
+                    out Vector3 position, out Quaternion rotation,
+                    out float detectMs, out float pnpMs, out float sendMs,
+                    out double pcRecvMl2, out double pcSendMl2))
             {
                 throw new InvalidDataException("Invalid ML2P pose packet");
             }
 
             Interlocked.Increment(ref _receivedCount);
             DepthFrameTcpServer.ActiveServer?.RecordPoseReceived(frameId);
-            SubmitPose(frameId, ok, confidence, position, rotation);
+            SubmitPose(frameId, ok, confidence, position, rotation, detectMs, pnpMs, sendMs,
+                pcRecvMl2, pcSendMl2);
         }
     }
 
+    private static bool IsSyncRequest(byte[] packet)
+    {
+        return packet.Length >= 4 &&
+               packet[0] == (byte)'M' && packet[1] == (byte)'L' &&
+               packet[2] == (byte)'2' && packet[3] == (byte)'S';
+    }
+
+    /// <summary>
+    /// One-shot NTP-style clock-sync reply (see pose_packet.py:sync_clock_offset).
+    /// Echoes the PC's request timestamp back alongside this clock's current reading
+    /// so the desktop can estimate the offset between the two clocks. Runs on this
+    /// server thread — Time.realtimeSinceStartupAsDouble is safe to read off the main
+    /// thread (same assumption already relied on elsewhere in this file).
+    /// </summary>
+    private void HandleSyncRequest(NetworkStream stream, byte[] request)
+    {
+        double pcT0 = BitConverter.ToDouble(request, 8);
+        double ml2T1 = Time.realtimeSinceStartupAsDouble;
+
+        byte[] reply = new byte[PacketSize];
+        using (MemoryStream memory = new MemoryStream(reply))
+        using (BinaryWriter writer = new BinaryWriter(memory))
+        {
+            writer.Write((byte)'M');
+            writer.Write((byte)'L');
+            writer.Write((byte)'2');
+            writer.Write((byte)'R');
+            writer.Write((ushort)ProtocolVersion);
+            writer.Write((ushort)PacketSize);
+            writer.Write(pcT0);
+            writer.Write(ml2T1);
+            // Remaining bytes stay zero-padded to PacketSize.
+        }
+
+        stream.Write(reply, 0, reply.Length);
+        stream.Flush();
+    }
+
     private static bool TryParsePacket(byte[] packet, out ulong frameId, out bool ok,
-        out float confidence, out Vector3 position, out Quaternion rotation)
+        out float confidence, out Vector3 position, out Quaternion rotation,
+        out float detectMs, out float pnpMs, out float sendMs,
+        out double pcRecvMl2, out double pcSendMl2)
     {
         frameId = 0;
         ok = false;
         confidence = 0f;
         position = default;
         rotation = Quaternion.identity;
+        detectMs = 0f;
+        pnpMs = 0f;
+        sendMs = 0f;
+        pcRecvMl2 = 0.0;
+        pcSendMl2 = 0.0;
 
         using MemoryStream memory = new MemoryStream(packet, false);
         using BinaryReader reader = new BinaryReader(memory);
@@ -482,6 +580,11 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
         rotation = new Quaternion(
             reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+        detectMs = reader.ReadSingle();
+        pnpMs = reader.ReadSingle();
+        sendMs = reader.ReadSingle();
+        pcRecvMl2 = reader.ReadDouble();
+        pcSendMl2 = reader.ReadDouble();
         return true;
     }
 

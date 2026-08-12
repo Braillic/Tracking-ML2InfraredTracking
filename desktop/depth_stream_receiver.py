@@ -31,6 +31,7 @@ from pose_packet import (
     connect_pose_socket,
     opencv_camera_pose_to_unity_world,
     send_pose,
+    sync_clock_offset,
 )
 
 
@@ -620,8 +621,19 @@ def estimate_and_send_pose(
     *,
     depth_vertically_flipped: bool = True,
     convert_object_axes: bool = False,
+    detect_ms: float = 0.0,
+    recv_done: float = 0.0,
+    clock_offset: float = 0.0,
 ) -> tuple[PoseEstimate, np.ndarray | None]:
     """Run MarkerPoseTracker and optionally stream Unity-world pose to the headset.
+
+    detect_ms is the marker-detection duration measured by the caller (before this
+    function runs); it is only forwarded into the outgoing packet so ML2 can log a
+    per-stage breakdown instead of one lumped "PC + network" bucket.
+
+    recv_done (this frame's perf_counter() receive time) and clock_offset (from
+    sync_clock_offset) let ML2 translate PC timestamps into its own clock domain
+    and split the round trip into its two network legs.
 
     Returns (estimate, camera_matrix_used_for_pnp).
     """
@@ -633,11 +645,13 @@ def estimate_and_send_pose(
     if camera_matrix is None or not centers:
         return PoseEstimate.failed(), camera_matrix
 
+    pnp_start = time.perf_counter()
     estimate = tracker.estimate(
         centers,
         camera_matrix,
         intrinsics.distortion_coefficients if intrinsics is not None else None,
     )
+    pnp_ms = (time.perf_counter() - pnp_start) * 1000.0
 
     if pose_connection is None:
         return estimate, camera_matrix
@@ -647,6 +661,7 @@ def estimate_and_send_pose(
     if not (estimate.ok and estimate.rvec is not None and estimate.tvec is not None):
         return estimate, camera_matrix
 
+    prep_start = time.perf_counter()
     position, rotation = opencv_camera_pose_to_unity_world(
         estimate.rvec,
         estimate.tvec,
@@ -655,17 +670,31 @@ def estimate_and_send_pose(
         depth_vertically_flipped=depth_vertically_flipped,
         convert_object_axes=convert_object_axes,
     )
+    # prep_ms covers world-space transform + struct packing, up to (but not
+    # including) the sendall syscall — a packet can't carry its own send
+    # duration, so that part is measured separately below and only printed
+    # locally; it's negligible for a 64-byte write with TCP_NODELAY.
+    send_ready_time = time.perf_counter()
     packet = PosePacket(
         frame_id=frame.frame_id,
         ok=True,
         confidence=float(estimate.confidence),
         position=position,
         rotation=rotation,
+        detect_ms=detect_ms,
+        pnp_ms=pnp_ms,
+        send_ms=(send_ready_time - prep_start) * 1000.0,
+        pc_recv_ml2=recv_done + clock_offset,
+        pc_send_ml2=send_ready_time + clock_offset,
     )
+    send_start = time.perf_counter()
     try:
         send_pose(pose_connection, packet)
     except OSError as error:
         raise ConnectionError(f"Pose stream send failed: {error}") from error
+    sendall_ms = (time.perf_counter() - send_start) * 1000.0
+    if sendall_ms > 1.0:
+        print(f"[ML2LAT] slow pose sendall: {sendall_ms:.1f}ms (not reflected in ML2's log)", flush=True)
     return estimate, camera_matrix
 
 
@@ -685,6 +714,7 @@ def run(args: argparse.Namespace) -> None:
 
     while True:
         pose_connection: socket.socket | None = None
+        clock_offset = 0.0
         try:
             print(f"Connecting to Magic Leap depth at {args.host}:{args.port} ...")
             with socket.create_connection((args.host, args.port), timeout=args.connect_timeout) as connection:
@@ -699,6 +729,13 @@ def run(args: argparse.Namespace) -> None:
                     )
                     pose_connection.settimeout(args.frame_timeout)
                     print("Pose TCP connected.", flush=True)
+                    clock_offset, sync_rtt = sync_clock_offset(pose_connection)
+                    print(
+                        f"Clock sync: offset={clock_offset * 1000.0:+.1f}ms sync_rtt={sync_rtt * 1000.0:.1f}ms "
+                        "(assumes symmetric Wi-Fi latency; ML2's leg1/leg2 split is accurate to "
+                        "roughly +/-sync_rtt/2)",
+                        flush=True,
+                    )
                     tracker.reset()
 
                 show_waiting_window(args.host, args.port)
@@ -707,6 +744,7 @@ def run(args: argparse.Namespace) -> None:
 
                 while True:
                     frame = receive_frame(connection)
+                    recv_done = time.perf_counter()
                     depth = frame.depth_metres
                     if first_frame:
                         print(f"First frame received: {depth.shape[1]}x{depth.shape[0]}, float32 metres",
@@ -724,6 +762,7 @@ def run(args: argparse.Namespace) -> None:
                         display, threshold_method, fixed_threshold, top_p,
                         **_geometry_filter_kwargs(args),
                     )
+                    detect_ms = (time.perf_counter() - recv_done) * 1000.0
 
                     estimate, pose_K = estimate_and_send_pose(
                         tracker,
@@ -733,6 +772,9 @@ def run(args: argparse.Namespace) -> None:
                         pose_connection,
                         depth_vertically_flipped=args.depth_vertically_flipped,
                         convert_object_axes=args.convert_object_axes,
+                        detect_ms=detect_ms,
+                        recv_done=recv_done,
+                        clock_offset=clock_offset,
                     )
                     projected = None
                     if pose_K is not None:

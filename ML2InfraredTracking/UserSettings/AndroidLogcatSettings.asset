@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "GB62XT00008P",
         "name": "com.braillic.depthstreaming",
-        "processId": 8951,
+        "processId": 14284,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -181,6 +181,18 @@
             "name": "com.braillic.depthstreaming",
             "processId": 8951,
             "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 7378,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 14284,
+            "exited": false
         }
     ],
     "m_Tags": {
@@ -233,7 +245,7 @@
         "AutoCapture": true
     },
     "m_FilterOptions": {
-        "m_Filter": "latency",
+        "m_Filter": "lat",
         "m_UseRegularExpressions": false,
         "m_MatchCase": false
     },

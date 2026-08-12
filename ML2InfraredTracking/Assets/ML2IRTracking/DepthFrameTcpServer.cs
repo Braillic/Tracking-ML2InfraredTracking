@@ -73,6 +73,13 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private readonly bool[] _latencyHasSend = new bool[LatencyRingSize];
     private int _latencyWriteIndex;
 
+    // Round-trip (depth-sent -> pose-received) latency accumulator; consumed/reset by
+    // ConsumeLatencyStats. frameNumber -> Stopwatch.GetTimestamp() at send-done.
+    private readonly ConcurrentDictionary<ulong, long> _frameSendTicks = new ConcurrentDictionary<ulong, long>();
+    private long _latencySumTicks;
+    private long _latencyCount;
+    private long _latencyMaxTicks;
+
     public int Port => port;
     public string Status => _status;
 
@@ -162,7 +169,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         }
 
         long pendingLatencySamples = Interlocked.Read(ref _latencyCount);
-        if (pendingLatencySamples >= 100)
+        if (pendingLatencySamples >= 100) // every 100 poses computed, log the latency stats
         {
             var (avgMs, maxMs, count) = ConsumeLatencyStats();
             if (count > 0)
@@ -439,6 +446,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             }
             // Monotonic clock is safe to read off the main thread; do not Debug.Log here.
             RecordLatencySendDone(frameNumber, Time.realtimeSinceStartupAsDouble);
+            _frameSendTicks[frameNumber] = Stopwatch.GetTimestamp();
             Interlocked.Increment(ref _sentFrameCount);
 
             lock (_frameLock)

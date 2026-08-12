@@ -121,7 +121,12 @@ namespace MagicLeap.OpenXR.Features.PixelSensors
 
                 var spaceInfoFunctions = PixelSensorFeature.SpaceInfoNativeFunctions;
                 // The line below was updated to accept a capture time value.
-                var pose = spaceInfoFunctions.GetUnityPose(sensorSpace, PixelSensorFeature.AppSpace, captureTime);
+                // PixelSensorFrame.CaptureTime is in microseconds (same clock as the native
+                // "Data Not Found for timestamp: ...us" pose-history error), but XrLocateSpace
+                // expects XrTime, which is nanoseconds. Passing microseconds straight through
+                // makes every query land ~1000x too close to time zero relative to "now",
+                // which the runtime rejects as XR_ERROR_TIME_INVALID / pose-history miss.
+                var pose = spaceInfoFunctions.GetUnityPose(sensorSpace, PixelSensorFeature.AppSpace, captureTime * 1000);
                 return pose;
             }
         }
