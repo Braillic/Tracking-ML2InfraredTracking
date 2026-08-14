@@ -67,8 +67,15 @@ class MarkerPoseTracker:
     # perspective; non-coplanar layouts need a looser gate.
     max_distance_ratio_error: float | None = None
     max_reproj_px: float = 2.0 # error in pixels between projected and detected points
-    # Temporal nearest-neighbour association gate (pixels).
-    max_assoc_px: float = 40.0
+    # Temporal nearest-neighbour association gate (pixels). Depth frames only
+    # arrive at ~5Hz, so even modest head motion between frames can displace
+    # markers well past a tight gate here - when that happens, the temporal path
+    # fails outright and falls back to a from-scratch combinatorial search, which
+    # is where a coplanar-marker correspondence ambiguity can flip to the wrong
+    # (but similarly low-reprojection-error) solution. Loosened from 40px after
+    # observing nearest-detection distances up to ~100px during ordinary,
+    # correctly-tracked motion at this frame rate.
+    max_assoc_px: float = 120.0
     # Soft weights for ranking candidates (lower is better before → confidence).
     temporal_translation_weight: float = 50.0  # px-equivalent per metre
     temporal_rotation_weight: float = 30.0  # px-equivalent per radian
@@ -79,6 +86,10 @@ class MarkerPoseTracker:
     refine_iterations: int = 2
     # Added to ranking error for each visible detection left unmatched.
     unmatched_det_penalty_px: float = 12.0
+    # [MarkerPoseDiag] tracing, off by default - every print below used
+    # flush=True (forced, blocking, unbuffered writes), some firing multiple
+    # times per frame, which is real per-frame overhead once left on.
+    debug: bool = False
 
     _prev_rvec: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_tvec: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -134,11 +145,37 @@ class MarkerPoseTracker:
             # if the pose is valid and the confidence is high enough, update the previous pose
             # otherwise, use combinatorial estimation
             if temporal.ok and temporal.confidence >= self.min_confidence:
+                if self.debug:
+                    print(
+                        f"[MarkerPoseDiag] path=temporal accepted=True conf={temporal.confidence:.3f} "
+                        f"reproj={temporal.mean_reproj_px:.2f}px n_used={temporal.n_used}"
+                    )
                 return self._commit(temporal)
+            if self.debug:
+                print(
+                    f"[MarkerPoseDiag] path=temporal accepted=False ok={temporal.ok} "
+                    f"conf={temporal.confidence:.3f} reproj={temporal.mean_reproj_px:.2f}px "
+                    f"n_used={temporal.n_used} -> falling back to combinatorial"
+                )
 
         combinatorial = self._estimate_combinatorial(pts, K, dist, n_detected)
         if combinatorial.ok:
+            if self.debug:
+                delta_str = ""
+                if self._prev_rvec is not None and self._prev_tvec is not None:
+                    dtheta = float(np.linalg.norm(
+                        cv2.Rodrigues(combinatorial.rvec)[0] @ cv2.Rodrigues(self._prev_rvec)[0].T
+                        - np.eye(3)
+                    ))
+                    dt = float(np.linalg.norm(combinatorial.tvec - self._prev_tvec))
+                    delta_str = f" dtheta~{dtheta:.3f} dt={dt:.4f}m"
+                print(
+                    f"[MarkerPoseDiag] path=combinatorial accepted=True conf={combinatorial.confidence:.3f} "
+                    f"reproj={combinatorial.mean_reproj_px:.2f}px n_used={combinatorial.n_used}{delta_str}"
+                )
             return self._commit(combinatorial)
+        if self.debug:
+            print("[MarkerPoseDiag] path=combinatorial accepted=False (no pose found)")
         # keep last pose only if we never found anything this frame
         return combinatorial
 
@@ -171,6 +208,16 @@ class MarkerPoseTracker:
             preferred_image=self._prev_image_indices,
         )
         if len(model_idx) < self.min_markers:
+            if self.debug:
+                proj = projected.reshape(-1, 2)
+                img = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+                dists = np.linalg.norm(proj[:, None, :] - img[None, :, :], axis=2)
+                nearest = dists.min(axis=1) if dists.size else np.array([])
+                print(
+                    f"[MarkerPoseDiag] temporal gate failed: matched={len(model_idx)} "
+                    f"n_detected={n_detected} n_model={proj.shape[0]} max_assoc_px={self.max_assoc_px} "
+                    f"nearest_dist_per_model_pt={np.round(nearest, 1).tolist()}"
+                )
             return PoseEstimate.failed()
 
         return self._solve_and_score(
@@ -194,9 +241,9 @@ class MarkerPoseTracker:
         dist_coeffs: np.ndarray,
         n_detected: int,
     ) -> PoseEstimate:
-        n_img = image_points.shape[0] # number of detected marker centers
-        n_model = self.model_points.shape[0] # number of model points
-        k_values = range(self.min_markers, min(n_img, n_model) + 1) # number of points to use for PnP
+        n_img = image_points.shape[0]  # number of detected marker centers
+        n_model = self.model_points.shape[0]  # number of model points
+        k_values = range(self.min_markers, min(n_img, n_model) + 1)  # number of points to use for PnP
 
         best = PoseEstimate.failed()
         best_cost = float("inf")
@@ -210,18 +257,18 @@ class MarkerPoseTracker:
             for img_combo in combinations(range(n_img), k):  # detected marker subsets
                 img_pts = image_points[list(img_combo)]
                 img_sig = img_sig_cache.setdefault(
-                    img_combo, _pairwise_distance_signature(img_pts) # normalized pairwise distances between the image points
+                    img_combo, _pairwise_distance_signature(img_pts)  # normalized pairwise distances between the image points
                 )
                 for model_combo in combinations(range(n_model), k):  # model subsets
                     model_pts = self.model_points[list(model_combo)]
                     model_sig = model_sig_cache.setdefault(
                         model_combo, _pairwise_distance_signature(model_pts)
                     )
-                    sig_err = _signature_error(img_sig, model_sig) # distance between image and model pairwise distances
+                    sig_err = _signature_error(img_sig, model_sig)  # distance between image and model pairwise distances
                     if sig_err > hard_gate:
                         continue
 
-                    for image_idx in _candidate_assignments( # correspondences between image and model points
+                    for image_idx in _candidate_assignments(  # correspondences between image and model points
                         img_pts,
                         model_pts,
                         img_combo,
@@ -284,27 +331,82 @@ class MarkerPoseTracker:
             else np.zeros((3, 1), dtype=np.float64)
         )
 
+        # Tried SOLVEPNP_IPPE here for the coplanar (z=0) model_points, expecting
+        # it to handle the planar-pose ambiguity better than SQPNP. In practice it
+        # returned ok=0/no candidates for essentially every input in this OpenCV
+        # build - including the identity correspondence - so it's not usable here.
+        # Back to SQPNP, which at least reliably returns candidates (the ambiguity
+        # is instead handled downstream by picking whichever valid candidate is
+        # closest to the previous pose).
+        flags = cv2.SOLVEPNP_SQPNP
+        pass_guess = use_extrinsic_guess
+        diag = use_extrinsic_guess and self.debug  # only trace the temporal-path calls
         try:
             ok, rvecs, tvecs, _ = cv2.solvePnPGeneric(
                 obj.reshape(-1, 1, 3),
                 img.reshape(-1, 1, 2),
                 camera_matrix,
                 dist_coeffs,
-                flags=cv2.SOLVEPNP_SQPNP,
+                flags=flags,
                 rvec=rvec0,
                 tvec=tvec0,
-                useExtrinsicGuess=use_extrinsic_guess,
+                useExtrinsicGuess=pass_guess,
             )
-        except cv2.error:
+        except cv2.error as e:
+            if diag:
+                print(f"[MarkerPoseDiag]   solvePnPGeneric raised: {e} "
+                      f"(model_idx={list(model_indices)} image_idx={list(image_indices)} "
+                      f"obj={obj.tolist()} img={img.tolist()})")
             return PoseEstimate.failed()
-        if not ok or not rvecs:
+        if diag and (not ok or not rvecs):
+            print(f"[MarkerPoseDiag]   solvePnPGeneric returned ok={ok} rvecs={rvecs} "
+                  f"(model_idx={list(model_indices)} image_idx={list(image_indices)} "
+                  f"obj={obj.tolist()} img={img.tolist()})")
+        rvecs = list(rvecs) if rvecs else []
+        tvecs = list(tvecs) if tvecs else []
+
+        # Rescue for the temporal path: SQPNP is a global solver and can return
+        # only degenerate (behind-camera) candidates for a coplanar target near
+        # the planar-pose ambiguity, or fail outright. SOLVEPNP_ITERATIVE seeded
+        # with the previous pose is a local optimizer instead - anchored at
+        # continuity with where we already know the object was, so it tends to
+        # converge back to the same physically-valid solution rather than landing
+        # on the ambiguous flip. Fed into the same scoring loop below so it only
+        # wins if it's actually a good fit, not blindly trusted.
+        if pass_guess:
+            try:
+                ok_iter, rvec_iter, tvec_iter = cv2.solvePnP(
+                    obj.reshape(-1, 1, 3),
+                    img.reshape(-1, 1, 2),
+                    camera_matrix,
+                    dist_coeffs,
+                    rvec=rvec0.copy(),
+                    tvec=tvec0.copy(),
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if ok_iter:
+                    rvecs.append(rvec_iter)
+                    tvecs.append(tvec_iter)
+                    if diag:
+                        print("[MarkerPoseDiag]   +iterative-guess candidate added")
+            except cv2.error as e:
+                if diag:
+                    print(f"[MarkerPoseDiag]   iterative-guess rescue raised: {e}")
+
+        if not rvecs:
             return PoseEstimate.failed()
 
         best_est = PoseEstimate.failed()
         best_cost = float("inf")
         expected = self._expected_matches(n_detected)
-        for rvec, tvec in zip(rvecs, tvecs):
+        if diag:
+            print(f"[MarkerPoseDiag]   solve_and_score: {len(rvecs)} candidate(s) total, "
+                  f"input model_idx={list(model_indices)} image_idx={list(image_indices)}")
+        for cand_i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
             if not _all_points_in_front(obj, rvec, tvec):
+                if diag:
+                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, points behind camera")
                 continue
 
             rvec_f, tvec_f, mi_f, ii_f = _refine_pose_and_reassign(
@@ -326,9 +428,15 @@ class MarkerPoseTracker:
             unmatched_det = max(0, n_detected - len(set(ii_f)))
 
             if n_used < self.min_markers:
+                if diag:
+                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, n_used={n_used} < min_markers={self.min_markers} "
+                          f"(mi_f={mi_f} ii_f={ii_f})")
                 continue
             # When enough markers are visible, require full min-side coverage.
             if n_detected >= self.min_markers and n_used < expected:
+                if diag:
+                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, n_used={n_used} < expected={expected} "
+                          f"(n_detected={n_detected}, mi_f={mi_f} ii_f={ii_f})")
                 continue
 
             mean_reproj = _mean_reprojection_error(
@@ -340,6 +448,9 @@ class MarkerPoseTracker:
                 dist_coeffs,
             )
             if mean_reproj > self.max_reproj_px:
+                if diag:
+                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, mean_reproj={mean_reproj:.2f}px "
+                          f"> max_reproj_px={self.max_reproj_px} (mi_f={mi_f} ii_f={ii_f})")
                 continue
 
             support = _model_support(
@@ -352,7 +463,13 @@ class MarkerPoseTracker:
                 self.max_assoc_px,
             )
             if support < self.min_markers:
+                if diag:
+                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, support={support} < min_markers={self.min_markers} "
+                          f"(mi_f={mi_f} ii_f={ii_f})")
                 continue
+            if diag:
+                print(f"[MarkerPoseDiag]   cand {cand_i}: passed all filters, reproj={mean_reproj:.2f}px "
+                      f"support={support} n_used={n_used}")
 
             confidence = _confidence(
                 mean_reproj_px=mean_reproj,

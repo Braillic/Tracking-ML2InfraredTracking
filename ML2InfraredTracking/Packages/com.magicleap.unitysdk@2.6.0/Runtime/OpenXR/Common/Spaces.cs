@@ -154,7 +154,15 @@ namespace MagicLeap.OpenXR.Spaces
 
         public Pose GetUnityPose(ulong space, ulong baseSpace, long nextPredictedDisplayTime)
         {
-            var result = Pose.identity;
+            TryGetUnityPose(space, baseSpace, nextPredictedDisplayTime, out var result);
+            return result;
+        }
+
+        // Same as GetUnityPose but reports success so callers can fall back to a cached
+        // pose instead of silently snapping to Pose.identity (e.g. on XR_ERROR_TIME_INVALID).
+        internal bool TryGetUnityPose(ulong space, ulong baseSpace, long nextPredictedDisplayTime, out Pose result)
+        {
+            result = Pose.identity;
             var spaceLocation = new XrSpaceLocation
             {
                 Type = XrSpaceLocation.XrSpaceLocationStructType,
@@ -162,7 +170,7 @@ namespace MagicLeap.OpenXR.Spaces
             var xrResult = XrLocateSpace(space, baseSpace, nextPredictedDisplayTime, out spaceLocation);
             if (!Utils.DidXrCallSucceed(xrResult, nameof(XrLocateSpace)))
             {
-                return result;
+                return false;
             }
 
             if (spaceLocation.SpaceLocationFlags.HasFlag(XrSpaceLocationFlagsML.OrientationValid))
@@ -175,7 +183,7 @@ namespace MagicLeap.OpenXR.Spaces
                 result.position = spaceLocation.Pose.Position.InvertZ();
             }
 
-            return result;
+            return true;
         }
     }
 }

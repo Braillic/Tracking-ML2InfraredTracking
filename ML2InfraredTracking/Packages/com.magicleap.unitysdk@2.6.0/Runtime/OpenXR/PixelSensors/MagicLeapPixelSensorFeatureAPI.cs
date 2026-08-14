@@ -474,6 +474,19 @@ namespace MagicLeap.OpenXR.Features.PixelSensors
             return sensor.GetSensorPose(offset, captureTime);
         }
 
+        // Same as GetSensorPose, but returns false (instead of silently substituting
+        // a cached pose) when XrLocateSpace fails - for callers that must not treat
+        // a held/stale pose as a fresh sample (e.g. feeding a motion-history buffer).
+        public bool TryGetSensorPose(PixelSensorId sensorType, long captureTime, out Pose pose, Pose offset = default)
+        {
+            if (!IsSensorConnected(sensorType, out var sensor))
+            {
+                pose = default;
+                return false;
+            }
+            return sensor.TryGetSensorPose(offset, captureTime, out pose);
+        }
+
 
         /// <summary>
         /// The sensor data stored can have differing orientations.

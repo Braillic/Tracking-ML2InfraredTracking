@@ -23,6 +23,15 @@ namespace MagicLeap.OpenXR.Features.PixelSensors
         private readonly List<PixelSensorAsyncOperation> activeOperations = new();
         private readonly List<PixelSensorAsyncOperation> queuedOperations = new();
         private XrSpace sensorSpace;
+        // Temporary: compares captureTime against a known-good absolute XrTime to tell
+        // whether GetSensorPose's XR_ERROR_TIME_INVALID is a unit-scale issue or an
+        // epoch/reference mismatch. Remove once the real cause is confirmed.
+        private int _diagnosticLogCount;
+        // XrLocateSpace intermittently fails with TimeInvalid for this sensor space.
+        // Holding the last valid pose avoids visibly snapping to Pose.identity (world
+        // origin) on those frames instead of just dropping the failure silently.
+        private Pose _lastValidPose = Pose.identity;
+        private bool _hasValidPose;
 
         private MagicLeapPixelSensorFeature PixelSensorFeature { get; }
         internal PixelSensorNativeFunctions NativeFunctions { get; }
@@ -99,7 +108,19 @@ namespace MagicLeap.OpenXR.Features.PixelSensors
         }
         */
 
+        // Old fallback-to-cached-pose behavior, for callers that don't need to
+        // distinguish a fresh pose from a held one (they just want *a* pose).
         public Pose GetSensorPose(Pose offset, long captureTime)
+        {
+            TryGetSensorPose(offset, captureTime, out var pose);
+            return pose;
+        }
+
+        // Returns false when XrLocateSpace failed, instead of silently substituting
+        // the cached last-valid pose - callers that feed this into their own motion
+        // model (e.g. SensorPoseHistory) need to know a sample is stale so they don't
+        // record it as if it were fresh.
+        public bool TryGetSensorPose(Pose offset, long captureTime, out Pose pose)
         {
             unsafe
             {
@@ -115,19 +136,32 @@ namespace MagicLeap.OpenXR.Features.PixelSensors
                     var xrResult = NativeFunctions.XrCreatePixelSensorSpace(PixelSensorFeature.AppSession, ref createSpaceInfo, out sensorSpace);
                     if (!Utils.DidXrCallSucceed(xrResult, nameof(PixelSensorNativeFunctions.XrCreatePixelSensorSpace)))
                     {
-                        return default;
+                        pose = default;
+                        return false;
                     }
                 }
 
                 var spaceInfoFunctions = PixelSensorFeature.SpaceInfoNativeFunctions;
-                // The line below was updated to accept a capture time value.
-                // PixelSensorFrame.CaptureTime is in microseconds (same clock as the native
-                // "Data Not Found for timestamp: ...us" pose-history error), but XrLocateSpace
-                // expects XrTime, which is nanoseconds. Passing microseconds straight through
-                // makes every query land ~1000x too close to time zero relative to "now",
-                // which the runtime rejects as XR_ERROR_TIME_INVALID / pose-history miss.
-                var pose = spaceInfoFunctions.GetUnityPose(sensorSpace, PixelSensorFeature.AppSpace, captureTime * 1000);
-                return pose;
+                // Uses frame.CaptureTime (not NextPredictedDisplayTime) so the pose matches
+                // the sensor's actual capture instant, not "now" - depth frames arrive at
+                // ~5Hz so using "now" would misalign reprojection as soon as the head moves.
+                // XrLocateSpace intermittently rejects this with TimeInvalid though (pose
+                // history for this sensor space apparently isn't retained far back enough).
+                if (_diagnosticLogCount < 5)
+                {
+                    _diagnosticLogCount++;
+                    long predicted = PixelSensorFeature.NextPredictedDisplayTime;
+                    Debug.Log($"[ML2SensorPoseTimeDiag] captureTime={captureTime} captureTime*1000={captureTime * 1000} " +
+                              $"NextPredictedDisplayTime={predicted} (delta vs *1000: {predicted - captureTime * 1000})");
+                }
+                if (spaceInfoFunctions.TryGetUnityPose(sensorSpace, PixelSensorFeature.AppSpace, captureTime, out pose))
+                {
+                    _lastValidPose = pose;
+                    _hasValidPose = true;
+                    return true;
+                }
+                pose = _hasValidPose ? _lastValidPose : Pose.identity;
+                return false;
             }
         }
 

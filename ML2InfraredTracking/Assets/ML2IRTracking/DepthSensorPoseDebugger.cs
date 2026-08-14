@@ -340,14 +340,36 @@ public static class DepthSensorPoseUtil
         out Pose worldPose)
     {
         worldPose = default;
+        if (!TryGetLiveSensorTrackingPose(feature, sensorId, out Pose trackingPose, out _))
+            return false;
+
+        worldPose = ToWorldPose(trackingPose, xrOrigin);
+        return true;
+    }
+
+    /// <summary>
+    /// Same live (NextPredictedDisplayTime) sensor pose as <see cref="TryGetLiveSensorPose"/>,
+    /// but in raw tracking space (no xrOrigin applied) plus the XrTime it was sampled at -
+    /// what SensorPoseHistory needs to record a consistent, always-valid timeline.
+    /// </summary>
+    public static bool TryGetLiveSensorTrackingPose(
+        MagicLeapPixelSensorFeature feature,
+        PixelSensorId sensorId,
+        out Pose trackingPose,
+        out long time)
+    {
+        trackingPose = default;
+        time = 0;
         if (feature == null)
             return false;
 
-        if (!TryGetPredictedDisplayTime(out long time))
+        if (!TryGetPredictedDisplayTime(out time))
             return false;
 
-        Pose trackingPose = feature.GetSensorPose(sensorId, time);
-        worldPose = ToWorldPose(trackingPose, xrOrigin);
-        return true;
+        // Try*, not GetSensorPose: a failed XrLocateSpace here must not look like a
+        // fresh sample to the caller - SensorPoseHistory only records what this
+        // returns true for, and recording a held/stale pose under a fresh timestamp
+        // is what was causing the flicker-between-stale-poses symptom.
+        return feature.TryGetSensorPose(sensorId, time, out trackingPose);
     }
 }

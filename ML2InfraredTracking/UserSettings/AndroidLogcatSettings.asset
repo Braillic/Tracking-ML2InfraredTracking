@@ -3,7 +3,7 @@
     "m_SelectedProcess": {
         "deviceId": "GB62XT00008P",
         "name": "com.braillic.depthstreaming",
-        "processId": 14284,
+        "processId": 31831,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -193,6 +193,78 @@
             "name": "com.braillic.depthstreaming",
             "processId": 14284,
             "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 6931,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 28316,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 32321,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 1062,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 6367,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 6595,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 9101,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 15761,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 17574,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 19429,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 23305,
+            "exited": false
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.braillic.depthstreaming",
+            "processId": 31831,
+            "exited": false
         }
     ],
     "m_Tags": {
@@ -245,7 +317,7 @@
         "AutoCapture": true
     },
     "m_FilterOptions": {
-        "m_Filter": "lat",
+        "m_Filter": "",
         "m_UseRegularExpressions": false,
         "m_MatchCase": false
     },
