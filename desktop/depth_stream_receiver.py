@@ -60,7 +60,6 @@ MARKER_MAX_CLUSTER_SPAN_FRAC = 0.85  # of min(h, w)
 MARKER_MIN_CLUSTER_SIZE = 3
 MARKER_GEOMETRY_RATIO_ERROR = 0.35
 
-
 @dataclass(frozen=True)
 # intrinsics recieved once per TCP connection
 class CameraIntrinsics:

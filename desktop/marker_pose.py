@@ -88,6 +88,8 @@ class MarkerPoseTracker:
     refine_iterations: int = 2
     # Added to ranking error for each visible detection left unmatched.
     unmatched_det_penalty_px: float = 12.0
+    min_probe_z_m: float = 0.15
+    max_probe_z_m: float = 1.50
 
     _reject_streak: int = field(default=0, init=False, repr=False)
     _prev_rvec: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -105,6 +107,8 @@ class MarkerPoseTracker:
             raise ValueError("model_points shorter than min_markers")
         if self.min_markers < 3:
             raise ValueError("PnP needs at least 3 markers")
+        self.debug_counts = {"depth": 0, "min_markers": 0, "coverage": 0,
+                             "reproj": 0, "support": 0, "in_front": 0}
 
     def reset(self) -> None:
         self._prev_rvec = None
@@ -339,6 +343,12 @@ class MarkerPoseTracker:
         expected = self._expected_matches(n_detected)
         for rvec, tvec in zip(rvecs, tvecs):
             if not _all_points_in_front(obj, rvec, tvec):
+                self.debug_counts["in_front"] += 1
+                continue
+
+            candidate_z = float(np.asarray(tvec, dtype=np.float64).reshape(3)[2])
+            if not (self.min_probe_z_m <= candidate_z <= self.max_probe_z_m):
+                self.debug_counts["depth"] += 1
                 continue
 
             rvec_f, tvec_f, mi_f, ii_f = _refine_pose_and_reassign(
@@ -360,9 +370,11 @@ class MarkerPoseTracker:
             unmatched_det = max(0, n_detected - len(set(ii_f)))
 
             if n_used < self.min_markers:
+                self.debug_counts["min_markers"] += 1
                 continue
             # When enough markers are visible, require full min-side coverage.
-            if n_detected >= self.min_markers and n_used < expected:
+            if n_detected >= self.min_markers and n_used < min(expected, n_detected - 1):
+                self.debug_counts["coverage"] += 1
                 continue
 
             mean_reproj = _mean_reprojection_error(
@@ -374,6 +386,7 @@ class MarkerPoseTracker:
                 dist_coeffs,
             )
             if mean_reproj > self.max_reproj_px:
+                self.debug_counts["reproj"] += 1
                 continue
 
             support = _model_support(
@@ -386,6 +399,7 @@ class MarkerPoseTracker:
                 self.max_assoc_px,
             )
             if support < self.min_markers:
+                self.debug_counts["support"] += 1
                 continue
 
             confidence = _confidence(

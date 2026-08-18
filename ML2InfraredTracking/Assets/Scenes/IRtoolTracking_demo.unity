@@ -2829,6 +2829,7 @@ MonoBehaviour:
   statusText: {fileID: 1301455982}
   sensorInfoText: {fileID: 0}
   showOnGuiOverlay: 1
+  poseReceiver: {fileID: 0}
 --- !u!114 &1591841591
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2859,6 +2860,9 @@ MonoBehaviour:
   showOnGuiOverlay: 1
   rotationFollow: 1
   positionFollow: 1
+  hideAfterNoPoseSeconds: 0.5
+  logLatency: 1
+  latencyLogEveryN: 15
 --- !u!114 &1591841592
 MonoBehaviour:
   m_ObjectHideFlags: 0
