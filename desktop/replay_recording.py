@@ -67,10 +67,10 @@ def main() -> None:
             z_values.append(z)
             n_ok += 1
             slot[0] += 1
-            if not args.quiet:
-                print(f"{index:5d} n={n_det} OK   z={z:+.3f}m "
-                      f"reproj={est.mean_reproj_px:.2f}px conf={est.confidence:.2f} "
-                      f"n_used={est.n_used}")
+            tag = "NEAR" if z < 0.30 else "FAR "
+            print(f"{index:5d} n_det={n_det} n_used={est.n_used} {tag} "
+                  f"z={z:+.3f} reproj={est.mean_reproj_px:.2f} "
+                  f"conf={est.confidence:.2f} model_idx={est.model_indices}")
         else:
             n_fail += 1
             slot[1] += 1

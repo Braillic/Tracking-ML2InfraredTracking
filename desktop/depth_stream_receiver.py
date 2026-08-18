@@ -647,6 +647,7 @@ def estimate_and_send_pose(
         return PoseEstimate.failed(), camera_matrix
 
     pnp_start = time.perf_counter()
+    print(f"sensor_rot={frame.sensor_rotation} sensor_pos={frame.sensor_position}", flush=True)
     estimate = tracker.estimate(
         centers,
         camera_matrix,

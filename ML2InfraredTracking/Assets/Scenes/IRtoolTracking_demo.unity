@@ -556,7 +556,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &809800488
 Transform:
   m_ObjectHideFlags: 0
@@ -664,7 +664,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1121428085
 Transform:
   m_ObjectHideFlags: 0
@@ -1535,7 +1535,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1261308845
 Transform:
   m_ObjectHideFlags: 0
@@ -2142,7 +2142,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!135 &1356435880
 SphereCollider:
   m_ObjectHideFlags: 0
@@ -2604,6 +2604,11 @@ PrefabInstance:
       propertyPath: m_Name
       value: Tool_2
       objectReference: {fileID: 0}
+    - target: {fileID: 919132149155446097, guid: 423f1f35df0ad054da4594cf0be43827,
+        type: 3}
+      propertyPath: m_IsActive
+      value: 0
+      objectReference: {fileID: 0}
     m_RemovedComponents: []
     m_RemovedGameObjects: []
     m_AddedGameObjects: []
@@ -2633,7 +2638,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!4 &1587496106
 Transform:
   m_ObjectHideFlags: 0
@@ -2829,7 +2834,6 @@ MonoBehaviour:
   statusText: {fileID: 1301455982}
   sensorInfoText: {fileID: 0}
   showOnGuiOverlay: 1
-  poseReceiver: {fileID: 0}
 --- !u!114 &1591841591
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2845,9 +2849,9 @@ MonoBehaviour:
   startAutomatically: 1
   bindAddress: 0.0.0.0
   port: 50778
-  trackedTool: {fileID: 0}
+  trackedTool: {fileID: 1887860339}
   minConfidence: 0
-  dropStaleFrames: 1
+  dropStaleFrames: 0
   createMarkerSpheresOnFirstPose: 1
   markerLocalPositions:
   - {x: 0, y: 0.0501, z: 0}
