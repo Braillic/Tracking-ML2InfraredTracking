@@ -1,9 +1,9 @@
 {
-    "m_SelectedDeviceId": "GB62XT00008P",
+    "m_SelectedDeviceId": "G572XT10010R",
     "m_SelectedProcess": {
-        "deviceId": "GB62XT00008P",
-        "name": "com.braillic.depthstreaming",
-        "processId": 14284,
+        "deviceId": "",
+        "name": "",
+        "processId": 0,
         "exited": false
     },
     "m_SelectedPriority": 1,
@@ -193,6 +193,18 @@
             "name": "com.braillic.depthstreaming",
             "processId": 14284,
             "exited": false
+        },
+        {
+            "deviceId": "G572XT10010R",
+            "name": "com.braillic.depthstreaming",
+            "processId": 8600,
+            "exited": false
+        },
+        {
+            "deviceId": "G572XT10010R",
+            "name": "com.braillic.depthstreaming",
+            "processId": 13018,
+            "exited": false
         }
     ],
     "m_Tags": {
@@ -245,7 +257,7 @@
         "AutoCapture": true
     },
     "m_FilterOptions": {
-        "m_Filter": "lat",
+        "m_Filter": "capture_e2e",
         "m_UseRegularExpressions": false,
         "m_MatchCase": false
     },

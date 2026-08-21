@@ -287,7 +287,7 @@ public class DepthSensorAPI : MonoBehaviour
                         Allocator.Temp, shouldFlipTexture: true))
                 {
                     // Process Frames ...
-                    Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value, frame.CaptureTime);
+                    Pose sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value, frame.CaptureTime / 1000);
                     sensorPose = DepthSensorPoseUtil.ToWorldPose(sensorPose, xrOrigin);
 
                     streamVisualizer.ProcessFrame(frame, metaData, sensorPose);

@@ -12,18 +12,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import combinations, permutations
+from pathlib import Path
 from typing import Sequence
 
 import cv2
 import numpy as np
-from pathlib import Path
+
 # in meters, planar probe first
 TEST_MARKER_COORDS = np.array(
     (
-        (0, 0.0501, 0), # top
-        (-0.0131, 0.0126, 0), # left
-        (0, 0, 0), # center
-        (0, -0.0391 , 0) # bottom
+        (-0.0466, 0.0000, 0.0206),  # left
+        (0.0444, 0.0000, 0.0206),   # right
+        (0.0095, 0.0623, 0.0206),   # up
+        (-0.0070, -0.0368, 0.0206), # bottom
     ),
     dtype=np.float64,
 )
@@ -620,8 +621,7 @@ def nearest_neighbor_distances(points: np.ndarray) -> np.ndarray:
             if i == j:
                 continue
             d = float(np.linalg.norm(pts[i] - pts[j]))
-            if d < nn[i]:
-                nn[i] = d
+            nn[i] = min(nn[i], d)
     return nn
 
 
@@ -636,7 +636,7 @@ def filter_isolated_centers(
         return []
     nn = nearest_neighbor_distances(pts)
     return [
-        (int(round(pts[i, 0])), int(round(pts[i, 1])))
+        (round(pts[i, 0]), round(pts[i, 1]))
         for i, d in enumerate(nn)
         if d <= max_nearest_neighbor_px
     ]
@@ -676,7 +676,7 @@ def filter_centers_by_span(
             best = chosen
             best_span = trial_span
 
-    return [(int(round(pts[i, 0])), int(round(pts[i, 1]))) for i in best]
+    return [(round(pts[i, 0]), round(pts[i, 1])) for i in best]
 
 
 def filter_centers_by_model_geometry(
@@ -715,7 +715,7 @@ def filter_centers_by_model_geometry(
         if best_idx:
             break
 
-    return [(int(round(pts[i, 0])), int(round(pts[i, 1]))) for i in best_idx]
+    return [(round(pts[i, 0]), round(pts[i, 1])) for i in best_idx]
 
 
 def filter_marker_centers(

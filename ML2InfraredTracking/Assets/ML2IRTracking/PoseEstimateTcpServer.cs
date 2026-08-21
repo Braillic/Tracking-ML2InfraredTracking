@@ -50,14 +50,14 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [SerializeField] private bool dropStaleFrames = true;
 
     [Header("Marker visualization (created on first accepted pose)")]
-    [Tooltip("Spawn one sphere per model point (object-frame metres). Defaults match desktop TEST_MARKER_COORDS.")]
+    [Tooltip("Spawn one sphere per model point (object-frame metres). The mounting surface is local Z = 0. Defaults match desktop TEST_MARKER_COORDS.")]
     [SerializeField] private bool createMarkerSpheresOnFirstPose = true;
     [SerializeField] private Vector3[] markerLocalPositions =
     {
-        new Vector3(0f, 0.0501f, 0f),
-        new Vector3(-0.0131f, 0.0126f, 0f),
-        new Vector3(0f, 0f, 0f),
-        new Vector3(0f, -0.0391f, 0f),
+        new Vector3(-0.0466f, 0f, 0.0206f), // Left
+        new Vector3(0.0444f, 0f, 0.0206f),  // Right
+        new Vector3(0.0095f, 0.0623f, 0.0206f), // Up
+        new Vector3(-0.007f, -0.0368f, 0.0206f), // Bottom
     };
     [SerializeField, Min(0.001f)] private float markerSphereRadius = 0.004f;
     [SerializeField] private Color markerSphereColor = new Color(1f, 0.2f, 0.2f, 0.9f);

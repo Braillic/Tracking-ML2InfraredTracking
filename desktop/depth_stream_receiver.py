@@ -16,7 +16,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
 from marker_pose import (
     TEST_MARKER_COORDS,
     MarkerPoseTracker,
@@ -33,7 +32,6 @@ from pose_packet import (
     send_pose,
     sync_clock_offset,
 )
-
 
 MAGIC = b"ML2D"
 PROTOCOL_VERSION = 3
