@@ -91,6 +91,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private float _pendingSendMs;
     private double _pendingPcRecvMl2;
     private double _pendingPcSendMl2;
+    private int _updateTickCounter;
+    private double _lastFpsSampleTime;
+    private float _measuredUpdateFps;
     private int _latencyLogCounter;
 
     private Thread _serverThread;
@@ -127,6 +130,17 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
     private void Update()
     {
+        _updateTickCounter++;
+        double nowUnscaled = Time.unscaledTimeAsDouble;
+        if (_lastFpsSampleTime <= 0.0)
+            _lastFpsSampleTime = nowUnscaled;
+        double fpsWindow = nowUnscaled - _lastFpsSampleTime;
+        if (fpsWindow >= 1.0)
+        {
+            _measuredUpdateFps = (float)(_updateTickCounter / fpsWindow);
+            _updateTickCounter = 0;
+            _lastFpsSampleTime = nowUnscaled;
+        }
         TryApplyPendingPose();
         HideTrackedToolIfTimedOut();
 
@@ -340,7 +354,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             $"(queue+tcp_write={queueMs:F1}ms | leg1_net(ML2->PC)={leg1Ms:F1}ms | " +
             $"detect={detectMs:F1}ms | pnp={pnpMs:F1}ms | pack={sendMs:F1}ms | " +
             $"leg2_net(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
-            $"unaccounted={unaccountedMs:F1}ms)");
+            $"unaccounted={unaccountedMs:F1}ms | update_fps={_measuredUpdateFps:F1})");
     }
 
     private void HideTrackedToolIfTimedOut()

@@ -72,6 +72,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private readonly double[] _latencySendDoneRealtime = new double[LatencyRingSize];
     private readonly bool[] _latencyHasSend = new bool[LatencyRingSize];
     private int _latencyWriteIndex;
+    private volatile float _lastQueueWaitMs;
+    private volatile float _lastWriteMs;
 
     // Round-trip (depth-sent -> pose-received) latency accumulator; consumed/reset by
     // ConsumeLatencyStats. frameNumber -> Stopwatch.GetTimestamp() at send-done.
@@ -165,7 +167,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             long sent = Interlocked.Read(ref _sentFrameCount);
             _status = submitted == 0
                 ? $"PC connected: {_remoteEndpoint}\nWaiting for first DepthRaw frame..."
-                : $"PC connected: {_remoteEndpoint}\nDepth {_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}";
+                : $"PC connected: {_remoteEndpoint}\nDepth {_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}" +
+                $"\nqueue={_lastQueueWaitMs:F1}ms write={_lastWriteMs:F1}ms";
         }
 
         long pendingLatencySamples = Interlocked.Read(ref _latencyCount);
@@ -429,6 +432,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 intrinsics = _pendingIntrinsics;
                 _pendingPayload = null;
             }
+            double pickupRealtime = Time.realtimeSinceStartupAsDouble;
 
             byte[] intrinsicsBytes = !intrinsicsSent && intrinsics.HasValue
                 ? BuildIntrinsicsBlock(intrinsics.Value)
@@ -445,7 +449,11 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 intrinsicsSent = true;
             }
             // Monotonic clock is safe to read off the main thread; do not Debug.Log here.
-            RecordLatencySendDone(frameNumber, Time.realtimeSinceStartupAsDouble);
+            double writeDoneRealtime = Time.realtimeSinceStartupAsDouble;
+            if (TryGetFrameTiming(frameNumber, out double submitRt, out _, out _))
+                _lastQueueWaitMs = (float)((pickupRealtime - submitRt) * 1000.0);
+            _lastWriteMs = (float)((writeDoneRealtime - pickupRealtime) * 1000.0);
+            RecordLatencySendDone(frameNumber, writeDoneRealtime);
             _frameSendTicks[frameNumber] = Stopwatch.GetTimestamp();
             Interlocked.Increment(ref _sentFrameCount);
 
