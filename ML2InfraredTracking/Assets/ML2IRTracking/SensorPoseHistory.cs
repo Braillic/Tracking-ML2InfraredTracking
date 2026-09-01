@@ -2,14 +2,12 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 
-/// <summary>
 /// Rolling history of sensor tracking-space poses, sampled every frame at
 /// NextPredictedDisplayTime (which XrLocateSpace always accepts - unlike an
 /// already-past depth frame CaptureTime, which is frequently rejected as
 /// XR_ERROR_TIME_INVALID once it falls outside the runtime's pose-history
 /// retention window). GetPose interpolates within this history instead of
 /// re-querying XrLocateSpace for a stale timestamp.
-/// </summary>
 public sealed class SensorPoseHistory
 {
     private struct Sample
@@ -23,17 +21,15 @@ public sealed class SensorPoseHistory
     private readonly long _maxAgeTicks; // XrTime is nanoseconds
     private readonly long _maxExtrapolationTicks;
 
-    /// <summary>
-    /// <paramref name="maxAgeSeconds"/> is how much history to retain. Outside the
+    /// "maxAgeSeconds" is how much history to retain. Outside the
     /// recorded range, TryGetPose extrapolates at constant velocity using the two
-    /// nearest samples, but only up to <paramref name="maxExtrapolationSeconds"/>
+    /// nearest samples, but only up to "maxExtrapolationSeconds"
     /// past them - beyond that the constant-velocity assumption gets unreliable
     /// (especially for rotation), so the query time is clamped before extrapolating,
     /// bounding how far the result can run away instead of diverging unboundedly.
     /// Samples recorded here are expected to already be smoothed (e.g. via a One
     /// Euro filter) before being passed to Record - this class only interpolates
     /// / extrapolates, it doesn't denoise.
-    /// </summary>
     public SensorPoseHistory(double maxAgeSeconds = 1.0, double maxExtrapolationSeconds = 0.75)
     {
         _maxAgeTicks = (long)(maxAgeSeconds * 1e9);
@@ -61,11 +57,9 @@ public sealed class SensorPoseHistory
     /// TryGetPose can actually interpolate right now instead of clamping.
     public long SpanTicks => _samples.Count >= 2 ? _samples[^1].Time - _samples[0].Time : 0;
 
-    /// <summary>
     /// Interpolates within the recorded range, or extrapolates at constant
     /// velocity (clamped to maxExtrapolationSeconds) outside it.
     /// Returns false only if no samples have been recorded yet.
-    /// </summary>
     public bool TryGetPose(long queryTime, out Pose trackingPose)
     {
         int n = _samples.Count;

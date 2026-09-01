@@ -6,11 +6,9 @@ using System.Threading;
 using TMPro;
 using UnityEngine;
 
-/// <summary>
 /// Listens for desktop pose packets (PC → Magic Leap) and applies the newest
 /// valid estimate to a tool transform. Companion to <see cref="DepthFrameTcpServer"/>
 /// (ML → PC depth); uses a separate port so depth send stays write-only.
-///
 /// Wire format (little-endian, fixed 80 bytes):
 ///   magic "ML2P"
 ///   ushort version (=3), ushort packet_size (=80)
@@ -29,7 +27,6 @@ using UnityEngine;
 /// "ML2R", see pose_packet.py:sync_clock_offset) so the desktop can translate its own
 /// perf_counter() timestamps above into this clock's domain, letting the latency log
 /// split the round trip into its two network legs instead of one lumped bucket.
-/// </summary>
 public sealed class PoseEstimateTcpServer : MonoBehaviour
 {
     public const int ProtocolVersion = 3;
@@ -206,9 +203,6 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         _status = "Pose stream stopped";
     }
 
-    /// <summary>
-    /// Thread-safe mailbox used by the receive loop. Main thread consumes via Update.
-    /// </summary>
     public void SubmitPose(ulong frameId, bool ok, float confidence, in Vector3 position,
         in Quaternion rotation, float detectMs, float pnpMs, float sendMs,
         double pcRecvMl2, double pcSendMl2)
@@ -291,7 +285,6 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         MaybeLogLatency(frameId, receivedRealtime, detectMs, pnpMs, sendMs, pcRecvMl2, pcSendMl2);
     }
 
-    /// <summary>
     /// detectMs/pnpMs/sendMs are PC-side stage durations from its own perf_counter
     /// (see pose_packet.py); pure durations need no clock sync. pcRecvMl2/pcSendMl2
     /// are PC perf_counter timestamps already translated into this clock's domain via
@@ -299,7 +292,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     /// directly against ML2's own sendDone/receivedRealtime to isolate each network leg.
     /// The split's accuracy is bounded by the sync handshake's assumption of symmetric
     /// Wi-Fi latency (see the "Clock sync: ... sync_rtt=" line the desktop prints).
-    /// </summary>
+
     private void MaybeLogLatency(ulong frameId, double receivedRealtime,
         float detectMs, float pnpMs, float sendMs, double pcRecvMl2, double pcSendMl2)
     {
@@ -352,11 +345,11 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             trackedTool.gameObject.SetActive(false);
     }
 
-    /// <summary>
+
     /// Creates a TrackedTool root (if needed) and child spheres at each model marker
     /// the first time a pose is accepted. Sphere local positions are the 3D constellation
     /// points used by PnP — once the root is posed, they sit on the physical markers.
-    /// </summary>
+
     private void EnsureTrackedToolVisual()
     {
         if (trackedTool == null)
@@ -513,13 +506,11 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
                packet[2] == (byte)'2' && packet[3] == (byte)'S';
     }
 
-    /// <summary>
     /// One-shot NTP-style clock-sync reply (see pose_packet.py:sync_clock_offset).
     /// Echoes the PC's request timestamp back alongside this clock's current reading
     /// so the desktop can estimate the offset between the two clocks. Runs on this
     /// server thread — Time.realtimeSinceStartupAsDouble is safe to read off the main
     /// thread (same assumption already relied on elsewhere in this file).
-    /// </summary>
     private void HandleSyncRequest(NetworkStream stream, byte[] request)
     {
         double pcT0 = BitConverter.ToDouble(request, 8);

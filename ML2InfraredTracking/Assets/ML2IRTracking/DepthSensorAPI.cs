@@ -302,7 +302,7 @@ public class DepthSensorAPI : MonoBehaviour
                PixelSensorStatus.Started)
         {
 
-            foreach (uint stream in configuredStreams)
+            foreach (uint stream in configuredStreams) 
             {
 
                 if (pixelSensorFeature.GetSensorData(sensorId.Value, stream, out var frame, out var metaData,

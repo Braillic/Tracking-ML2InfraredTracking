@@ -11,10 +11,8 @@ using TMPro;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
 
-/// <summary>
 /// Listens for a desktop TCP client and sends the newest depth frame as FLOAT32 meters.
 /// Network I/O runs on a background thread so a slow client cannot block the sensor loop.
-/// </summary>
 public sealed class DepthFrameTcpServer : MonoBehaviour
 {
     public const int ProtocolVersion = 3;
@@ -83,10 +81,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     public int Port => port;
     public string Status => _status;
 
-    /// <summary>
     /// Look up when this depth frame was queued / finished writing on the TCP thread.
     /// Times are <see cref="Time.realtimeSinceStartupAsDouble"/> (same clock as pose apply).
-    /// </summary>
     public bool TryGetFrameTiming(ulong frameId, out double submitRealtime, out double sendDoneRealtime,
         out bool hasSendDone)
     {
@@ -244,10 +240,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         _status = "Depth stream stopped";
     }
 
-    /// <summary>
     /// Called by PoseEstimateTcpServer when a pose packet arrives for a given frame.
     /// Computes round-trip latency (depth-sent → pose-received) and accumulates stats.
-    /// </summary>
     public void RecordPoseReceived(ulong frameId)
     {
         if (!_frameSendTicks.TryRemove(frameId, out long sendTick))
@@ -262,9 +256,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         while (dt > prevMax && Interlocked.CompareExchange(ref _latencyMaxTicks, dt, prevMax) != prevMax);
     }
 
-    /// <summary>
     /// Returns (avgMs, maxMs, sampleCount) and resets the accumulators.
-    /// </summary>
     public (double avgMs, double maxMs, long count) ConsumeLatencyStats()
     {
         long sum = Interlocked.Exchange(ref _latencySumTicks, 0);
@@ -276,10 +268,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         return (avgMs, maxMs, count);
     }
 
-    /// <summary>
     /// Called on Unity's main thread. The input array may be reused immediately after this returns.
     /// Only the newest unsent frame is retained.
-    /// </summary>
     public void SubmitFrame(float[] depthMetres, int width, int height, in Pose sensorPose,
         DepthCameraIntrinsics? intrinsics)
     {

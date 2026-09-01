@@ -1,15 +1,6 @@
 using System;
 using UnityEngine;
 
-/// <summary>
-/// One Euro Filter (Casiez, Roussel, Vogel 2012) - an adaptive low-pass filter
-/// purpose-built for smoothing noisy real-time human-motion tracking signals
-/// (position/orientation from head, hand, or controller tracking). It trades off
-/// jitter suppression against lag based on how fast the signal is currently
-/// moving: near-stationary, it smooths aggressively (minCutoff); moving fast, it
-/// opens up and tracks closely so real motion doesn't feel laggy (beta controls
-/// how quickly it opens up as speed increases).
-/// </summary>
 public sealed class OneEuroFilterVector3
 {
     private readonly float _minCutoff;
@@ -65,7 +56,6 @@ public sealed class OneEuroFilterVector3
     public void Reset() => _initialized = false;
 }
 
-/// <summary>Same idea as <see cref="OneEuroFilterVector3"/>, for rotation.</summary>
 public sealed class OneEuroFilterQuaternion
 {
     private readonly float _minCutoff;
