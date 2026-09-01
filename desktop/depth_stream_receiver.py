@@ -16,7 +16,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-
 from marker_pose import (
     TEST_MARKER_COORDS,
     MarkerPoseTracker,
@@ -34,7 +33,6 @@ from pose_packet import (
     sync_clock_offset,
 )
 
-
 MAGIC = b"ML2D"
 PROTOCOL_VERSION = 3
 PIXEL_FORMAT_FLOAT32_METRES = 1
@@ -45,11 +43,12 @@ WINDOW_TITLE = "Magic Leap 2 depth"
 ANALYSIS_WINDOW_TITLE = "Analysis (f=fixed, p=percentile)"
 MARKER_MIN_AREA = 2
 # Absolute fallback; close-up blobs often exceed a few thousand pixels.
-MARKER_MAX_AREA = 30000
+MARKER_MAX_AREA = 2000
 # Prefer image-relative cap: ~8% of frame (≈20k px on 544x480).
 MARKER_MAX_AREA_FRAC = 0.10
 MARKER_MAX_ASPECT = 6.0
 MARKER_RING_RADIUS = 10
+MAX_DETECTED_MARKERS = 4
 # Pre-PnP spatial filter defaults (pixels). These also scale up with image size
 # so close-up constellations are not rejected as "too spread out".
 MARKER_MAX_NEAREST_NEIGHBOR_PX = 90.0
@@ -58,7 +57,6 @@ MARKER_MAX_CLUSTER_SPAN_PX = 220.0
 MARKER_MAX_CLUSTER_SPAN_FRAC = 0.85  # of min(h, w)
 MARKER_MIN_CLUSTER_SIZE = 3
 MARKER_GEOMETRY_RATIO_ERROR = 0.35
-
 
 @dataclass(frozen=True)
 # intrinsics recieved once per TCP connection
@@ -252,7 +250,7 @@ def detect_marker_centers(
     threshold_method: str,
     fixed_threshold: float,
     top_p: tuple[float, float],
-    max_markers: int = 5,
+    # max_markers: int = 5,
     *,
     filter_geometry: bool = True,
     model_points: np.ndarray | None = None,
@@ -263,6 +261,7 @@ def detect_marker_centers(
     max_cluster_span_px: float | None = None,
     min_cluster_size: int = MARKER_MIN_CLUSTER_SIZE,
     max_geometry_ratio_error: float = MARKER_GEOMETRY_RATIO_ERROR,
+    max_markers: int=MAX_DETECTED_MARKERS,
 ) -> tuple[np.ndarray, float, list[tuple[int, int]]]:
     """Threshold a colourised frame and locate bright marker blobs."""
     thresholded, cutoff = apply_threshold(
@@ -646,6 +645,7 @@ def estimate_and_send_pose(
         return PoseEstimate.failed(), camera_matrix
 
     pnp_start = time.perf_counter()
+    print(f"sensor_rot={frame.sensor_rotation} sensor_pos={frame.sensor_position}", flush=True)
     estimate = tracker.estimate(
         centers,
         camera_matrix,
@@ -993,6 +993,8 @@ def parse_args() -> argparse.Namespace:
                         help="Initial Analysis-window threshold mode (toggle with f/p)")
     parser.add_argument("--fixed-threshold", type=float, default=200.0,
                         help="Cutoff on colourised 0-255 intensity when mode is fixed")
+    parser.add_argument("--max-detected-markers", type=int, default=4,
+                        help="Maximum number of probe markers to detect and save per frame")
     parser.add_argument("--percentile", type=float, default=90.0,
                         help="Percentile of colourised intensity when mode is percentile")
     parser.add_argument("--percentile-floor", type=float, default=100.0,

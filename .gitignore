@@ -16,6 +16,8 @@
 *.pidb
 *.svd
 *.userprefs
+*.npy
+*.png
 .DS_Store
 Thumbs.db
 
@@ -25,9 +27,12 @@ Thumbs.db
 # Visual Studio Code
 .vscode/
 */.venv/
+ML2InfraredTracking/venv/
 
 # saves
 *.npy
 desktop/saves
 desktop/processing
 *.apk
+desktop/recordings
+*.txt

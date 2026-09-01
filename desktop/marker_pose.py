@@ -1,8 +1,8 @@
-"""2D↔3D marker correspondence and pose.
+"""2D↔3D probe-marker correspondence and pose.
 
 Per frame:
   1. Acquire image centers (e.g. from detect_marker_centers).
-  2. Build candidates: treat detections as a subset of the known 3D model,
+  2. Build candidates: treat detections as a subset of the known 3D probe model,
      can rule out using pairwise distance-ratio signatures.
   3. Rule out more using: geometric gate → solvePnP → reprojection + temporal score.
   4. Output pose and confidence.
@@ -12,22 +12,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import combinations, permutations
+from pathlib import Path
 from typing import Sequence
 
 import cv2
 import numpy as np
-from pathlib import Path
+
 # in meters, planar probe first
 TEST_MARKER_COORDS = np.array(
     (
-        (0, 0.0501, 0), # top
-        (-0.0131, 0.0126, 0), # left
-        (0, 0, 0), # center
-        (0, -0.0391 , 0) # bottom
+        (-0.0466, 0.0000, 0.0206),  # left
+        (0.0444, 0.0000, 0.0206),   # right
+        (0.0095, 0.0623, 0.0206),   # up
+        (-0.0070, -0.0368, 0.0206), # bottom
     ),
     dtype=np.float64,
 )
-
 
 @dataclass(frozen=True)
 class PoseEstimate:
@@ -67,30 +67,32 @@ class MarkerPoseTracker:
     # perspective; non-coplanar layouts need a looser gate.
     max_distance_ratio_error: float | None = None
     max_reproj_px: float = 2.0 # error in pixels between projected and detected points
-    # Temporal nearest-neighbour association gate (pixels). Depth frames only
-    # arrive at ~5Hz, so even modest head motion between frames can displace
-    # markers well past a tight gate here - when that happens, the temporal path
-    # fails outright and falls back to a from-scratch combinatorial search, which
-    # is where a coplanar-marker correspondence ambiguity can flip to the wrong
-    # (but similarly low-reprojection-error) solution. Loosened from 40px after
-    # observing nearest-detection distances up to ~100px during ordinary,
-    # correctly-tracked motion at this frame rate.
-    max_assoc_px: float = 120.0
+    # Temporal nearest-neighbour association gate (pixels).
+    max_assoc_px: float = 40.0
+    # Reject a solved pose that jumps more than this from the previous frame's
+    # committed translation (metres). Filters minimal-config (3-marker) depth flips.
+    max_translation_jump_m: float = 0.06
+    # After this many consecutive jump-gate rejects, the reference pose is
+    # assumed stale; drop it and re-acquire from scratch.
+    max_consecutive_rejects: int = 3
     # Soft weights for ranking candidates (lower is better before → confidence).
     temporal_translation_weight: float = 50.0  # px-equivalent per metre
     temporal_rotation_weight: float = 30.0  # px-equivalent per radian
     # Reject if confidence below this after ranking.
     min_confidence: float = 0.15
+    # Cold-start needs 4 markers: 3 coplanar points admit two equally-good
+    # poses, so acquiring on 3 (with no prior to disambiguate) can lock onto
+    # the collapsed branch. An already-running track still continues on 3.
+    min_acquire_markers: int = 4
     # LM polish after PnP + one reassignment pass from projected model points.
     refine_pose: bool = True
     refine_iterations: int = 2
     # Added to ranking error for each visible detection left unmatched.
     unmatched_det_penalty_px: float = 12.0
-    # [MarkerPoseDiag] tracing, off by default - every print below used
-    # flush=True (forced, blocking, unbuffered writes), some firing multiple
-    # times per frame, which is real per-frame overhead once left on.
-    debug: bool = False
+    min_probe_z_m: float = 0.15
+    max_probe_z_m: float = 1.50
 
+    _reject_streak: int = field(default=0, init=False, repr=False)
     _prev_rvec: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_tvec: np.ndarray | None = field(default=None, init=False, repr=False)
     _prev_model_indices: tuple[int, ...] | None = field(default=None, init=False, repr=False)
@@ -106,12 +108,15 @@ class MarkerPoseTracker:
             raise ValueError("model_points shorter than min_markers")
         if self.min_markers < 3:
             raise ValueError("PnP needs at least 3 markers")
+        self.debug_counts = {"depth": 0, "min_markers": 0, "coverage": 0,
+                             "reproj": 0, "support": 0, "in_front": 0}
 
     def reset(self) -> None:
         self._prev_rvec = None
         self._prev_tvec = None
         self._prev_model_indices = None
         self._prev_image_indices = None
+        self._reject_streak = 0
 
     def _expected_matches(self, n_detected: int) -> int:
         return min(n_detected, self.model_points.shape[0])
@@ -139,45 +144,42 @@ class MarkerPoseTracker:
         ).reshape(-1)
         K = np.asarray(camera_matrix, dtype=np.float64)
 
-        # default to temporal association if already tracking
+        # A long reject streak means our reference pose is stale. Drop it and
+        # re-acquire this frame instead of comparing against a frozen pose.
+        if self._reject_streak >= self.max_consecutive_rejects:
+            print(f"[JUMP GATE] lost tracking after {self._reject_streak} rejects — re-acquiring")
+            self.reset()
+
         if self._prev_rvec is not None and self._prev_tvec is not None:
             temporal = self._estimate_temporal(pts, K, dist, n_detected)
-            # if the pose is valid and the confidence is high enough, update the previous pose
-            # otherwise, use combinatorial estimation
-            if temporal.ok and temporal.confidence >= self.min_confidence:
-                if self.debug:
-                    print(
-                        f"[MarkerPoseDiag] path=temporal accepted=True conf={temporal.confidence:.3f} "
-                        f"reproj={temporal.mean_reproj_px:.2f}px n_used={temporal.n_used}"
-                    )
+            if (temporal.ok and temporal.confidence >= self.min_confidence
+                    and self._jump_plausible(temporal)):
+                self._reject_streak = 0
                 return self._commit(temporal)
-            if self.debug:
-                print(
-                    f"[MarkerPoseDiag] path=temporal accepted=False ok={temporal.ok} "
-                    f"conf={temporal.confidence:.3f} reproj={temporal.mean_reproj_px:.2f}px "
-                    f"n_used={temporal.n_used} -> falling back to combinatorial"
-                )
+            
+        if self._prev_rvec is None and n_detected < self.min_acquire_markers:
+            self._reject_streak = 0
+            return PoseEstimate.failed()
 
         combinatorial = self._estimate_combinatorial(pts, K, dist, n_detected)
-        if combinatorial.ok:
-            if self.debug:
-                delta_str = ""
-                if self._prev_rvec is not None and self._prev_tvec is not None:
-                    dtheta = float(np.linalg.norm(
-                        cv2.Rodrigues(combinatorial.rvec)[0] @ cv2.Rodrigues(self._prev_rvec)[0].T
-                        - np.eye(3)
-                    ))
-                    dt = float(np.linalg.norm(combinatorial.tvec - self._prev_tvec))
-                    delta_str = f" dtheta~{dtheta:.3f} dt={dt:.4f}m"
-                print(
-                    f"[MarkerPoseDiag] path=combinatorial accepted=True conf={combinatorial.confidence:.3f} "
-                    f"reproj={combinatorial.mean_reproj_px:.2f}px n_used={combinatorial.n_used}{delta_str}"
-                )
+        # _jump_plausible returns True when there's no prev (fresh acquisition).
+        if combinatorial.ok and self._jump_plausible(combinatorial):
+            self._reject_streak = 0
             return self._commit(combinatorial)
-        if self.debug:
-            print("[MarkerPoseDiag] path=combinatorial accepted=False (no pose found)")
-        # keep last pose only if we never found anything this frame
-        return combinatorial
+
+        self._reject_streak += 1
+        return PoseEstimate.failed()
+    
+    def _jump_plausible(self, est: PoseEstimate) -> bool:
+        if self._prev_tvec is None or est.tvec is None:
+            return True  # no reference yet (startup) — nothing to compare against
+        dt = float(np.linalg.norm(est.tvec.reshape(3) - self._prev_tvec.reshape(3)))
+        if dt > self.max_translation_jump_m:
+            print(f"[JUMP GATE] reject dt={dt*1000:.1f}mm  n_used={est.n_used}  "
+                  f"reproj={est.mean_reproj_px:.2f}px  "
+                  f"z={float(est.tvec[2,0]):.3f}  prev_z={float(self._prev_tvec.reshape(3)[2]):.3f}")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Temporal path: project previous pose, keep nearest detection
@@ -405,8 +407,12 @@ class MarkerPoseTracker:
                   f"input model_idx={list(model_indices)} image_idx={list(image_indices)}")
         for cand_i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
             if not _all_points_in_front(obj, rvec, tvec):
-                if diag:
-                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, points behind camera")
+                self.debug_counts["in_front"] += 1
+                continue
+
+            candidate_z = float(np.asarray(tvec, dtype=np.float64).reshape(3)[2])
+            if not (self.min_probe_z_m <= candidate_z <= self.max_probe_z_m):
+                self.debug_counts["depth"] += 1
                 continue
 
             rvec_f, tvec_f, mi_f, ii_f = _refine_pose_and_reassign(
@@ -428,15 +434,11 @@ class MarkerPoseTracker:
             unmatched_det = max(0, n_detected - len(set(ii_f)))
 
             if n_used < self.min_markers:
-                if diag:
-                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, n_used={n_used} < min_markers={self.min_markers} "
-                          f"(mi_f={mi_f} ii_f={ii_f})")
+                self.debug_counts["min_markers"] += 1
                 continue
             # When enough markers are visible, require full min-side coverage.
-            if n_detected >= self.min_markers and n_used < expected:
-                if diag:
-                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, n_used={n_used} < expected={expected} "
-                          f"(n_detected={n_detected}, mi_f={mi_f} ii_f={ii_f})")
+            if n_detected >= self.min_markers and n_used < min(expected, n_detected - 1):
+                self.debug_counts["coverage"] += 1
                 continue
 
             mean_reproj = _mean_reprojection_error(
@@ -448,9 +450,7 @@ class MarkerPoseTracker:
                 dist_coeffs,
             )
             if mean_reproj > self.max_reproj_px:
-                if diag:
-                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, mean_reproj={mean_reproj:.2f}px "
-                          f"> max_reproj_px={self.max_reproj_px} (mi_f={mi_f} ii_f={ii_f})")
+                self.debug_counts["reproj"] += 1
                 continue
 
             support = _model_support(
@@ -463,9 +463,7 @@ class MarkerPoseTracker:
                 self.max_assoc_px,
             )
             if support < self.min_markers:
-                if diag:
-                    print(f"[MarkerPoseDiag]   cand {cand_i}: rejected, support={support} < min_markers={self.min_markers} "
-                          f"(mi_f={mi_f} ii_f={ii_f})")
+                self.debug_counts["support"] += 1
                 continue
             if diag:
                 print(f"[MarkerPoseDiag]   cand {cand_i}: passed all filters, reproj={mean_reproj:.2f}px "
@@ -689,8 +687,7 @@ def nearest_neighbor_distances(points: np.ndarray) -> np.ndarray:
             if i == j:
                 continue
             d = float(np.linalg.norm(pts[i] - pts[j]))
-            if d < nn[i]:
-                nn[i] = d
+            nn[i] = min(nn[i], d)
     return nn
 
 
@@ -705,7 +702,7 @@ def filter_isolated_centers(
         return []
     nn = nearest_neighbor_distances(pts)
     return [
-        (int(round(pts[i, 0])), int(round(pts[i, 1])))
+        (round(pts[i, 0]), round(pts[i, 1]))
         for i, d in enumerate(nn)
         if d <= max_nearest_neighbor_px
     ]
@@ -745,7 +742,7 @@ def filter_centers_by_span(
             best = chosen
             best_span = trial_span
 
-    return [(int(round(pts[i, 0])), int(round(pts[i, 1]))) for i in best]
+    return [(round(pts[i, 0]), round(pts[i, 1])) for i in best]
 
 
 def filter_centers_by_model_geometry(
@@ -784,7 +781,7 @@ def filter_centers_by_model_geometry(
         if best_idx:
             break
 
-    return [(int(round(pts[i, 0])), int(round(pts[i, 1]))) for i in best_idx]
+    return [(round(pts[i, 0]), round(pts[i, 1])) for i in best_idx]
 
 
 def filter_marker_centers(

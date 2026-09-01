@@ -18,7 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import cv2
 import numpy as np
-from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker, video_save_overlay
+from marker_pose import TEST_MARKER_COORDS, PoseEstimate, MarkerPoseTracker, video_save_overlay
 from depth_stream_receiver import colourise_depth #, detect_marker_centers, annotate_markers
 # camera matrix and distortion coefficients fom running depth_stream_receiver
 DEFAULT_CAMERA_MATRIX = np.array([[363.10574341,   0.          , 267.85662842],

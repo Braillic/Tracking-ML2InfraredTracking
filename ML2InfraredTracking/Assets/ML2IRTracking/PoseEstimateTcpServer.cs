@@ -47,14 +47,14 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [SerializeField] private bool dropStaleFrames = true;
 
     [Header("Marker visualization (created on first accepted pose)")]
-    [Tooltip("Spawn one sphere per model point (object-frame metres). Defaults match desktop TEST_MARKER_COORDS.")]
+    [Tooltip("Spawn one sphere per model point (object-frame metres). The mounting surface is local Z = 0. Defaults match desktop TEST_MARKER_COORDS.")]
     [SerializeField] private bool createMarkerSpheresOnFirstPose = true;
     [SerializeField] private Vector3[] markerLocalPositions =
     {
-        new Vector3(0f, 0.0501f, 0f),
-        new Vector3(-0.0131f, 0.0126f, 0f),
-        new Vector3(0f, 0f, 0f),
-        new Vector3(0f, -0.0391f, 0f),
+        new Vector3(-0.0466f, 0f, 0.0206f), // Left
+        new Vector3(0.0444f, 0f, 0.0206f),  // Right
+        new Vector3(0.0095f, 0.0623f, 0.0206f), // Up
+        new Vector3(-0.007f, -0.0368f, 0.0206f), // Bottom
     };
     [SerializeField, Min(0.001f)] private float markerSphereRadius = 0.004f;
     [SerializeField] private Color markerSphereColor = new Color(1f, 0.2f, 0.2f, 0.9f);
@@ -88,6 +88,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private float _pendingSendMs;
     private double _pendingPcRecvMl2;
     private double _pendingPcSendMl2;
+    private int _updateTickCounter;
+    private double _lastFpsSampleTime;
+    private float _measuredUpdateFps;
     private int _latencyLogCounter;
 
     private Thread _serverThread;
@@ -124,6 +127,17 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
     private void Update()
     {
+        _updateTickCounter++;
+        double nowUnscaled = Time.unscaledTimeAsDouble;
+        if (_lastFpsSampleTime <= 0.0)
+            _lastFpsSampleTime = nowUnscaled;
+        double fpsWindow = nowUnscaled - _lastFpsSampleTime;
+        if (fpsWindow >= 1.0)
+        {
+            _measuredUpdateFps = (float)(_updateTickCounter / fpsWindow);
+            _updateTickCounter = 0;
+            _lastFpsSampleTime = nowUnscaled;
+        }
         TryApplyPendingPose();
         HideTrackedToolIfTimedOut();
 
@@ -333,7 +347,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             $"(queue+tcp_write={queueMs:F1}ms | leg1_net(ML2->PC)={leg1Ms:F1}ms | " +
             $"detect={detectMs:F1}ms | pnp={pnpMs:F1}ms | pack={sendMs:F1}ms | " +
             $"leg2_net(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
-            $"unaccounted={unaccountedMs:F1}ms)");
+            $"unaccounted={unaccountedMs:F1}ms | update_fps={_measuredUpdateFps:F1})");
     }
 
     private void HideTrackedToolIfTimedOut()
