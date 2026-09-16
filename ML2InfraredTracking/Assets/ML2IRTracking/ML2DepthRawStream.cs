@@ -119,7 +119,7 @@ public class ML2DepthRawStream : MonoBehaviour
     {
         if (_loggedFloatFormat) return;
 
-        Debug.Log($"[ML2Tracking] Depth interpreted as FLOAT32" +
+        Debug.Log($"[ML2Tracking] Sensor input is FLOAT32 DepthRaw (before transport conversion)" +
                   $"{(removedRowPadding ? " (row padding removed)" : string.Empty)}. " +
                   $"{plane.Width}x{plane.Height}, stride={plane.Stride}.");
         _loggedFloatFormat = true;
@@ -224,11 +224,11 @@ public class ML2DepthRawStream : MonoBehaviour
                     var depthData = GetRawDepthData(in frame, ref _floatBuffer);
                     if (depthData == null) return;
 
-                    var detection = markerDetector.Detect(depthData, w, h);
+                    // var detection = markerDetector.Detect(depthData, w, h);
 
-                    Debug.Log(
-                        $"[MarkerDetector] Found {detection.centers.Count} markers"
-                    );
+                    // Debug.Log(
+                    //     $"[MarkerDetector] Found {detection.centers.Count} markers"
+                    // );
 
                     depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics);
                     if (sensorPoseDebugger != null)

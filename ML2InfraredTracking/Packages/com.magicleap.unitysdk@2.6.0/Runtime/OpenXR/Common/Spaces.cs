@@ -173,6 +173,13 @@ namespace MagicLeap.OpenXR.Spaces
                 return false;
             }
 
+            // XR_SUCCESS does not imply a complete pose. Never publish identity
+            // components in place of an unavailable position or orientation.
+            const XrSpaceLocationFlagsML required =
+                XrSpaceLocationFlagsML.PositionValid | XrSpaceLocationFlagsML.OrientationValid;
+            if ((spaceLocation.SpaceLocationFlags & required) != required)
+                return false;
+
             if (spaceLocation.SpaceLocationFlags.HasFlag(XrSpaceLocationFlagsML.OrientationValid))
             {
                 result.rotation = spaceLocation.Pose.Rotation.InvertXY();

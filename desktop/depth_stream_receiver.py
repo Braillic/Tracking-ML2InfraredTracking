@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Receive Magic Leap 2 FLOAT32 depth frames and display them with OpenCV.
+"""Receive selectable FLOAT32/PC-conversion and UINT8/ML2-conversion pipelines.
 
 Optionally estimates tool pose with MarkerPoseTracker and streams Unity-world
 poses back to PoseEstimateTcpServer on the headset (--send-pose).
@@ -11,7 +11,8 @@ import argparse
 import socket
 import struct
 import time
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -31,24 +32,26 @@ from pose_packet import (
     opencv_camera_pose_to_unity_world,
     send_pose,
     sync_clock_offset,
+    unity_trs_matrix,
 )
 
 MAGIC = b"ML2D"
-PROTOCOL_VERSION = 3
-PIXEL_FORMAT_FLOAT32_METRES = 1
+PROTOCOL_VERSION = 4
+PIXEL_FORMAT_FLOAT32_RAW = 1
+PIXEL_FORMAT_UINT8_SRGB_INTENSITY = 2
 HEADER = struct.Struct("<4sHHIIIIQd3f4fI")
 INTRINSICS = struct.Struct("<11d")
 MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
-WINDOW_TITLE = "Magic Leap 2 depth"
+WINDOW_TITLE = "Magic Leap 2 depth transport"
 ANALYSIS_WINDOW_TITLE = "Analysis (f=fixed, p=percentile)"
 MARKER_MIN_AREA = 2
 # Absolute fallback; close-up blobs often exceed a few thousand pixels.
 MARKER_MAX_AREA = 2000
-# Prefer image-relative cap: ~8% of frame (≈20k px on 544x480).
+# Prefer image-relative cap: ~8% of frame (â‰ˆ20k px on 544x480).
 MARKER_MAX_AREA_FRAC = 0.10
 MARKER_MAX_ASPECT = 6.0
 MARKER_RING_RADIUS = 10
-MAX_DETECTED_MARKERS = 4
+MAX_DETECTED_MARKERS = 8  # bounded candidate pool; PnP selects the constellation
 # Pre-PnP spatial filter defaults (pixels). These also scale up with image size
 # so close-up constellations are not rejected as "too spread out".
 MARKER_MAX_NEAREST_NEIGHBOR_PX = 90.0
@@ -89,14 +92,15 @@ class CameraIntrinsics:
 
 @dataclass(frozen=True)
 class DepthFrame:
-    """One synchronized ML depth frame and its Unity-world sensor pose."""
+    """One synchronized ML frame and its Unity-world sensor pose."""
 
-    depth_metres: np.ndarray
+    pixels: np.ndarray  # unmodified wire pixels: float32 DepthRaw or uint8 intensity
     frame_id: int
     timestamp: float
     sensor_position: np.ndarray  # xyz metres, Unity world coordinates
     sensor_rotation: np.ndarray  # xyzw quaternion, Unity world coordinates
     intrinsics: CameraIntrinsics | None  # present once per TCP connection
+    pixel_format: int = PIXEL_FORMAT_UINT8_SRGB_INTENSITY  # wire format
 
 
 def receive_exact(connection: socket.socket, count: int) -> bytes:
@@ -112,20 +116,25 @@ def receive_exact(connection: socket.socket, count: int) -> bytes:
 
 
 def receive_frame(connection: socket.socket) -> DepthFrame:
+    """Decode the wire payload only; conversion happens after recv_done."""
     values = HEADER.unpack(receive_exact(connection, HEADER.size))
     (magic, version, header_size, width, height, pixel_format, payload_size,
      frame_id, timestamp, px, py, pz, qx, qy, qz, qw, intrinsics_size) = values
 
     if magic != MAGIC:
         raise ValueError(f"Unexpected stream magic {magic!r}")
-    if version != PROTOCOL_VERSION or header_size != HEADER.size:
+    if version not in (3, PROTOCOL_VERSION) or header_size != HEADER.size:
         raise ValueError(f"Unsupported protocol version/header: {version}/{header_size}")
-    if pixel_format != PIXEL_FORMAT_FLOAT32_METRES:
+    if pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY:
+        dtype = np.dtype(np.uint8)
+    elif pixel_format == PIXEL_FORMAT_FLOAT32_RAW:
+        dtype = np.dtype("<f4")
+    else:
         raise ValueError(f"Unsupported pixel format {pixel_format}")
-    expected_size = width * height * np.dtype("<f4").itemsize
-    if payload_size != expected_size or payload_size > MAX_PAYLOAD_BYTES:
+    expected_size = width * height * dtype.itemsize
+    if width == 0 or height == 0 or payload_size != expected_size or payload_size > MAX_PAYLOAD_BYTES:
         raise ValueError(
-            f"Invalid payload: {payload_size} bytes for {width}x{height} FLOAT32"
+            f"Invalid payload: {payload_size} bytes for {width}x{height} {dtype.name}"
         )
     if intrinsics_size not in (0, INTRINSICS.size):
         raise ValueError(
@@ -133,38 +142,125 @@ def receive_frame(connection: socket.socket) -> DepthFrame:
         )
 
     payload = receive_exact(connection, payload_size)
-    depth_metres = np.frombuffer(payload, dtype="<f4").reshape(height, width)
+    pixels = np.frombuffer(payload, dtype=dtype).reshape(height, width)
     intrinsics = (CameraIntrinsics(*INTRINSICS.unpack(receive_exact(connection, intrinsics_size)))
                   if intrinsics_size else None)
     return DepthFrame(
-        depth_metres=depth_metres,
+        pixels=pixels,
         frame_id=frame_id,
         timestamp=timestamp,
         sensor_position=np.array((px, py, pz), dtype=np.float32),
         sensor_rotation=np.array((qx, qy, qz, qw), dtype=np.float32),
         intrinsics=intrinsics,
+        pixel_format=pixel_format,
     )
 
 
+class LatestFrameReceiver:
+    """One socket reader, one replaceable complete-frame slot per connection.
+
+    GUI/recording/PnP stalls drop intermediate frames instead of building a FIFO.
+    Intrinsics belong to the connection and survive dropping their first frame.
+    Receive timestamps are taken here, never when processing eventually starts.
+    """
+
+    def __init__(self, connection: socket.socket):
+        self.connection = connection
+        self._condition = threading.Condition()
+        self._pending = None
+        self._error = None
+        self._stopped = False
+        self.dropped_frames = 0
+        self._thread = threading.Thread(target=self._read, name="ML2 latest frame", daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        with self._condition:
+            self._stopped = True
+            self._pending = None
+            self._condition.notify_all()
+        # Interrupt recv_into before joining; no old reader survives reconnect.
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._thread.join()
+
+    def _read(self):
+        intrinsics = None
+        try:
+            while True:
+                frame = receive_frame(self.connection)
+                received = time.perf_counter()
+                if frame.intrinsics is not None:
+                    intrinsics = frame.intrinsics
+                frame = replace(frame, intrinsics=intrinsics)
+                with self._condition:
+                    if self._stopped:
+                        return
+                    if self._pending is not None:
+                        self.dropped_frames += 1
+                    self._pending = (frame, received)
+                    self._condition.notify_all()
+        except (ConnectionError, OSError, ValueError) as error:
+            with self._condition:
+                self._error = error
+                self._pending = None  # disconnected sessions cannot publish poses
+                self._condition.notify_all()
+
+    def take(self):
+        with self._condition:
+            self._condition.wait_for(lambda: self._pending is not None or self._error or self._stopped)
+            if self._error is not None:
+                raise self._error
+            if self._stopped:
+                raise ConnectionError("Depth receiver stopped")
+            result, self._pending = self._pending, None
+            return result
+
+
+def raw_to_uint8_srgb(
+    depth: np.ndarray,
+    raw_min: float,
+    raw_max: float,
+    *,
+    linear_to_srgb: bool,
+) -> np.ndarray:
+    """Map FLOAT32 DepthRaw values to the same uint8 image produced on ML2."""
+    finite = np.isfinite(depth)
+    normalized = (
+        (np.where(finite, depth, raw_min) - raw_min)
+        / max(raw_max - raw_min, 1e-6)
+    )
+    normalized = np.clip(normalized, 0.0, 1.0)
+    if linear_to_srgb:
+        normalized = np.where(
+            normalized <= 0.0031308,
+            normalized * 12.92,
+            1.055 * np.power(normalized, 1.0 / 2.4) - 0.055,
+        )
+    grey = np.rint(normalized * 255.0).astype(np.uint8)
+    grey[~finite] = 0
+    return grey
+
+
 def colourise_depth(depth: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    """Legacy e8a3201 FLOAT32-to-BGR mapping, also used by offline replay."""
     finite = np.isfinite(depth)
 
     if args.view == "unity-raw":
-        # Exact CPU equivalent of DepthSensorShader.shader for _Buffer == 0:
-        # saturate((depth - _RawMin) / (_RawMax - _RawMin)).
-        normalized = ((np.where(finite, depth, args.raw_min) - args.raw_min) /
-                      max(args.raw_max - args.raw_min, 1e-6))
-        normalized = np.clip(normalized, 0.0, 1.0)
-        if args.unity_color_space == "linear":
-            # The project uses Linear color space. Unity converts the shader's
-            # linear output to sRGB, while OpenCV byte images are already sRGB.
-            normalized = np.where(
-                normalized <= 0.0031308,
-                normalized * 12.92,
-                1.055 * np.power(normalized, 1.0 / 2.4) - 0.055,
-            )
-        grey = np.rint(normalized * 255.0).astype(np.uint8)
-        grey[~finite] = 0
+        grey = raw_to_uint8_srgb(
+            depth,
+            args.raw_min,
+            args.raw_max,
+            linear_to_srgb=args.unity_color_space == "linear",
+        )
         return cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
 
     valid = finite & (depth > 0)
@@ -175,6 +271,16 @@ def colourise_depth(depth: np.ndarray, args: argparse.Namespace) -> np.ndarray:
     colour = cv2.applyColorMap(255 - grey, cv2.COLORMAP_TURBO)
     colour[~valid] = 0
     return colour
+
+
+def prepare_detection_image(frame: DepthFrame, args: argparse.Namespace) -> np.ndarray:
+    """Both pipelines converge on UINT8 BGR before render_analysis()."""
+    if frame.pixel_format == PIXEL_FORMAT_FLOAT32_RAW:
+        return colourise_depth(frame.pixels, args)
+    if frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY:
+        return cv2.cvtColor(frame.pixels, cv2.COLOR_GRAY2BGR)
+    raise ValueError(f"Unsupported pixel format {frame.pixel_format}")
+
 
 def apply_threshold(
     image: np.ndarray,
@@ -319,6 +425,7 @@ def detect_marker_centers(
             max_cluster_span_px=max_span_px,
             min_cluster_size=min_cluster_size,
             max_geometry_ratio_error=max_geometry_ratio_error,
+            preserve_candidates=True,
         )
     return thresholded, cutoff, centers
 
@@ -349,7 +456,7 @@ def _cv_point(x: object, y: object) -> tuple[int, int] | None:
         return None
     if not (np.isfinite(xf) and np.isfinite(yf)):
         return None
-    # Bad / unstable PnP (e.g. a marker occluded) can project to ±1e20; OpenCV 5 then
+    # Bad / unstable PnP (e.g. a marker occluded) can project to Â±1e20; OpenCV 5 then
     # rejects the point with "Can't parse 'position'" because it must fit int32.
     try:
         xi = int(round(xf))
@@ -365,7 +472,7 @@ def flip_ud_points(
     points: list[tuple[int, int]] | np.ndarray | None,
     image_height: int,
 ) -> list[tuple[int, int]] | np.ndarray | None:
-    """Map stream-buffer coordinates → upright display coordinates (vertical flip)."""
+    """Map stream-buffer coordinates â†’ upright display coordinates (vertical flip)."""
     if points is None:
         return None
     if isinstance(points, list):
@@ -536,7 +643,7 @@ def render_analysis(
         min_cluster_size=min_cluster_size,
         max_geometry_ratio_error=max_geometry_ratio_error,
     )
-    # Do not draw marker rings or HUD here — caller unflips for display first,
+    # Do not draw marker rings or HUD here â€” caller unflips for display first,
     # then draw_pose_overlay / draw_analysis_hud own graphics and text.
     view = analysis.copy()
     if view.ndim == 2:
@@ -597,13 +704,13 @@ def _new_recording_dir(base_dir: Path) -> Path:
     # Keep it deterministic and filesystem-friendly.
     path = base_dir / f"recording_{stamp}"
     path.mkdir(parents=True, exist_ok=False)
-    # also make subdirs for depth, display, analysis
-    depth_dir = path / "depth"
+    # also make subdirs for intensity, display, centers and intrinsics
+    intensity_dir = path / "intensity"
     display_dir = path / "display"
     # analysis_dir = path / "analysis"
     centers_dir = path / "centers"
     intrinsics_dir = path / "intrinsics"
-    depth_dir.mkdir(parents=True, exist_ok=True)
+    intensity_dir.mkdir(parents=True, exist_ok=True)
     display_dir.mkdir(parents=True, exist_ok=True)
     # analysis_dir.mkdir(parents=True, exist_ok=True)
     centers_dir.mkdir(parents=True, exist_ok=True)
@@ -623,6 +730,7 @@ def estimate_and_send_pose(
     detect_ms: float = 0.0,
     recv_done: float = 0.0,
     clock_offset: float = 0.0,
+    max_processing_age_s: float = 0.10,
 ) -> tuple[PoseEstimate, np.ndarray | None]:
     """Run MarkerPoseTracker and optionally stream Unity-world pose to the headset.
 
@@ -638,18 +746,26 @@ def estimate_and_send_pose(
     """
     camera_matrix = pose_camera_matrix(
         intrinsics,
-        frame.depth_metres.shape[0],
+        frame.pixels.shape[0],
         depth_vertically_flipped=depth_vertically_flipped,
     )
-    if camera_matrix is None or not centers:
+    if camera_matrix is None:
+        tracker.reset()
         return PoseEstimate.failed(), camera_matrix
 
     pnp_start = time.perf_counter()
-    print(f"sensor_rot={frame.sensor_rotation} sensor_pos={frame.sensor_position}", flush=True)
+    if recv_done > 0 and pnp_start - recv_done > max_processing_age_s:
+        return PoseEstimate.failed(), camera_matrix
+    camera_world = unity_trs_matrix(frame.sensor_position, frame.sensor_rotation)
+    if not depth_vertically_flipped or convert_object_axes:
+        camera_world[:3, 1] *= -1  # same camera basis as world-pose conversion
+
     estimate = tracker.estimate(
         centers,
         camera_matrix,
         intrinsics.distortion_coefficients if intrinsics is not None else None,
+        observation_time=frame.timestamp,
+        camera_world_transform=camera_world,
     )
     pnp_ms = (time.perf_counter() - pnp_start) * 1000.0
 
@@ -671,10 +787,13 @@ def estimate_and_send_pose(
         convert_object_axes=convert_object_axes,
     )
     # prep_ms covers world-space transform + struct packing, up to (but not
-    # including) the sendall syscall — a packet can't carry its own send
+    # including) the sendall syscall â€” a packet can't carry its own send
     # duration, so that part is measured separately below and only printed
     # locally; it's negligible for a 64-byte write with TCP_NODELAY.
     send_ready_time = time.perf_counter()
+    if recv_done > 0 and send_ready_time - recv_done > max_processing_age_s:
+        tracker.reset()  # do not let a pose we cannot publish become the next prior
+        return PoseEstimate.failed(), camera_matrix
     packet = PosePacket(
         frame_id=frame.frame_id,
         ok=True,
@@ -706,7 +825,9 @@ def run(args: argparse.Namespace) -> None:
     threshold_method = args.threshold_method
     fixed_threshold = args.fixed_threshold
     top_p = (args.percentile_floor, args.percentile)
-    tracker = MarkerPoseTracker(TEST_MARKER_COORDS)
+    tracker = MarkerPoseTracker(TEST_MARKER_COORDS,
+                                lost_timeout_s=args.tracking_lost_timeout,
+                                acquisition_timeout_s=args.acquisition_timeout)
 
     recording = False
     recording_dir: Path | None = None
@@ -715,6 +836,7 @@ def run(args: argparse.Namespace) -> None:
     while True:
         pose_connection: socket.socket | None = None
         clock_offset = 0.0
+        tracker.reset()
         try:
             print(f"Connecting to Magic Leap depth at {args.host}:{args.port} ...")
             with socket.create_connection((args.host, args.port), timeout=args.connect_timeout) as connection:
@@ -739,196 +861,205 @@ def run(args: argparse.Namespace) -> None:
                     tracker.reset()
 
                 show_waiting_window(args.host, args.port)
-                first_frame = True
+                last_pixel_format = None
                 intrinsics = None
 
-                while True:
-                    frame = receive_frame(connection)
-                    recv_done = time.perf_counter()
-                    depth = frame.depth_metres
-                    if first_frame:
-                        print(f"First frame received: {depth.shape[1]}x{depth.shape[0]}, float32 metres",
-                              flush=True)
-                        first_frame = False
-                    if frame.intrinsics is not None:
-                        intrinsics = frame.intrinsics
-                        print("Intrinsics received once:", intrinsics, flush=True)
-                        print("OpenCV camera matrix:\n", intrinsics.camera_matrix, flush=True)
-                        print("OpenCV distortion coefficients:",
-                              intrinsics.distortion_coefficients, flush=True)
-
-                    display = colourise_depth(depth, args)
-                    analysis_view, analysis, centers, cutoff = render_analysis(
-                        display, threshold_method, fixed_threshold, top_p,
-                        **_geometry_filter_kwargs(args),
-                    )
-                    detect_ms = (time.perf_counter() - recv_done) * 1000.0
-
-                    estimate, pose_K = estimate_and_send_pose(
-                        tracker,
-                        centers,
-                        frame,
-                        intrinsics,
-                        pose_connection,
-                        depth_vertically_flipped=args.depth_vertically_flipped,
-                        convert_object_axes=args.convert_object_axes,
-                        detect_ms=detect_ms,
-                        recv_done=recv_done,
-                        clock_offset=clock_offset,
-                    )
-                    projected = None
-                    if pose_K is not None:
-                        projected = project_model_points(
-                            estimate,
-                            tracker.model_points,
-                            pose_K,
-                            intrinsics.distortion_coefficients if intrinsics is not None else None,
-                        )
-
-                    # Detection/PnP stay in stream coordinates; only the PC view is un-flipped.
-                    display_view, centers_view, projected_view = prepare_display_view(
-                        display, centers, projected, unflip=args.display_unflip
-                    )
-                    analysis_view, _, _ = prepare_display_view(
-                        analysis_view, centers, projected, unflip=args.display_unflip
-                    )
-                    analysis_view = draw_analysis_hud(
-                        analysis_view,
-                        analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
-                    )
-
-                    annotated_display = draw_pose_overlay(
-                        display_view, centers_view, estimate, projected_view
-                    )
-                    annotated_thresholded = draw_pose_overlay(
-                        analysis_view, centers_view, estimate, projected_view
-                    )
-
-                    valid = np.isfinite(depth) & (depth > 0)
-                    if np.any(valid):
-                        minimum = float(depth[valid].min())
-                        maximum = float(depth[valid].max())
-                        unit = "raw" if args.view == "unity-raw" else "m"
-                        label = f"frame {frame.frame_id}  range {minimum:.2f}-{maximum:.2f} {unit}"
-                    else:
-                        label = f"frame {frame.frame_id}  no valid depth"
-                    cv2.putText(annotated_display, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.55, (255, 255, 255), 1, cv2.LINE_AA)
-                    p = frame.sensor_position
-                    q = frame.sensor_rotation
-                    pose_label = (f"pose P=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})m "
-                                  f"Q=({q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f})")
-                    cv2.putText(annotated_display, pose_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.4, (255, 255, 255), 1, cv2.LINE_AA)
-
-                    if recording:
-                        cv2.putText(annotated_display, f"REC {recording_index:06d}", (10, 75),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-
-                    cv2.imshow(WINDOW_TITLE, annotated_display)
-                    cv2.imshow(ANALYSIS_WINDOW_TITLE, annotated_thresholded)
-
-                    key = cv2.waitKey(1) & 0xFF
-                    if key in (27, ord("q")):
-                        if pose_connection is not None:
-                            try:
-                                pose_connection.close()
-                            except OSError:
-                                pass
-                            pose_connection = None
-                        return
-                    if key == ord("r"):
-                        if not recording:
-                            base = save_directory or (Path.cwd() / "saves")
-                            base.mkdir(parents=True, exist_ok=True)
-                            recording_dir = _new_recording_dir(base)
-                            recording = True
-                            recording_index = 0
-                            print(f"Recording started: {recording_dir}", flush=True)
-                        else:
-                            recording = False
-                            print(
-                                f"Recording stopped: {recording_dir} ({recording_index} frames)",
-                                flush=True,
-                            )
-                            # compile all frames into a video
-                            frames_to_load = recording_dir.glob("display/*.npy")
-                            # make sure the frames are in the correct order
-                            frames_to_load = sorted(frames_to_load, key=lambda x: int(x.stem.split("_")[1]))
-                            frames = []
-                            for frame in frames_to_load:
-                                frames.append(np.load(frame))
-                            video_save_overlay(recording_dir, frames)
-                            recording_dir = None
-                    if key == ord("f"):
-                        threshold_method = "fixed"
-                        print("Analysis: fixed threshold", flush=True)
-                        analysis_view, analysis, centers, cutoff = render_analysis(
-                            colourise_depth(depth, args),
-                            threshold_method, fixed_threshold, top_p,
-                            **_geometry_filter_kwargs(args),
-                        )
-                        analysis_view, _, _ = prepare_display_view(
-                            analysis_view, centers, None, unflip=args.display_unflip
-                        )
-                        analysis_view = draw_analysis_hud(
-                            analysis_view,
-                            analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
-                        )
-                        cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis_view)
-                    elif key == ord("p"):
-                        threshold_method = "percentile"
-                        print("Analysis: percentile threshold", flush=True)
-                        analysis_view, analysis, centers, cutoff = render_analysis(
-                            colourise_depth(depth, args),
-                            threshold_method, fixed_threshold, top_p,
-                            **_geometry_filter_kwargs(args),
-                        )
-                        analysis_view, _, _ = prepare_display_view(
-                            analysis_view, centers, None, unflip=args.display_unflip
-                        )
-                        analysis_view = draw_analysis_hud(
-                            analysis_view,
-                            analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
-                        )
-                        cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis_view)
-                    elif key == ord("s"):
-                        # prompt for save name
-                        save_name = input("Enter save name: ")
-                        if not save_name:
-                            print("Save name cannot be empty")
+                with LatestFrameReceiver(connection) as receiver:
+                    while True:
+                        frame, recv_done = receiver.take()
+                        if time.perf_counter() - recv_done > args.max_processing_age:
                             continue
-                        target = ((save_directory or Path.cwd()) /
-                                  f"depth_{save_name}")
-                        np.save(target, depth)
-                        display_target = ((save_directory or Path.cwd()) /
-                                  f"display_{save_name}.png")
-                        cv2.imwrite(display_target, display)
-                        analysis_target = ((save_directory or Path.cwd()) /
-                                  f"analysis_{save_name}")
-                        np.save(f"{analysis_target}.npy", analysis)
-                        cv2.imwrite(f"{analysis_target}.png", analysis)
-                        print(f"Saved {target}")
-                        print(f"Saved {display_target}")
-                        print(f"Saved {analysis_target}")
+                        detection_start = time.perf_counter()
+                        if frame.pixel_format != last_pixel_format:
+                            pipeline = ("1: FLOAT32 -> colourise_depth() on PC"
+                                        if frame.pixel_format == PIXEL_FORMAT_FLOAT32_RAW
+                                        else "2: UINT8 from ML2 -> grayscale-to-BGR on PC")
+                            print(f"Pipeline {pipeline}; {frame.pixels.shape[1]}x{frame.pixels.shape[0]}, "
+                                  f"{frame.pixels.nbytes:,} payload bytes/frame", flush=True)
+                            tracker.reset()
+                            last_pixel_format = frame.pixel_format
+                        if frame.intrinsics is not None and frame.intrinsics != intrinsics:
+                            intrinsics = frame.intrinsics
+                            print("Intrinsics received once:", intrinsics, flush=True)
+                            print("OpenCV camera matrix:\n", intrinsics.camera_matrix, flush=True)
+                            print("OpenCV distortion coefficients:",
+                                  intrinsics.distortion_coefficients, flush=True)
 
-                    if recording:
-                        # Save current frame to the active recording directory.
-                        # We save depth + display + analysis (+ centers) for easy offline inspection.
-                        assert recording_dir is not None
-                        stem = f"{recording_index:06d}_{frame.frame_id}_{frame.timestamp:.3f}"
-                        # save intrinsics and distortion coefficients only once
-                        if recording_index == 0 and intrinsics is not None:
-                            np.save(recording_dir / "intrinsics" / "camera_matrix.npy", intrinsics.camera_matrix)
-                            np.save(recording_dir / "intrinsics" / "dist_coeffs.npy", intrinsics.distortion_coefficients)
+                        display = prepare_detection_image(frame, args)
+                        # Keep mapped intensity recordings/HUD for both transport modes.
+                        intensity = (frame.pixels if frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY
+                                     else display.max(axis=2))
+                        analysis_view, analysis, centers, cutoff = render_analysis(
+                            display, threshold_method, fixed_threshold, top_p,
+                            **_geometry_filter_kwargs(args),
+                        )
+                        detect_ms = (time.perf_counter() - detection_start) * 1000.0
 
-                        np.save(recording_dir / "depth" / f"depth_{stem}.npy", depth)
-                        # np.save(recording_dir / "analysis" / f"analysis_{stem}.npy", analysis)
-                        cv2.imwrite(str(recording_dir / "display" / f"display_{stem}.png"), annotated_display)
-                        np.save(recording_dir / "display" / f"display_{stem}.npy", annotated_display)
-                        # cv2.imwrite(str(recording_dir / "analysis" / f"analysis_{stem}.png"), analysis)
-                        np.save(recording_dir / "centers" / f"centers_{stem}.npy", np.array(centers, dtype=np.int32))
-                        recording_index += 1
+                        estimate, pose_K = estimate_and_send_pose(
+                            tracker,
+                            centers,
+                            frame,
+                            intrinsics,
+                            pose_connection,
+                            depth_vertically_flipped=args.depth_vertically_flipped,
+                            convert_object_axes=args.convert_object_axes,
+                            detect_ms=detect_ms,
+                            recv_done=recv_done,
+                            clock_offset=clock_offset,
+                            max_processing_age_s=args.max_processing_age,
+                        )
+                        projected = None
+                        if pose_K is not None:
+                            projected = project_model_points(
+                                estimate,
+                                tracker.model_points,
+                                pose_K,
+                                intrinsics.distortion_coefficients if intrinsics is not None else None,
+                            )
+
+                        # Detection/PnP stay in stream coordinates; only the PC view is un-flipped.
+                        display_view, centers_view, projected_view = prepare_display_view(
+                            display, centers, projected, unflip=args.display_unflip
+                        )
+                        analysis_view, _, _ = prepare_display_view(
+                            analysis_view, centers, projected, unflip=args.display_unflip
+                        )
+                        analysis_view = draw_analysis_hud(
+                            analysis_view,
+                            analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
+                        )
+
+                        annotated_display = draw_pose_overlay(
+                            display_view, centers_view, estimate, projected_view
+                        )
+                        annotated_thresholded = draw_pose_overlay(
+                            analysis_view, centers_view, estimate, projected_view
+                        )
+
+                        valid = intensity > 0
+                        if np.any(valid):
+                            minimum = int(intensity[valid].min())
+                            maximum = int(intensity[valid].max())
+                            label = f"frame {frame.frame_id}  range {minimum}-{maximum} uint8 sRGB"
+                        else:
+                            label = f"frame {frame.frame_id}  no nonzero intensity"
+                        cv2.putText(annotated_display, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                        p = frame.sensor_position
+                        q = frame.sensor_rotation
+                        pose_label = (f"pose P=({p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f})m "
+                                      f"Q=({q[0]:.3f}, {q[1]:.3f}, {q[2]:.3f}, {q[3]:.3f})")
+                        cv2.putText(annotated_display, pose_label, (10, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+                        if recording:
+                            cv2.putText(annotated_display, f"REC {recording_index:06d}", (10, 75),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+
+                        cv2.imshow(WINDOW_TITLE, annotated_display)
+                        cv2.imshow(ANALYSIS_WINDOW_TITLE, annotated_thresholded)
+
+                        key = cv2.waitKey(1) & 0xFF
+                        if key in (27, ord("q")):
+                            if pose_connection is not None:
+                                try:
+                                    pose_connection.close()
+                                except OSError:
+                                    pass
+                                pose_connection = None
+                            return
+                        if key == ord("r"):
+                            if not recording:
+                                base = save_directory or (Path.cwd() / "saves")
+                                base.mkdir(parents=True, exist_ok=True)
+                                recording_dir = _new_recording_dir(base)
+                                recording = True
+                                recording_index = 0
+                                print(f"Recording started: {recording_dir}", flush=True)
+                            else:
+                                recording = False
+                                print(
+                                    f"Recording stopped: {recording_dir} ({recording_index} frames)",
+                                    flush=True,
+                                )
+                                # compile all frames into a video
+                                frames_to_load = recording_dir.glob("display/*.npy")
+                                # make sure the frames are in the correct order
+                                frames_to_load = sorted(frames_to_load, key=lambda x: int(x.stem.split("_")[1]))
+                                frames = []
+                                for frame in frames_to_load:
+                                    frames.append(np.load(frame))
+                                video_save_overlay(recording_dir, frames)
+                                recording_dir = None
+                        if key == ord("f"):
+                            threshold_method = "fixed"
+                            print("Analysis: fixed threshold", flush=True)
+                            analysis_view, analysis, centers, cutoff = render_analysis(
+                                display,
+                                threshold_method, fixed_threshold, top_p,
+                                **_geometry_filter_kwargs(args),
+                            )
+                            analysis_view, _, _ = prepare_display_view(
+                                analysis_view, centers, None, unflip=args.display_unflip
+                            )
+                            analysis_view = draw_analysis_hud(
+                                analysis_view,
+                                analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
+                            )
+                            cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis_view)
+                        elif key == ord("p"):
+                            threshold_method = "percentile"
+                            print("Analysis: percentile threshold", flush=True)
+                            analysis_view, analysis, centers, cutoff = render_analysis(
+                                display,
+                                threshold_method, fixed_threshold, top_p,
+                                **_geometry_filter_kwargs(args),
+                            )
+                            analysis_view, _, _ = prepare_display_view(
+                                analysis_view, centers, None, unflip=args.display_unflip
+                            )
+                            analysis_view = draw_analysis_hud(
+                                analysis_view,
+                                analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
+                            )
+                            cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis_view)
+                        elif key == ord("s"):
+                            # prompt for save name
+                            save_name = input("Enter save name: ")
+                            if not save_name:
+                                print("Save name cannot be empty")
+                                continue
+                            target = ((save_directory or Path.cwd()) /
+                                      f"intensity_{save_name}")
+                            np.save(target, intensity)
+                            display_target = ((save_directory or Path.cwd()) /
+                                      f"display_{save_name}.png")
+                            cv2.imwrite(display_target, display)
+                            analysis_target = ((save_directory or Path.cwd()) /
+                                      f"analysis_{save_name}")
+                            np.save(f"{analysis_target}.npy", analysis)
+                            cv2.imwrite(f"{analysis_target}.png", analysis)
+                            print(f"Saved {target}")
+                            print(f"Saved {display_target}")
+                            print(f"Saved {analysis_target}")
+
+                        if recording:
+                            # Save current frame to the active recording directory.
+                            # Save intensity + display + centers for offline inspection.
+                            assert recording_dir is not None
+                            stem = f"{recording_index:06d}_{frame.frame_id}_{frame.timestamp:.3f}"
+                            # save intrinsics and distortion coefficients only once
+                            if recording_index == 0 and intrinsics is not None:
+                                np.save(recording_dir / "intrinsics" / "camera_matrix.npy", intrinsics.camera_matrix)
+                                np.save(recording_dir / "intrinsics" / "dist_coeffs.npy", intrinsics.distortion_coefficients)
+
+                            np.save(recording_dir / "intensity" / f"intensity_{stem}.npy", intensity)
+                            # np.save(recording_dir / "analysis" / f"analysis_{stem}.npy", analysis)
+                            cv2.imwrite(str(recording_dir / "display" / f"display_{stem}.png"), annotated_display)
+                            np.save(recording_dir / "display" / f"display_{stem}.npy", annotated_display)
+                            # cv2.imwrite(str(recording_dir / "analysis" / f"analysis_{stem}.png"), analysis)
+                            np.save(recording_dir / "centers" / f"centers_{stem}.npy", np.array(centers, dtype=np.int32))
+                            recording_index += 1
 
         except (ConnectionError, OSError, ValueError) as error:
             if not args.reconnect:
@@ -949,9 +1080,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1",
                         help="ML Wi-Fi IP, or 127.0.0.1 when using adb forward")
     parser.add_argument("--port", type=int, default=50777,
-                        help="DepthFrameTcpServer port (ML → PC)")
+                        help="DepthFrameTcpServer port (ML â†’ PC)")
     parser.add_argument("--pose-port", type=int, default=DEFAULT_POSE_PORT,
-                        help="PoseEstimateTcpServer port (PC → ML)")
+                        help="PoseEstimateTcpServer port (PC â†’ ML)")
     parser.add_argument("--send-pose", action="store_true",
                         help="Estimate pose live and stream ML2P packets to the headset")
     parser.add_argument(
@@ -959,7 +1090,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="ML streams flipped depth (shouldFlipTexture=true): adjust cy for PnP and "
-             "skip the OpenCV→Unity Y-flip (default: on). Required for correct motion direction.",
+             "skip the OpenCVâ†’Unity Y-flip (default: on). Required for correct motion direction.",
     )
     parser.add_argument(
         "--display-unflip",
@@ -1003,7 +1134,7 @@ def parse_args() -> argparse.Namespace:
         "--filter-geometry",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Drop isolated / geometrically implausible detections before PnP (default: on)",
+        help="Drop isolated / spatially implausible candidates before PnP (default: on)",
     )
     parser.add_argument(
         "--min-marker-area",
@@ -1050,10 +1181,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=float, default=5.0)
     parser.add_argument("--frame-timeout", type=float, default=10.0,
                         help="Reconnect if no complete frame data arrives for this many seconds")
+    parser.add_argument("--tracking-lost-timeout", type=float, default=0.65,
+                        help="Seconds since last accepted source observation before clearing the prior")
+    parser.add_argument("--acquisition-timeout", type=float, default=0.65,
+                        help="Maximum gap between acquisition confirmations (supports 5 Hz capture)")
+    parser.add_argument("--max-processing-age", type=float, default=0.10,
+                        help="Drop poses older than this many seconds since complete PC receive")
     parser.add_argument("--retry-delay", type=float, default=2.0)
     parser.add_argument("--no-reconnect", action="store_false", dest="reconnect")
     parser.set_defaults(reconnect=True)
-    return parser.parse_args()
+    args = parser.parse_args()
+    for name in ("tracking_lost_timeout", "acquisition_timeout", "max_processing_age"):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive and finite")
+    return args
 
 
 if __name__ == "__main__":

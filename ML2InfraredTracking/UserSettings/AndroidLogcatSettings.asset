@@ -257,7 +257,7 @@
         "AutoCapture": true
     },
     "m_FilterOptions": {
-        "m_Filter": "capture_e2e",
+        "m_Filter": "e2e",
         "m_UseRegularExpressions": false,
         "m_MatchCase": false
     },

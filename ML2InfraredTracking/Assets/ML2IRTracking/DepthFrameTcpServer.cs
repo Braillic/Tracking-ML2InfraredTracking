@@ -11,13 +11,23 @@ using TMPro;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
 
-/// Listens for a desktop TCP client and sends the newest depth frame as FLOAT32 meters.
+/// Sends DepthRaw through Pipeline 1 (FLOAT32, PC conversion) or
+/// Pipeline 2 (UINT8 intensity, ML2 conversion).
 /// Network I/O runs on a background thread so a slow client cannot block the sensor loop.
 public sealed class DepthFrameTcpServer : MonoBehaviour
 {
-    public const int ProtocolVersion = 3;
+    public enum PipelineMode
+    {
+        [InspectorName("Pipeline 1 - Legacy FLOAT32 (PC conversion)")]
+        LegacyFloat32 = 1,
+        [InspectorName("Pipeline 2 - UINT8 (ML2 conversion)")]
+        Ml2UInt8 = 2,
+    }
+
+    public const int ProtocolVersion = 4;
     public const int HeaderSize = 72;
-    public const uint PixelFormatFloat32Metres = 1;
+    public const uint PixelFormatFloat32Raw = 1;
+    public const uint PixelFormatUInt8SrgbIntensity = 2;
     public static DepthFrameTcpServer ActiveServer { get; private set; }
 
     [Header("TCP server (Magic Leap listens; PC connects)")]
@@ -27,6 +37,18 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     [SerializeField, Range(1, 65535)] private int port = 50777;
     [Tooltip("0 sends every frame. A lower rate is often more reliable over Wi-Fi.")]
     [SerializeField, Min(0)] private float maximumFramesPerSecond = 15f;
+
+    [Header("Processing pipeline")]
+    [Tooltip("Pipeline 1 sends raw floats for colourise_depth() on PC. Pipeline 2 converts on ML2 before sending. Both use the same PC tracker.")]
+    [SerializeField] private PipelineMode pipelineMode = PipelineMode.Ml2UInt8;
+
+    [Header("DepthRaw to UINT8 transport mapping")]
+    [Tooltip("Raw value mapped to black. Must match the previous Python --raw-min value.")]
+    [SerializeField] private float rawMin = 5f;
+    [Tooltip("Raw value mapped to white. Must match the previous Python --raw-max value.")]
+    [SerializeField] private float rawMax = 3000f;
+    [Tooltip("Apply the same linear-to-sRGB conversion previously performed by Python.")]
+    [SerializeField] private bool convertLinearToSrgb = true;
 
     [Header("Status display (optional)")]
     [SerializeField] private TMP_Text statusText;
@@ -41,6 +63,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private int _pendingWidth;
     private int _pendingHeight;
     private ulong _pendingFrameNumber;
+    private PipelineMode _pendingPipeline;
+    private PipelineMode _lastSubmittedPipeline;
     private double _pendingTimestamp;
     private Pose _pendingSensorPose;
     private DepthCameraIntrinsics? _pendingIntrinsics;
@@ -69,6 +93,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private readonly double[] _latencySubmitRealtime = new double[LatencyRingSize];
     private readonly double[] _latencySendDoneRealtime = new double[LatencyRingSize];
     private readonly bool[] _latencyHasSend = new bool[LatencyRingSize];
+    private readonly PipelineMode[] _latencyPipelines = new PipelineMode[LatencyRingSize];
     private int _latencyWriteIndex;
     private volatile float _lastQueueWaitMs;
     private volatile float _lastWriteMs;
@@ -82,11 +107,30 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
 
     public int Port => port;
     public string Status => _status;
+    public PipelineMode SelectedPipeline
+    {
+        get => pipelineMode;
+        set => SetPipelineMode((int)value);
+    }
+
+    // UnityEvent/API uses pipeline numbers 1 and 2, not zero-based indices.
+    public void SetPipelineMode(int pipelineNumber)
+    {
+        if (pipelineNumber != 1 && pipelineNumber != 2)
+        {
+            Debug.LogWarning($"[ML2DepthTCP] Unsupported pipeline {pipelineNumber}.");
+            return;
+        }
+        pipelineMode = (PipelineMode)pipelineNumber;
+    }
+
+    public static string PipelineLabel(PipelineMode mode) =>
+        mode == PipelineMode.LegacyFloat32 ? "1 FLOAT32 raw" : "2 UINT8 sRGB";
 
     /// Look up when this depth frame was queued / finished writing on the TCP thread.
     /// Times are <see cref="Time.realtimeSinceStartupAsDouble"/> (same clock as pose apply).
     public bool TryGetFrameTiming(ulong frameId, out double submitRealtime, out double sendDoneRealtime,
-        out bool hasSendDone)
+        out bool hasSendDone, out PipelineMode framePipeline)
     {
         lock (_latencyLock)
         {
@@ -99,6 +143,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 submitRealtime = _latencySubmitRealtime[i];
                 sendDoneRealtime = _latencySendDoneRealtime[i];
                 hasSendDone = _latencyHasSend[i];
+                framePipeline = _latencyPipelines[i];
                 return submitRealtime > 0.0;
             }
         }
@@ -106,10 +151,11 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         submitRealtime = 0.0;
         sendDoneRealtime = 0.0;
         hasSendDone = false;
+        framePipeline = default;
         return false;
     }
 
-    private void RecordLatencySubmit(ulong frameId, double submitRealtime)
+    private void RecordLatencySubmit(ulong frameId, double submitRealtime, PipelineMode framePipeline)
     {
         lock (_latencyLock)
         {
@@ -118,6 +164,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             _latencySubmitRealtime[i] = submitRealtime;
             _latencySendDoneRealtime[i] = 0.0;
             _latencyHasSend[i] = false;
+            _latencyPipelines[i] = framePipeline;
             _latencyWriteIndex = (i + 1) % LatencyRingSize;
         }
     }
@@ -163,7 +210,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             long sent = Interlocked.Read(ref _sentFrameCount);
             _status = submitted == 0
                 ? $"PC connected: {_remoteEndpoint}\nWaiting for first DepthRaw frame..."
-                : $"PC connected: {_remoteEndpoint}\nDepth {_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}" +
+                : $"PC connected: {_remoteEndpoint}\nPipeline {PipelineLabel(_lastSubmittedPipeline)} " +
+                $"{_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}" +
                 $"\nqueue={_lastQueueWaitMs:F1}ms write={_lastWriteMs:F1}ms";
         }
 
@@ -279,12 +327,17 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         if (!_running || depthMetres == null || width <= 0 || height <= 0)
             return;
 
+        PipelineMode framePipeline = pipelineMode;
+        if (framePipeline != PipelineMode.LegacyFloat32 && framePipeline != PipelineMode.Ml2UInt8)
+            return;
+
         int elementCount;
         int byteCount;
         try
         {
             elementCount = checked(width * height);
-            byteCount = checked(elementCount * sizeof(float));
+            byteCount = framePipeline == PipelineMode.LegacyFloat32
+                ? checked(elementCount * sizeof(float)) : elementCount;
         }
         catch (OverflowException)
         {
@@ -315,21 +368,52 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 }
             }
 
-            Buffer.BlockCopy(depthMetres, 0, _pendingPayload, 0, byteCount);
+            if (framePipeline == PipelineMode.LegacyFloat32)
+                Buffer.BlockCopy(depthMetres, 0, _pendingPayload, 0, byteCount);
+            else
+                ConvertRawToUInt8Srgb(depthMetres, _pendingPayload, elementCount);
             _pendingWidth = width;
             _pendingHeight = height;
             _pendingFrameNumber = _nextFrameNumber++;
+            _pendingPipeline = framePipeline;
             _pendingTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
             _pendingSensorPose = sensorPose;
             _pendingIntrinsics = intrinsics;
             _lastWidth = width;
             _lastHeight = height;
             _sensorInfo = BuildSensorInfo(sensorPose, intrinsics);
-            RecordLatencySubmit(_pendingFrameNumber, now);
+            RecordLatencySubmit(_pendingFrameNumber, now, framePipeline);
             long submitted = Interlocked.Increment(ref _submittedFrameCount);
-            if (submitted == 1)
-                Debug.Log($"[ML2DepthTCP] First depth frame queued: {width}x{height}, {byteCount} bytes.");
+            if (submitted == 1 || framePipeline != _lastSubmittedPipeline)
+                Debug.Log($"[ML2DepthTCP] Pipeline {PipelineLabel(framePipeline)}: " +
+                          $"{width}x{height}, {byteCount} payload bytes/frame.");
+            _lastSubmittedPipeline = framePipeline;
             Monitor.Pulse(_frameLock);
+        }
+    }
+
+    private void ConvertRawToUInt8Srgb(float[] source, byte[] destination, int count)
+    {
+        float denominator = Mathf.Max(rawMax - rawMin, 1e-6f);
+        for (int i = 0; i < count; i++)
+        {
+            float raw = source[i];
+            if (float.IsNaN(raw) || float.IsInfinity(raw))
+            {
+                destination[i] = 0;
+                continue;
+            }
+
+            float normalized = Mathf.Clamp01((raw - rawMin) / denominator);
+            if (convertLinearToSrgb)
+            {
+                normalized = normalized <= 0.0031308f
+                    ? normalized * 12.92f
+                    : 1.055f * Mathf.Pow(normalized, 1f / 2.4f) - 0.055f;
+            }
+
+            destination[i] = (byte)Mathf.Clamp(
+                Mathf.RoundToInt(normalized * 255f), 0, byte.MaxValue);
         }
     }
 
@@ -402,6 +486,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             int width;
             int height;
             ulong frameNumber;
+            PipelineMode framePipeline;
             double timestamp;
             Pose sensorPose;
             DepthCameraIntrinsics? intrinsics;
@@ -417,6 +502,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 width = _pendingWidth;
                 height = _pendingHeight;
                 frameNumber = _pendingFrameNumber;
+                framePipeline = _pendingPipeline;
                 timestamp = _pendingTimestamp;
                 sensorPose = _pendingSensorPose;
                 intrinsics = _pendingIntrinsics;
@@ -429,8 +515,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 : null;
             int intrinsicsByteCount = intrinsicsBytes?.Length ?? 0;
 
-            WriteHeader(header, width, height, payload.Length, frameNumber, timestamp,
-                sensorPose, intrinsicsByteCount);
+            WriteHeader(header, width, height, framePipeline, payload.Length,
+                frameNumber, timestamp, sensorPose, intrinsicsByteCount);
             stream.Write(header, 0, header.Length);
             stream.Write(payload, 0, payload.Length);
             if (intrinsicsByteCount > 0)
@@ -440,7 +526,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             }
             // Monotonic clock is safe to read off the main thread; do not Debug.Log here.
             double writeDoneRealtime = Time.realtimeSinceStartupAsDouble;
-            if (TryGetFrameTiming(frameNumber, out double submitRt, out _, out _))
+            if (TryGetFrameTiming(frameNumber, out double submitRt, out _, out _, out _))
                 _lastQueueWaitMs = (float)((pickupRealtime - submitRt) * 1000.0);
             _lastWriteMs = (float)((writeDoneRealtime - pickupRealtime) * 1000.0);
             RecordLatencySendDone(frameNumber, writeDoneRealtime);
@@ -463,17 +549,19 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         }
     }
 
-    private static void WriteHeader(byte[] header, int width, int height, int payloadBytes,
-        ulong frameNumber, double timestamp, in Pose sensorPose, int intrinsicsByteCount)
+    private static void WriteHeader(byte[] header, int width, int height,
+        PipelineMode framePipeline, int payloadBytes, ulong frameNumber,
+        double timestamp, in Pose sensorPose, int intrinsicsByteCount)
     {
         using MemoryStream memory = new MemoryStream(header, true);
         using BinaryWriter writer = new BinaryWriter(memory);
         writer.Write(new[] { (byte)'M', (byte)'L', (byte)'2', (byte)'D' });
-        writer.Write((ushort)ProtocolVersion);
+        writer.Write((ushort)(framePipeline == PipelineMode.LegacyFloat32 ? 3 : ProtocolVersion));
         writer.Write((ushort)HeaderSize);
         writer.Write((uint)width);
         writer.Write((uint)height);
-        writer.Write(PixelFormatFloat32Metres);
+        writer.Write(framePipeline == PipelineMode.LegacyFloat32
+            ? PixelFormatFloat32Raw : PixelFormatUInt8SrgbIntensity);
         writer.Write((uint)payloadBytes);
         writer.Write(frameNumber);
         writer.Write(timestamp);

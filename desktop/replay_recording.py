@@ -13,14 +13,15 @@ from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker, centers_to_float
 
 
 def load_frames(recording: Path):
-    """Return [(index, frame_id, centers_array), ...] in capture order."""
+    """Return [(index, frame_id, timestamp, centers_array), ...] in source order."""
     files = sorted((recording / "centers").glob("centers_*.npy"))
     frames = []
     for path in files:
         m = re.match(r"centers_(\d+)_(\d+)_", path.name)
         if m is None:
             continue
-        frames.append((int(m.group(1)), int(m.group(2)), np.load(path)))
+        timestamp = float(path.stem.rsplit("_", 1)[1])
+        frames.append((int(m.group(1)), int(m.group(2)), timestamp, np.load(path)))
     frames.sort(key=lambda item: item[0])
     return frames
 
@@ -56,10 +57,11 @@ def main() -> None:
     z_values, n_ok, n_fail = [], 0, 0
     by_marker_count = {}
 
-    for index, frame_id, centers in frames:
+    for index, frame_id, timestamp, centers in frames:
         centers = np.asarray(centers).reshape(-1, 2)
         n_det = centers.shape[0]
-        est = tracker.estimate(centers_to_float(centers), K, dist) if n_det >= 3 else None
+        est = tracker.estimate(
+            centers_to_float(centers), K, dist, observation_time=timestamp)
 
         slot = by_marker_count.setdefault(n_det, [0, 0])
         if est is not None and est.ok:

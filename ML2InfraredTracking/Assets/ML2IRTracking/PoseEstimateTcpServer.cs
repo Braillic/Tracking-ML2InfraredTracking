@@ -43,8 +43,10 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [Tooltip("Optional. If empty, a TrackedTool root is created on the first accepted pose.")]
     [SerializeField] private Transform trackedTool;
     [SerializeField, Min(0f)] private float minConfidence;
-    [Tooltip("Ignore poses whose frame_id is older than the last applied pose.")]
+    [Tooltip("Ignore duplicate or older frame IDs. Keep enabled for live tracking.")]
     [SerializeField] private bool dropStaleFrames = true;
+    [Tooltip("Maximum submit-to-apply age on ML2's own clock. Independent of capture cadence and tracking-loss hold.")]
+    [SerializeField, Min(0.001f)] private float maxPoseAgeSeconds = 0.15f;
 
     [Header("Marker visualization (created on first accepted pose)")]
     [Tooltip("Spawn one sphere per model point (object-frame metres). The mounting surface is local Z = 0. Defaults match desktop TEST_MARKER_COORDS.")]
@@ -67,7 +69,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [Tooltip("0 = snap. Small values reduce jitter but add a little lag.")]
     [SerializeField, Range(0f, 1f)] private float rotationFollow = 1f;
     [SerializeField, Range(0f, 1f)] private float positionFollow = 1f;
-    [SerializeField, Min(0f)] private float hideAfterNoPoseSeconds = 0.5f;
+    [SerializeField, Min(0f)] private float hideAfterNoPoseSeconds = 0.65f;
 
     [Header("Latency (Debug.Log)")]
     [Tooltip("Log throttled [ML2LAT] lines on the main thread when a pose is applied. " +
@@ -101,6 +103,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private volatile string _remoteEndpoint;
     private volatile string _status = "Pose stream stopped";
     private ulong _lastAppliedFrameId;
+    private bool _hasAppliedFrame;
+    private long _stalePoseCount;
     private long _receivedCount;
     private long _appliedCount;
     private double _nextStatusUpdate;
@@ -150,7 +154,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             {
                 _status = received == 0
                     ? $"PC connected: {_remoteEndpoint}\nWaiting for pose packets..."
-                    : $"PC connected: {_remoteEndpoint}\nposes recv {received} | applied {applied}";
+                    : $"PC connected: {_remoteEndpoint}\nposes recv {received} | applied {applied} | stale {_stalePoseCount}";
             }
         }
 
@@ -188,6 +192,10 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         Interlocked.Exchange(ref _receivedCount, 0);
         Interlocked.Exchange(ref _appliedCount, 0);
         _lastAppliedFrameId = 0;
+        _hasAppliedFrame = false;
+        _stalePoseCount = 0;
+        _lastAcceptedPoseTime = double.NegativeInfinity;
+        lock (_poseLock) _hasPending = false;
         _status = $"Starting pose server on {bindAddress}:{port}...";
         _serverThread = new Thread(ServerLoop)
         {
@@ -214,6 +222,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         _client = null;
         _listener = null;
         _serverThread = null;
+        lock (_poseLock) _hasPending = false;
+        _lastAcceptedPoseTime = double.NegativeInfinity;
+        if (trackedTool != null) trackedTool.gameObject.SetActive(false);
         _status = "Pose stream stopped";
     }
 
@@ -225,6 +236,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         double receivedRealtime = Time.realtimeSinceStartupAsDouble;
         lock (_poseLock)
         {
+            if (dropStaleFrames && _hasPending && frameId <= _pendingFrameId)
+                return;
             _pendingFrameId = frameId;
             _pendingOk = ok;
             _pendingConfidence = confidence;
@@ -270,13 +283,22 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             _hasPending = false;
         }
 
-        if (!ok || confidence < minConfidence)
+        if (!ok || float.IsNaN(confidence) || float.IsInfinity(confidence) || confidence < minConfidence
+            || !IsFinitePose(position, rotation))
             return;
 
-        if (dropStaleFrames && frameId < _lastAppliedFrameId)
+        var depthServer = DepthFrameTcpServer.ActiveServer;
+        double now = Time.realtimeSinceStartupAsDouble;
+        double submit = 0.0;
+        bool knownFrame = depthServer != null && depthServer.TryGetFrameTiming(frameId,
+            out submit, out _, out _, out _);
+        if (!IsFreshPose(frameId, _hasAppliedFrame, _lastAppliedFrameId, dropStaleFrames,
+                         knownFrame, submit, now, maxPoseAgeSeconds))
         {
+            _stalePoseCount++;
             return;
         }
+        rotation = rotation.normalized;
 
         EnsureTrackedToolVisual();
         if (trackedTool == null)
@@ -294,9 +316,29 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             trackedTool.rotation = Quaternion.Slerp(trackedTool.rotation, rotation, rotationFollow);
 
         _lastAppliedFrameId = frameId;
-        _lastAcceptedPoseTime = Time.unscaledTimeAsDouble;
+        _hasAppliedFrame = true;
+        // Receipt of a delayed packet must not extend the lifetime of an old pose.
+        _lastAcceptedPoseTime = submit;
         Interlocked.Increment(ref _appliedCount);
         MaybeLogLatency(frameId, receivedRealtime, detectMs, pnpMs, sendMs, pcRecvMl2, pcSendMl2);
+    }
+
+    internal static bool IsFreshPose(ulong frameId, bool hasApplied, ulong lastApplied,
+        bool rejectOldIds, bool knownFrame, double submit, double now, double maxAge)
+    {
+        double age = now - submit;
+        return (!rejectOldIds || !hasApplied || frameId > lastApplied)
+            && knownFrame && !double.IsNaN(age) && !double.IsInfinity(age)
+            && maxAge > 0.0 && age >= 0.0 && age <= maxAge;
+    }
+
+    private static bool IsFinitePose(Vector3 position, Quaternion rotation)
+    {
+        float norm = Quaternion.Dot(rotation, rotation);
+        return !float.IsNaN(position.x) && !float.IsInfinity(position.x)
+            && !float.IsNaN(position.y) && !float.IsInfinity(position.y)
+            && !float.IsNaN(position.z) && !float.IsInfinity(position.z)
+            && !float.IsNaN(norm) && !float.IsInfinity(norm) && norm > 1e-8f;
     }
 
     /// detectMs/pnpMs/sendMs are PC-side stage durations from its own perf_counter
@@ -322,7 +364,8 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
         var depthServer = DepthFrameTcpServer.ActiveServer;
         if (depthServer == null ||
-            !depthServer.TryGetFrameTiming(frameId, out double submit, out double sendDone, out bool hasSend))
+            !depthServer.TryGetFrameTiming(frameId, out double submit, out double sendDone,
+                out bool hasSend, out DepthFrameTcpServer.PipelineMode framePipeline))
         {
             Debug.Log($"[ML2LAT] frame={frameId} apply_wait={applyWaitMs:F1}ms " +
                       "(no matching depth submit time — is DepthFrameTcpServer active?)");
@@ -343,8 +386,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         double measuredMs = queueMs + leg1Ms + detectMs + pnpMs + sendMs + leg2Ms + applyWaitMs;
         double unaccountedMs = e2eMs - measuredMs; // clock-sync/measurement slack; large values mean the symmetric-latency assumption is off
         Debug.Log(
-            $"[ML2LAT] frame={frameId} e2e={e2eMs:F1}ms " +
-            $"(queue+tcp_write={queueMs:F1}ms | leg1_net(ML2->PC)={leg1Ms:F1}ms | " +
+            $"[ML2LAT] frame={frameId} pipeline={DepthFrameTcpServer.PipelineLabel(framePipeline)} " +
+            $"e2e={e2eMs:F1}ms " +
+            $"(ml_prepare+queue+tcp_write={queueMs:F1}ms | leg1_net(ML2->PC)={leg1Ms:F1}ms | " +
             $"detect={detectMs:F1}ms | pnp={pnpMs:F1}ms | pack={sendMs:F1}ms | " +
             $"leg2_net(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
             $"unaccounted={unaccountedMs:F1}ms | update_fps={_measuredUpdateFps:F1})");
@@ -355,7 +399,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         if (hideAfterNoPoseSeconds <= 0f || trackedTool == null || !trackedTool.gameObject.activeSelf)
             return;
 
-        if (Time.unscaledTimeAsDouble - _lastAcceptedPoseTime > hideAfterNoPoseSeconds)
+        if (Time.realtimeSinceStartupAsDouble - _lastAcceptedPoseTime > hideAfterNoPoseSeconds)
             trackedTool.gameObject.SetActive(false);
     }
 

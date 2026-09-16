@@ -124,7 +124,9 @@ def run_recording(
     reprojs: list[float] = []
     for path in center_files:
         pts = np.load(path).astype(np.float64).reshape(-1, 2)
-        est = tracker.estimate(pts, camera_matrix, dist_coeffs)
+        observation_time = float(path.stem.rsplit("_", 1)[1])
+        est = tracker.estimate(
+            pts, camera_matrix, dist_coeffs, observation_time=observation_time)
 
         projected = None
         if est.ok and est.rvec is not None and est.tvec is not None:

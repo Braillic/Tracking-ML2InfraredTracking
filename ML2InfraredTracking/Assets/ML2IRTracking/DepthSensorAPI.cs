@@ -6,6 +6,7 @@ using Unity.Collections;
 using UnityEngine;
 using UnityEngine.XR.MagicLeap;
 using UnityEngine.XR.OpenXR;
+using UnityEngine.XR;
 using MagicLeap.OpenXR.Features.PixelSensors;
 using Unity.XR.CoreUtils;
 using System.Text;
@@ -46,28 +47,62 @@ public class DepthSensorAPI : MonoBehaviour
     private PixelSensorId? sensorId;
     private List<uint> configuredStreams = new List<uint>();
 
-    // Recorded every frame at NextPredictedDisplayTime (always a valid XrLocateSpace
-    // query) so we can interpolate to a depth frame's CaptureTime - which is often
-    // already outside the runtime's pose-history window by the time we see it -
-    // instead of querying XrLocateSpace directly with a timestamp it may reject.
-    // 2s of retention keeps CaptureTime (typically <1s stale) inside the recorded
-    // range in the common case, so most lookups interpolate between closely-spaced
-    // samples instead of falling back to the noisier extrapolation path.
+    // Keep SDK poses at their original timestamps. Additional smoothing here
+    // delays head motion relative to the image used by desktop PnP.
+    // History accepts exact samples or interpolation across at most 100 ms.
     private readonly SensorPoseHistory sensorPoseHistory = new SensorPoseHistory(2.0);
-
-    // Smooths the noisy raw headset-tracked sensor pose before it's recorded, so
-    // both interpolation and extrapolation work from a clean signal instead of
-    // reproducing per-sample tracking jitter.
-    private readonly OneEuroFilterVector3 positionFilter = new OneEuroFilterVector3();
-    private readonly OneEuroFilterQuaternion rotationFilter = new OneEuroFilterQuaternion();
+    private readonly List<XRInputSubsystem> inputSubsystems = new List<XRInputSubsystem>();
+    private int _lastLiveSampleFrame = -1;
+    private long _lastLiveSampleXrTime;
+    private long _minimumCaptureTime;
+    private double _lastLiveSampleRealtime = double.NegativeInfinity;
+    private const double MaxLiveSampleAgeSeconds = 0.1;
+    private bool _applicationPaused;
 
     // Temporary diagnostics for tuning the history-based pose lookup. Remove once
     // the flicker/lag under motion is understood.
     private int _historyMissCount;
     private int _liveUpdateOkCount;
     private int _liveUpdateFailCount;
+    private int _historyPoseCount;
+    private int _directPoseCount;
+    private int _droppedPoseCount;
+    private SensorPoseHistory.LookupStatus _lastLookupStatus;
     private float _lastHistoryDiagLog;
 
+    private void OnEnable()
+    {
+        ResetSensorPoseHistory();
+        SubscribeToTrackingOriginChanges();
+    }
+
+    private void SubscribeToTrackingOriginChanges()
+    {
+        foreach (var subsystem in inputSubsystems)
+            subsystem.trackingOriginUpdated -= OnTrackingOriginUpdated;
+        SubsystemManager.GetSubsystems(inputSubsystems);
+        foreach (var subsystem in inputSubsystems)
+            subsystem.trackingOriginUpdated += OnTrackingOriginUpdated;
+    }
+
+    private void OnTrackingOriginUpdated(XRInputSubsystem subsystem) => ResetSensorPoseHistory();
+
+    private void OnApplicationPause(bool paused)
+    {
+        _applicationPaused = paused;
+        ResetSensorPoseHistory();
+    }
+
+    private void ResetSensorPoseHistory()
+    {
+        sensorPoseHistory.Clear();
+        _lastLiveSampleFrame = -1;
+        _lastLiveSampleXrTime = 0;
+        _lastLiveSampleRealtime = double.NegativeInfinity;
+        // Prevent an in-flight image from being paired across a tracking-origin
+        // change. If XR has not started, the first successful live sample sets it.
+        DepthSensorPoseUtil.TryGetPredictedDisplayTime(out _minimumCaptureTime);
+    }
 
     public uint targetStream
     {
@@ -127,7 +162,10 @@ public class DepthSensorAPI : MonoBehaviour
 
     private void OnSensorAvailabilityChanged(PixelSensorId id, bool available)
     {
-        if (sensorId.HasValue && id == sensorId && available)
+        if (!sensorId.HasValue || id != sensorId.Value)
+            return;
+        ResetSensorPoseHistory();
+        if (available)
         {
             Debug.Log("Sensor became available.");
             TryInitializeSensor();
@@ -136,9 +174,12 @@ public class DepthSensorAPI : MonoBehaviour
 
     private void TryInitializeSensor()
     {
+        if (!isActiveAndEnabled)
+            return;
         if (sensorId.HasValue && pixelSensorFeature.GetSensorStatus(sensorId.Value) ==
             PixelSensorStatus.Undefined && pixelSensorFeature.CreatePixelSensor(sensorId.Value))
         {
+            ResetSensorPoseHistory();
             Debug.Log("Sensor created successfully.");
             ConfigureSensorStreams();
         }
@@ -173,7 +214,8 @@ public class DepthSensorAPI : MonoBehaviour
             return;
         }
 
-        // Only add the target
+        // Only add the target, including when the sensor is recreated.
+        configuredStreams.Clear();
         configuredStreams.Add(targetStream);
 
 
@@ -282,6 +324,8 @@ public class DepthSensorAPI : MonoBehaviour
 
         if (startOperation.DidOperationSucceed)
         {
+            ResetSensorPoseHistory();
+            SubscribeToTrackingOriginChanges();
             Debug.Log("Sensor started successfully. Monitoring data...");
             StartCoroutine(MonitorSensorData());
         }
@@ -301,6 +345,12 @@ public class DepthSensorAPI : MonoBehaviour
         while (pixelSensorFeature.GetSensorStatus(sensorId.Value) ==
                PixelSensorStatus.Started)
         {
+            if (_applicationPaused)
+            {
+                yield return null;
+                continue;
+            }
+            SampleLiveSensorPose();
 
             foreach (uint stream in configuredStreams) 
             {
@@ -308,65 +358,100 @@ public class DepthSensorAPI : MonoBehaviour
                 if (pixelSensorFeature.GetSensorData(sensorId.Value, stream, out var frame, out var metaData,
                         Allocator.Temp, shouldFlipTexture: true))
                 {
-                    // Process Frames ...
-                    if (!sensorPoseHistory.TryGetPose(frame.CaptureTime, out Pose sensorPose))
-                    {
-                        // History not warmed up yet (first frame or two) - fall back to a
-                        // direct query, which may itself hit TimeInvalid this early.
-                        _historyMissCount++;
-                        sensorPose = pixelSensorFeature.GetSensorPose(sensorId.Value, frame.CaptureTime);
-                    }
-                    if (Time.realtimeSinceStartup - _lastHistoryDiagLog > 2f)
-                    {
-                        _lastHistoryDiagLog = Time.realtimeSinceStartup;
-                        Debug.Log($"[ML2SensorPoseHistoryDiag] samples={sensorPoseHistory.SampleCount} " +
-                                  $"spanMs={sensorPoseHistory.SpanTicks / 1e6:F1} historyMisses={_historyMissCount} " +
-                                  $"liveUpdateOk={_liveUpdateOkCount} liveUpdateFail={_liveUpdateFailCount}");
-                    }
+                    if (!frame.IsValid || !TryResolveCapturePose(frame.CaptureTime, out Pose sensorPose))
+                        continue;
                     sensorPose = DepthSensorPoseUtil.ToWorldPose(sensorPose, xrOrigin);
 
                     streamVisualizer.ProcessFrame(frame, metaData, sensorPose);
-
-                    yield return null;
                 }
             }
+
+            LogPoseDiagnostics();
+            // GetSensorData is polled on Unity's main thread. Always yield once per
+            // rendered frame, including when no sensor frame is ready, so this
+            // coroutine cannot busy-wait and starve Update/LateUpdate.
+            yield return null;
         }
     }
 
-    // Cap the live-pose polling rate. Sampling every rendered frame (60-90Hz) adds
-    // enough native XrLocateSpace overhead to stress frame timing, and packs samples
-    // so close together that tracking noise gets amplified into large spurious
-    // velocity estimates during extrapolation. ~20Hz still comfortably out-resolves
-    // the ~5Hz depth stream while cutting both problems down.
-    private const float LiveSampleIntervalSeconds = 1f / 20f;
-    private float _lastLiveSampleTime = float.NegativeInfinity;
-
-    private void LateUpdate()
+    private bool TryResolveCapturePose(long captureTime, out Pose sensorPose)
     {
-        if (!sensorId.HasValue || pixelSensorFeature == null)
-            return;
+        sensorPose = Pose.identity;
+        if (captureTime <= 0 || (_minimumCaptureTime > 0 && captureTime < _minimumCaptureTime))
+        {
+            _droppedPoseCount++;
+            return false;
+        }
 
-        if (Time.realtimeSinceStartup - _lastLiveSampleTime < LiveSampleIntervalSeconds)
-            return;
-        _lastLiveSampleTime = Time.realtimeSinceStartup;
+        // Prefer a bounded lookup when XR no longer retains the capture time.
+        // An old history cannot remain usable after live tracking stops updating.
+        if (Time.realtimeSinceStartupAsDouble - _lastLiveSampleRealtime > MaxLiveSampleAgeSeconds)
+            sensorPoseHistory.Clear();
+        if (sensorPoseHistory.TryGetPose(captureTime, out sensorPose, out _lastLookupStatus))
+        {
+            _historyPoseCount++;
+            return true;
+        }
 
-        // Display-rate extrinsic sample, always taken at NextPredictedDisplayTime
-        // (always a valid XrLocateSpace query). Feeds SensorPoseHistory so depth
-        // frames can interpolate to their own CaptureTime instead of querying
-        // XrLocateSpace directly with a timestamp that's often already stale.
+        _historyMissCount++;
+        if (pixelSensorFeature.TryGetSensorPose(sensorId.Value, captureTime, out sensorPose) &&
+            SensorPoseHistory.IsValidPose(sensorPose))
+        {
+            sensorPose.rotation = sensorPose.rotation.normalized;
+            _directPoseCount++;
+            return true;
+        }
+
+        // TryGetSensorPose may write a cached pose on failure. Never use that out value.
+        sensorPose = Pose.identity;
+        _droppedPoseCount++;
+        return false;
+    }
+
+    private void LogPoseDiagnostics()
+    {
+        if (Time.realtimeSinceStartup - _lastHistoryDiagLog <= 2f)
+            return;
+        _lastHistoryDiagLog = Time.realtimeSinceStartup;
+        Debug.Log($"[ML2SensorPoseHistoryDiag] samples={sensorPoseHistory.SampleCount} " +
+                  $"spanMs={sensorPoseHistory.SpanTicks / 1e6:F1} historyMisses={_historyMissCount} " +
+                  $"historyUsed={_historyPoseCount} directUsed={_directPoseCount} dropped={_droppedPoseCount} " +
+                  $"lastLookup={_lastLookupStatus} liveUpdateOk={_liveUpdateOkCount} liveUpdateFail={_liveUpdateFailCount}");
+    }
+
+    private void LateUpdate() => SampleLiveSensorPose();
+
+    private void SampleLiveSensorPose()
+    {
+        if (_applicationPaused || !sensorId.HasValue || pixelSensorFeature == null ||
+            pixelSensorFeature.GetSensorStatus(sensorId.Value) != PixelSensorStatus.Started ||
+            _lastLiveSampleFrame == Time.frameCount)
+            return;
+        _lastLiveSampleFrame = Time.frameCount;
+
+        // One query per Unity frame, shared by the producer and debug display.
+        // Record the SDK pose directly; never smooth or extrapolate sensor motion.
         bool gotLivePose = DepthSensorPoseUtil.TryGetLiveSensorTrackingPose(
             pixelSensorFeature, sensorId.Value, out Pose trackingPose, out long time);
-        if (gotLivePose)
+        gotLivePose = gotLivePose && time > 0 && SensorPoseHistory.IsValidPose(trackingPose);
+        if (gotLivePose && time != _lastLiveSampleXrTime)
         {
-            double timeSeconds = time / 1e9;
-            trackingPose = new Pose(
-                positionFilter.Filter(trackingPose.position, timeSeconds),
-                rotationFilter.Filter(trackingPose.rotation, timeSeconds));
+            if (time < _lastLiveSampleXrTime)
+            {
+                ResetSensorPoseHistory();
+                _minimumCaptureTime = time;
+            }
+            if (_minimumCaptureTime == 0)
+                _minimumCaptureTime = time;
             sensorPoseHistory.Record(time, trackingPose);
+            _lastLiveSampleXrTime = time;
+            _lastLiveSampleRealtime = Time.realtimeSinceStartupAsDouble;
             _liveUpdateOkCount++;
         }
-        else
+        else if (!gotLivePose)
         {
+            sensorPoseHistory.Clear();
+            _lastLiveSampleRealtime = double.NegativeInfinity;
             _liveUpdateFailCount++;
         }
 
@@ -383,9 +468,21 @@ public class DepthSensorAPI : MonoBehaviour
 
     public void OnDisable()
     {
+        ResetSensorPoseHistory();
+        StopAllCoroutines();
+        foreach (var subsystem in inputSubsystems)
+            subsystem.trackingOriginUpdated -= OnTrackingOriginUpdated;
+        inputSubsystems.Clear();
         //We start the Coroutine on another MonoBehaviour since it can only run while the object is enabled.
-        MonoBehaviour camMono = Camera.main.GetComponent<MonoBehaviour>();
-        camMono.StartCoroutine(StopSensorCoroutine());
+        MonoBehaviour camMono = Camera.main ? Camera.main.GetComponent<MonoBehaviour>() : null;
+        if (camMono != null && pixelSensorFeature != null)
+            camMono.StartCoroutine(StopSensorCoroutine());
+    }
+
+    private void OnDestroy()
+    {
+        if (pixelSensorFeature != null)
+            pixelSensorFeature.OnSensorAvailabilityChanged -= OnSensorAvailabilityChanged;
     }
 
     private IEnumerator StopSensorCoroutine()
