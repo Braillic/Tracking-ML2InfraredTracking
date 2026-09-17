@@ -175,18 +175,22 @@ does not eliminate all planar-pose ambiguity or implement final-pose smoothing.
 
 ## Wire protocol
 
-Each frame is a 72-byte little-endian header (`<4sHHIIIIQd3f4fI`) followed by
+Each frame has a 112-byte little-endian header (base `<4sHHIIIIQd3f4fI>` plus
+40-byte timing extension `<Qqddd>`) followed by
 `width * height * 4` little-endian FLOAT32 values (Pipeline 1) or
 `width * height` UINT8 intensity values (Pipeline 2) and, when present, a fixed
 88-byte numeric intrinsics block (`<11d`):
 
 1. Magic `ML2D`
-2. Protocol version (`3` for Pipeline 1, `4` for Pipeline 2) and header size (`72`)
+2. Protocol version `5` for both pipelines and header size `112` (Python also reads legacy v3/v4)
 3. Width, height, pixel format (`1` = FLOAT32 DepthRaw, `2` = UINT8 sRGB intensity), payload byte count
 4. Frame number and UTC Unix timestamp in seconds
 5. Sensor position `x,y,z` in metres and rotation quaternion `x,y,z,w`, both in
    the Unity world coordinate system
 6. Numeric intrinsics byte count (`0` or `88`)
+7. Session ID (`uint64`), exact capture XrTime (`int64` nanoseconds), mapped capture
+   time, SDK-poll start, and SDK-frame-ready time (three `float64` Unity-clock seconds).
+   Mapped capture time is NaN when clock conversion is unavailable.
 
 The sensor pose is synchronized with every depth frame. Intrinsics are sent once
 per TCP connection (on the first frame after metadata becomes available), then
@@ -210,7 +214,7 @@ Rejected jumps do not refresh the accepted observation time.
 A dedicated depth reader continuously drains TCP into one replaceable complete
 frame slot. Processing takes the newest frame, with its original PC receive time
 and connection calibration. Intermediate frames are dropped during processing,
-preview, and recording stalls. FLOAT32/UINT8 protocols remain unchanged.
+preview, and recording stalls. The FLOAT32/UINT8 pixel encodings remain unchanged; v5 adds timing and session metadata.
 
 ### Independent timing settings
 
@@ -258,7 +262,113 @@ These limits discard stale work; they do not establish latency below 30 ms.
 Already-buffered TCP bytes still cross the network before the reader can discard
 frames. Preview, disk writes, and interactive save/video operations can still
 pause solving, although they no longer create a desktop frame FIFO. Benchmark
-without recording/save prompts. The current wire observation timestamp remains
-ML2 UTC submission time (a capture-time proxy), so tracker interval checks assume
-no wall-clock adjustment during a session. Restart after an ML2 clock change.
+without recording/save prompts. Version 5 uses exact monotonic capture timestamps
+for tracker intervals; the UTC field is retained only for recording names and legacy readers.
+Legacy v3/v4 inputs still use the UTC submission proxy.
 Actual capture-to-display latency still needs hardware measurement.
+
+
+## Fixes #6–8: timing, frame preparation, and centroid precision
+
+### Deployment
+
+**Rebuild/deploy the Unity APK and restart this desktop receiver together.**
+Depth packets are now v5 (112-byte header); pose replies are v4 (88 bytes) with an
+echoed session ID. The new Python decoder can read old depth recordings/streams,
+but an old live desktop receiver cannot read the new ML2 header. Clock-sync
+messages remain v3 and 80 bytes. A new ML2 pose server requires a matching nonzero
+session; old clients cannot apply untagged poses.
+
+The session changes when the server starts or sensor history/XR origin resets.
+Pending frames and timing history are invalidated, the old visual is hidden, and
+the PC starts acquisition again. A worker retains the session of its original
+frame even if the origin changes during conversion or network transmission.
+
+### Reading the measurements
+
+- `[ML2LAT] submit_to_apply` replaces the misleading `e2e` label. It includes
+  sender conversion/queue/write, PC work, transport, and Unity apply waiting.
+- `[ML2Timing]` reports rolling p50/p95/p99 and sample counts for capture-to-submit,
+  capture-to-apply, SDK polling, frame-ready-to-submit, submit-to-apply, and
+  apply-to-`onBeforeRender`. Windows contain at most 256 accepted samples and reset
+  for a new session. Cumulative counters include received/applied/rejected/stale,
+  wrong-session replies, sender overwrites, and rate-limited frame drops.
+- Displayed pose age is shown separately, with `hidden` when the model is hidden.
+  Both capture age (when available) and submission age are reported.
+- `[ML2SensorPoseHistoryDiag]` now also reports delivered frame rate and mean
+  interval between distinct source capture timestamps, including frames whose
+  pose lookup subsequently fails.
+- `[PCTracking]` reports received/overwritten/processed/accepted/failed-or-expired
+  counts and rolling PC-work percentiles across processed successes and failures.
+  `--diagnostics-interval 0` disables PC summaries; Unity's `logLatency` disables
+  detailed apply summaries. Source-pose diagnostics remain independently throttled.
+
+Capture time is converted via the SDK's XR-to-system conversion, sampled against
+Android `CLOCK_MONOTONIC`, then mapped to Unity's monotonic clock. This follows
+[OpenXR's clock conversion contract](https://registry.khronos.org/OpenXR/specs/1.0/man/html/xrConvertTimeToTimespecTimeKHR.html).
+The bridge rejects sampling spans above 2 ms, failed conversions, negative ages,
+and implausibly old captures. It reports unavailable rather than inventing an
+offset or using predicted display time as the current time. Its sampling error
+is bounded by half the accepted sampling span, plus runtime conversion error.
+
+`onBeforeRender` is a CPU callback, **not physical display presentation**.
+Presentation remains explicitly `unmeasured`. Sensor exposure details and
+motion-to-photon latency still need on-device/high-speed-camera validation.
+One-way transport splits remain estimates; constant clock-sync offset cancels
+between the two legs, so `unaccounted` mainly represents PC queue/omitted work.
+The existing 150 ms rejection threshold still measures submission-to-apply;
+the new capture measurements allow that policy to be assessed before tightening it.
+Always assess accepted rate, drop counts, and pose error alongside percentiles.
+
+### Faster preparation without changing intensity mapping
+
+ML2 now checks connection/rate eligibility before copying the raw plane. It
+uploads the preview only when enabled and a renderer exists, at a configurable
+10 Hz default. UINT8 conversion runs on the sender thread with an owned raw
+buffer and snapshotted mapping settings. Full-frame copies and conversion run
+outside the handoff lock. Conversion preserves the old mapping and rounding;
+no approximate lookup table or extra filter has been introduced.
+
+For a clean latency trial from the repository root:
+
+```powershell
+.venv/Scripts/python.exe desktop/depth_stream_receiver.py --host 127.0.0.1 --send-pose --headless
+```
+
+Use the headset IP for Wi-Fi, or the existing ADB forwarding setup for localhost.
+`--headless` skips GUI, overlays, BGR expansion for UINT8 frames, and interactive
+save/recording work. Normal preview and recording remain available. Disk/video
+operations in interactive mode can still pause solving; the latest-frame reader
+prevents them from creating an accumulating frame queue.
+
+Blob centroid scans are restricted to each component's bounding box. Hypothesis
+ranking now has its own 12 ms budget, checked per detection subset, in addition
+to the existing 12 ms solver budget. These are cooperative checks, not a hard
+whole-frame deadline: a running native solver call cannot be interrupted.
+
+### Accuracy and validation
+
+Intensity-weighted centroids remain floats through all geometry filters,
+correspondence, and PnP. Recordings store float64 centers plus JSON sidecars with
+exact observation time, capture nanoseconds, session, sensor pose, and the PnP
+camera matrix. `replay_recording.py` uses these to compensate head motion during
+replay; old recordings without sidecars still load with their previous metadata.
+Rounding is confined to drawing.
+
+Final refined candidates are checked again for finite values, positive depth,
+and depth range. The packet boundary validates finite values and unit rotation.
+The unsupported unflipped/no-object-conversion combination is rejected explicitly
+because it creates a reflection; the default flipped pipeline is unchanged.
+
+```powershell
+.venv/Scripts/python.exe -B -m unittest discover -s desktop -p 'test_*.py' -v
+pwsh -NoProfile -File tests/pipeline-quality/Run-PipelineTests.ps1
+pwsh -NoProfile -File tests/pose-freshness/Run-PoseFreshnessTests.ps1
+pwsh -NoProfile -File tests/sensor-pose/Run-SensorPoseTests.ps1
+```
+
+Regression checks cover subpixel motion, refined-pose rejection, headless operation,
+clock mapping failures, session reset, buffer ownership during repeated capture,
+200,016 pre-change mapping comparisons, and actual C#-written/Python-decoded packets.
+Unity Editor and Android conditional code also require a project compile.
+These software tests do not establish a measured latency below 30 ms on ML2.

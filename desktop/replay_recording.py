@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
 import numpy as np
-
 from marker_pose import TEST_MARKER_COORDS, MarkerPoseTracker, centers_to_float
+from pose_packet import unity_trs_matrix
 
 
-def load_frames(recording: Path):
+def load_frames(recording: Path, with_metadata: bool = False):
     """Return [(index, frame_id, timestamp, centers_array), ...] in source order."""
     files = sorted((recording / "centers").glob("centers_*.npy"))
     frames = []
@@ -21,7 +22,11 @@ def load_frames(recording: Path):
         if m is None:
             continue
         timestamp = float(path.stem.rsplit("_", 1)[1])
-        frames.append((int(m.group(1)), int(m.group(2)), timestamp, np.load(path)))
+        metadata_path = path.with_suffix('.json')
+        metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        timestamp = metadata.get('observation_time', timestamp)
+        item = (int(m.group(1)), int(m.group(2)), timestamp, np.load(path))
+        frames.append(item + (metadata,) if with_metadata else item)
     frames.sort(key=lambda item: item[0])
     return frames
 
@@ -50,18 +55,31 @@ def main() -> None:
         max_probe_z_m=max_z,
     )
 
-    frames = load_frames(args.recording)
+    frames = load_frames(args.recording, with_metadata=True)
     print(f"Loaded {len(frames)} frames from {args.recording}")
     print(f"Depth gate: {'OFF' if args.no_gate else f'{min_z}..{max_z} m'}\n")
 
     z_values, n_ok, n_fail = [], 0, 0
     by_marker_count = {}
 
-    for index, frame_id, timestamp, centers in frames:
+    last_session = None
+    for index, frame_id, timestamp, centers, metadata in frames:
+        session = metadata.get('session_id')
+        if session != last_session:
+            tracker.reset()
+            last_session = session
+        camera_world = None
+        if 'sensor_position' in metadata:
+            camera_world = unity_trs_matrix(np.asarray(metadata['sensor_position']),
+                                            np.asarray(metadata['sensor_rotation']))
+            if not metadata.get('depth_vertically_flipped', True) or metadata.get('convert_object_axes', False):
+                camera_world[:3, 1] *= -1
+        frame_K = np.asarray(metadata['pnp_camera_matrix']) if metadata.get('pnp_camera_matrix') else K
         centers = np.asarray(centers).reshape(-1, 2)
         n_det = centers.shape[0]
         est = tracker.estimate(
-            centers_to_float(centers), K, dist, observation_time=timestamp)
+            centers_to_float(centers), frame_K, dist, observation_time=timestamp,
+            camera_world_transform=camera_world)
 
         slot = by_marker_count.setdefault(n_det, [0, 0])
         if est is not None and est.ok:

@@ -163,7 +163,8 @@ class SolverIntegrationTests(unittest.TestCase):
     def test_search_time_budget_stops_between_solver_calls(self):
         tracker = MarkerPoseTracker(TEST_MARKER_COORDS)
         with patch.object(tracker, "_solve_and_score", return_value=PoseEstimate.failed()) as solve:
-            with patch("marker_pose.time.perf_counter", side_effect=[0., .013]):
+            # Ranking start/check, solver start, then elapsed solver budget.
+            with patch("marker_pose.time.perf_counter", side_effect=[0., 0., 0., .013]):
                 tracker.estimate(points(), K, observation_time=1.)
             self.assertEqual(solve.call_count, 1)
 

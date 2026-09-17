@@ -69,6 +69,9 @@ public class DepthSensorAPI : MonoBehaviour
     private int _droppedPoseCount;
     private SensorPoseHistory.LookupStatus _lastLookupStatus;
     private float _lastHistoryDiagLog;
+    private long _lastDeliveredCaptureTime;
+    private long _captureIntervalSum;
+    private int _deliveredFrames, _captureIntervals;
 
     private void OnEnable()
     {
@@ -95,6 +98,9 @@ public class DepthSensorAPI : MonoBehaviour
 
     private void ResetSensorPoseHistory()
     {
+        DepthFrameTcpServer.ActiveServer?.BeginCaptureEpoch();
+        _lastDeliveredCaptureTime = 0;
+        _captureIntervalSum = 0; _captureIntervals = 0; _deliveredFrames = 0;
         sensorPoseHistory.Clear();
         _lastLiveSampleFrame = -1;
         _lastLiveSampleXrTime = 0;
@@ -355,14 +361,23 @@ public class DepthSensorAPI : MonoBehaviour
             foreach (uint stream in configuredStreams) 
             {
 
+                double pollStart = Time.realtimeSinceStartupAsDouble;
                 if (pixelSensorFeature.GetSensorData(sensorId.Value, stream, out var frame, out var metaData,
                         Allocator.Temp, shouldFlipTexture: true))
                 {
+                    double frameReady = Time.realtimeSinceStartupAsDouble;
+                    if (frame.IsValid && frame.CaptureTime > _lastDeliveredCaptureTime)
+                    {
+                        _deliveredFrames++;
+                        if (_lastDeliveredCaptureTime > 0)
+                        { _captureIntervalSum += frame.CaptureTime - _lastDeliveredCaptureTime; _captureIntervals++; }
+                        _lastDeliveredCaptureTime = frame.CaptureTime;
+                    }
                     if (!frame.IsValid || !TryResolveCapturePose(frame.CaptureTime, out Pose sensorPose))
                         continue;
                     sensorPose = DepthSensorPoseUtil.ToWorldPose(sensorPose, xrOrigin);
 
-                    streamVisualizer.ProcessFrame(frame, metaData, sensorPose);
+                    streamVisualizer.ProcessFrame(frame, metaData, sensorPose, pollStart, frameReady);
                 }
             }
 
@@ -412,11 +427,15 @@ public class DepthSensorAPI : MonoBehaviour
     {
         if (Time.realtimeSinceStartup - _lastHistoryDiagLog <= 2f)
             return;
+        float elapsed = Time.realtimeSinceStartup - _lastHistoryDiagLog;
         _lastHistoryDiagLog = Time.realtimeSinceStartup;
         Debug.Log($"[ML2SensorPoseHistoryDiag] samples={sensorPoseHistory.SampleCount} " +
                   $"spanMs={sensorPoseHistory.SpanTicks / 1e6:F1} historyMisses={_historyMissCount} " +
                   $"historyUsed={_historyPoseCount} directUsed={_directPoseCount} dropped={_droppedPoseCount} " +
-                  $"lastLookup={_lastLookupStatus} liveUpdateOk={_liveUpdateOkCount} liveUpdateFail={_liveUpdateFailCount}");
+                  $"lastLookup={_lastLookupStatus} liveUpdateOk={_liveUpdateOkCount} liveUpdateFail={_liveUpdateFailCount} " +
+                  $"delivered_hz={_deliveredFrames / elapsed:F1} capture_period_ms=" +
+                  (_captureIntervals > 0 ? (_captureIntervalSum / 1e6 / _captureIntervals).ToString("F1") : "unavailable"));
+        _deliveredFrames = 0; _captureIntervalSum = 0; _captureIntervals = 0;
     }
 
     private void LateUpdate() => SampleLiveSensorPose();

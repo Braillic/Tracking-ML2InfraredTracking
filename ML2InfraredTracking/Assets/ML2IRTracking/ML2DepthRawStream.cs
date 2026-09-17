@@ -1,5 +1,8 @@
-﻿using UnityEngine;
+using UnityEngine;
 using System;
+using System.Runtime.InteropServices;
+using MagicLeap.OpenXR.Features;
+using UnityEngine.XR.OpenXR;
 using MagicLeap.OpenXR.Features.PixelSensors;
 public readonly struct DepthCameraIntrinsics
 {
@@ -43,6 +46,9 @@ public class ML2DepthRawStream : MonoBehaviour
     [Tooltip("Optional. Visualizes the same world_T_sensor packed into each depth TCP frame.")]
     [SerializeField] private DepthSensorPoseDebugger sensorPoseDebugger;
 
+    [SerializeField] private bool enablePreview = true;
+    [SerializeField, Min(0.01f)] private float previewIntervalSeconds = 0.1f;
+    private double _nextPreviewTime;
     Texture2D targetTexture, filteredTexture;
 
     private float[] _floatBuffer;                        // CPU-side float[] depth map (meters) 
@@ -157,9 +163,7 @@ public class ML2DepthRawStream : MonoBehaviour
             sensorPoseDebugger = GetComponent<DepthSensorPoseDebugger>();
         if (sensorPoseDebugger == null)
             sensorPoseDebugger = gameObject.AddComponent<DepthSensorPoseDebugger>();
-        markerDetector = GetComponent<MarkerDetector>();
-        if (markerDetector == null)
-        markerDetector = gameObject.AddComponent<MarkerDetector>(); // make object MarkerDetector if it doesn't exist
+
 
         // Assign the material 
         var mat = materialList.GetMaterialForFrameType(PixelSensorFrameType.DepthRaw);
@@ -200,7 +204,8 @@ public class ML2DepthRawStream : MonoBehaviour
     }
 
     // ----------------- Main per-frame processing -----------------
-    public void ProcessFrame(in PixelSensorFrame frame, in PixelSensorMetaData[] metaData, in Pose sensorPose)
+    public void ProcessFrame(in PixelSensorFrame frame, in PixelSensorMetaData[] metaData, in Pose sensorPose,
+        double pollStart = 0.0, double frameReady = 0.0)
     {
         if (!frame.IsValid || frame.Planes.Length == 0) return;
         if (frame.FrameType != PixelSensorFrameType.DepthRaw) return;
@@ -210,9 +215,15 @@ public class ML2DepthRawStream : MonoBehaviour
         int w = (int)firstPlane.Width;
         int h = (int)firstPlane.Height;
 
-        // Ensure preview texture and upload raw plane 
-        Utils.EnsureTargetTexture(ref targetTexture, frameType, w, h);
-        Utils.UploadMainTexture(frameType, ref firstPlane, targetTexture);
+        // Preview is independently throttled and performs no GPU upload without a renderer.
+        double now = Time.realtimeSinceStartupAsDouble;
+        if (enablePreview && targetRenderer != null && now >= _nextPreviewTime)
+        {
+            Utils.EnsureTargetTexture(ref targetTexture, frameType, w, h);
+            Utils.UploadMainTexture(frameType, ref firstPlane, targetTexture);
+            targetRenderer.material.mainTexture = targetTexture;
+            _nextPreviewTime = now + previewIntervalSeconds;
+        }
 
         switch (frameType)
         {
@@ -220,7 +231,11 @@ public class ML2DepthRawStream : MonoBehaviour
                 {
                     CaptureIntrinsicsOnce(metaData);
 
-                    // Build a CPU float[] depth map (meters) for the native pipeline
+                    // Avoid full-frame CPU preparation for disconnected/rate-limited transport.
+                    if (depthTcpServer == null || !depthTcpServer.CanSubmitFrame()) return;
+                    var timing = new CaptureTiming(frame.CaptureTime,
+                        CaptureClock.TryMapToUnity(frame.CaptureTime), pollStart, frameReady);
+                    // Copy before the SDK's temporary native frame storage expires.
                     var depthData = GetRawDepthData(in frame, ref _floatBuffer);
                     if (depthData == null) return;
 
@@ -230,12 +245,11 @@ public class ML2DepthRawStream : MonoBehaviour
                     //     $"[MarkerDetector] Found {detection.centers.Count} markers"
                     // );
 
-                    depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics);
+                    depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics, timing);
                     if (sensorPoseDebugger != null)
                         sensorPoseDebugger.SubmitFrameSynced(sensorPose, intrinsics, w, h);
 
-                    if (targetRenderer != null)
-                        targetRenderer.material.mainTexture = targetTexture;
+
 
                     //Matrix4x4 worldTsensor = Matrix4x4.TRS(sensorPose.position, sensorPose.rotation, Vector3.one);
                 }
@@ -248,5 +262,52 @@ public class ML2DepthRawStream : MonoBehaviour
 
     private void Update()
     {
+    }
+}
+
+
+public readonly struct CaptureTiming
+{
+    public readonly long XrNanoseconds;
+    public readonly double CaptureRealtime, PollStartRealtime, FrameReadyRealtime;
+    public CaptureTiming(long xrNanoseconds, double captureRealtime, double pollStart, double frameReady)
+    {
+        XrNanoseconds = xrNanoseconds; CaptureRealtime = captureRealtime;
+        PollStartRealtime = pollStart; FrameReadyRealtime = frameReady;
+    }
+}
+
+// Explicit XR -> CLOCK_MONOTONIC -> Unity clock mapping. Never subtract XR time
+// directly from Unity time or pair predicted display time with the current time.
+internal static class CaptureClock
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Timespec { public long Seconds, Nanoseconds; }
+    [DllImport("libc", EntryPoint = "clock_gettime")]
+    private static extern int ClockGetTime(int clockId, out Timespec time);
+
+    internal static double Map(long captureNs, long systemNowNs, double before, double after)
+    {
+        double age = (systemNowNs - captureNs) * 1e-9;
+        if (captureNs <= 0 || systemNowNs <= 0 || age < 0 || age > 10.0
+            || after < before || after - before > 0.002)
+            return double.NaN;
+        return (before + after) * 0.5 - age;
+    }
+
+    public static double TryMapToUnity(long xrTime)
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        var feature = OpenXRSettings.Instance?.GetFeature<MagicLeapFeature>();
+        if (feature == null || !feature.enabled ||
+            !OpenXRRuntime.IsExtensionEnabled("XR_KHR_convert_timespec_time")) return double.NaN;
+        long captureNs = feature.ConvertXrTimeToSystemTime(xrTime);
+        double before = Time.realtimeSinceStartupAsDouble;
+        if (ClockGetTime(1, out Timespec now) != 0) return double.NaN; // Android CLOCK_MONOTONIC
+        double after = Time.realtimeSinceStartupAsDouble;
+        return Map(captureNs, now.Seconds * 1000000000L + now.Nanoseconds, before, after);
+#else
+        return double.NaN;
+#endif
     }
 }

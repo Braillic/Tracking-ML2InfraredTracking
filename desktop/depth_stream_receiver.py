@@ -8,10 +8,12 @@ poses back to PoseEstimateTcpServer on the headset (--send-pose).
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import struct
-import time
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -36,10 +38,11 @@ from pose_packet import (
 )
 
 MAGIC = b"ML2D"
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 PIXEL_FORMAT_FLOAT32_RAW = 1
 PIXEL_FORMAT_UINT8_SRGB_INTENSITY = 2
 HEADER = struct.Struct("<4sHHIIIIQd3f4fI")
+TIMING_HEADER = struct.Struct("<Qqddd")  # session, capture XR ns, mapped capture, poll start, frame ready
 INTRINSICS = struct.Struct("<11d")
 MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
 WINDOW_TITLE = "Magic Leap 2 depth transport"
@@ -47,7 +50,7 @@ ANALYSIS_WINDOW_TITLE = "Analysis (f=fixed, p=percentile)"
 MARKER_MIN_AREA = 2
 # Absolute fallback; close-up blobs often exceed a few thousand pixels.
 MARKER_MAX_AREA = 2000
-# Prefer image-relative cap: ~8% of frame (â‰ˆ20k px on 544x480).
+# Prefer image-relative cap: ~8% of frame (≈20k px on 544x480).
 MARKER_MAX_AREA_FRAC = 0.10
 MARKER_MAX_ASPECT = 6.0
 MARKER_RING_RADIUS = 10
@@ -101,6 +104,15 @@ class DepthFrame:
     sensor_rotation: np.ndarray  # xyzw quaternion, Unity world coordinates
     intrinsics: CameraIntrinsics | None  # present once per TCP connection
     pixel_format: int = PIXEL_FORMAT_UINT8_SRGB_INTENSITY  # wire format
+    session_id: int = 0
+    capture_time_ns: int = 0
+    capture_realtime: float = float("nan")  # ML2 clock; NaN means conversion unavailable
+    poll_start_realtime: float = 0.0
+    frame_ready_realtime: float = 0.0
+
+    @property
+    def observation_time(self) -> float:
+        return self.capture_time_ns * 1e-9 if self.capture_time_ns > 0 else self.timestamp
 
 
 def receive_exact(connection: socket.socket, count: int) -> bytes:
@@ -123,8 +135,13 @@ def receive_frame(connection: socket.socket) -> DepthFrame:
 
     if magic != MAGIC:
         raise ValueError(f"Unexpected stream magic {magic!r}")
-    if version not in (3, PROTOCOL_VERSION) or header_size != HEADER.size:
+    expected_header = HEADER.size + TIMING_HEADER.size if version == 5 else HEADER.size
+    if version not in (3, 4, 5) or header_size != expected_header:
         raise ValueError(f"Unsupported protocol version/header: {version}/{header_size}")
+    timing = TIMING_HEADER.unpack(receive_exact(connection, TIMING_HEADER.size)) if version == 5 else None
+    if timing is not None and (timing[0] == 0 or timing[1] <= 0
+                               or not np.isfinite(timing[3:]).all() or timing[4] < timing[3]):
+        raise ValueError("Invalid frame identity/capture timing")
     if pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY:
         dtype = np.dtype(np.uint8)
     elif pixel_format == PIXEL_FORMAT_FLOAT32_RAW:
@@ -153,6 +170,8 @@ def receive_frame(connection: socket.socket) -> DepthFrame:
         sensor_rotation=np.array((qx, qy, qz, qw), dtype=np.float32),
         intrinsics=intrinsics,
         pixel_format=pixel_format,
+        **(dict(zip(("session_id", "capture_time_ns", "capture_realtime", "poll_start_realtime",
+                     "frame_ready_realtime"), timing)) if timing is not None else {}),
     )
 
 
@@ -171,6 +190,7 @@ class LatestFrameReceiver:
         self._error = None
         self._stopped = False
         self.dropped_frames = 0
+        self.received_frames = 0
         self._thread = threading.Thread(target=self._read, name="ML2 latest frame", daemon=True)
 
     def __enter__(self):
@@ -206,6 +226,7 @@ class LatestFrameReceiver:
                         return
                     if self._pending is not None:
                         self.dropped_frames += 1
+                    self.received_frames += 1
                     self._pending = (frame, received)
                     self._condition.notify_all()
         except (ConnectionError, OSError, ValueError) as error:
@@ -368,7 +389,7 @@ def detect_marker_centers(
     min_cluster_size: int = MARKER_MIN_CLUSTER_SIZE,
     max_geometry_ratio_error: float = MARKER_GEOMETRY_RATIO_ERROR,
     max_markers: int=MAX_DETECTED_MARKERS,
-) -> tuple[np.ndarray, float, list[tuple[int, int]]]:
+) -> tuple[np.ndarray, float, list[tuple[float, float]]]:
     """Threshold a colourised frame and locate bright marker blobs."""
     thresholded, cutoff = apply_threshold(
         colourised,
@@ -404,16 +425,20 @@ def detect_marker_centers(
         if area < min_blob_area or area > max_blob_area or aspect > max_aspect:
             continue
 
-        ys, xs = np.where(labels == label)
+        # Restrict each blob scan to its bounding box rather than repeatedly
+        # scanning the full image for every connected component.
+        left, top = int(stats[label, cv2.CC_STAT_LEFT]), int(stats[label, cv2.CC_STAT_TOP])
+        ys, xs = np.where(labels[top:top + height, left:left + width] == label)
+        ys, xs = ys + top, xs + left
         weights = intensity[ys, xs]
-        if weights.size == 0:
+        if weights.size == 0 or float(weights.sum()) <= 0:
             continue
 
         weight_sum = float(weights.sum())
         cx = float((xs * weights).sum() / weight_sum)
         cy = float((ys * weights).sum() / weight_sum)
         mean_intensity = float(weights.mean())
-        candidates.append((mean_intensity, (int(round(cx)), int(round(cy)))))
+        candidates.append((mean_intensity, (cx, cy)))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     centers = [center for _, center in candidates[:max_markers]]
@@ -430,7 +455,7 @@ def detect_marker_centers(
     return thresholded, cutoff, centers
 
 
-def annotate_markers(image: np.ndarray, centers: list[tuple[int, int]]) -> np.ndarray:
+def annotate_markers(image: np.ndarray, centers: list[tuple[float, float]]) -> np.ndarray:
     """Draw a ring and index around each detected marker."""
     overlay = image.copy()
     for index, (x, y) in enumerate(centers):
@@ -456,7 +481,7 @@ def _cv_point(x: object, y: object) -> tuple[int, int] | None:
         return None
     if not (np.isfinite(xf) and np.isfinite(yf)):
         return None
-    # Bad / unstable PnP (e.g. a marker occluded) can project to Â±1e20; OpenCV 5 then
+    # Bad / unstable PnP (e.g. a marker occluded) can project to ±1e20; OpenCV 5 then
     # rejects the point with "Can't parse 'position'" because it must fit int32.
     try:
         xi = int(round(xf))
@@ -469,14 +494,14 @@ def _cv_point(x: object, y: object) -> tuple[int, int] | None:
 
 
 def flip_ud_points(
-    points: list[tuple[int, int]] | np.ndarray | None,
+    points: list[tuple[float, float]] | np.ndarray | None,
     image_height: int,
-) -> list[tuple[int, int]] | np.ndarray | None:
-    """Map stream-buffer coordinates â†’ upright display coordinates (vertical flip)."""
+) -> list[tuple[float, float]] | np.ndarray | None:
+    """Map stream-buffer coordinates → upright display coordinates (vertical flip)."""
     if points is None:
         return None
     if isinstance(points, list):
-        out: list[tuple[int, int]] = []
+        out: list[tuple[float, float]] = []
         for x, y in points:
             p = _cv_point(x, y)
             if p is None:
@@ -492,11 +517,11 @@ def flip_ud_points(
 
 def prepare_display_view(
     image: np.ndarray,
-    centers: list[tuple[int, int]],
+    centers: list[tuple[float, float]],
     projected: np.ndarray | None,
     *,
     unflip: bool,
-) -> tuple[np.ndarray, list[tuple[int, int]], np.ndarray | None]:
+) -> tuple[np.ndarray, list[tuple[float, float]], np.ndarray | None]:
     """Optionally un-flip the streamed image + overlays for upright PC viewing."""
     if not unflip:
         return image, centers, projected
@@ -549,7 +574,7 @@ def project_model_points(
 
 def draw_pose_overlay(
     image: np.ndarray,
-    centers: list[tuple[int, int]],
+    centers: list[tuple[float, float]],
     estimate: PoseEstimate,
     projected: np.ndarray | None,
     *,
@@ -627,7 +652,7 @@ def render_analysis(
     max_cluster_span_px: float | None = None,
     min_cluster_size: int = MARKER_MIN_CLUSTER_SIZE,
     max_geometry_ratio_error: float = MARKER_GEOMETRY_RATIO_ERROR,
-) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]]]:
+) -> tuple[np.ndarray, np.ndarray, list[tuple[float, float]]]:
     """Build the Analysis window from an already-colourised frame."""
     analysis, cutoff, centers = detect_marker_centers(
         colourised,
@@ -643,7 +668,7 @@ def render_analysis(
         min_cluster_size=min_cluster_size,
         max_geometry_ratio_error=max_geometry_ratio_error,
     )
-    # Do not draw marker rings or HUD here â€” caller unflips for display first,
+    # Do not draw marker rings or HUD here — caller unflips for display first,
     # then draw_pose_overlay / draw_analysis_hud own graphics and text.
     view = analysis.copy()
     if view.ndim == 2:
@@ -720,7 +745,7 @@ def _new_recording_dir(base_dir: Path) -> Path:
 
 def estimate_and_send_pose(
     tracker: MarkerPoseTracker,
-    centers: list[tuple[int, int]],
+    centers: list[tuple[float, float]],
     frame: DepthFrame,
     intrinsics: CameraIntrinsics | None,
     pose_connection: socket.socket | None,
@@ -764,7 +789,7 @@ def estimate_and_send_pose(
         centers,
         camera_matrix,
         intrinsics.distortion_coefficients if intrinsics is not None else None,
-        observation_time=frame.timestamp,
+        observation_time=frame.observation_time,
         camera_world_transform=camera_world,
     )
     pnp_ms = (time.perf_counter() - pnp_start) * 1000.0
@@ -772,9 +797,11 @@ def estimate_and_send_pose(
     if pose_connection is None:
         return estimate, camera_matrix
 
-    # Only send accepted poses. Rejected spam adds latency and the headset
-    # already keeps the last applied transform.
+    # Explicit rejected observations let ML2 count failures. The bounded hold
+    # policy still uses the last accepted source time (one miss does not flicker).
     if not (estimate.ok and estimate.rvec is not None and estimate.tvec is not None):
+        if recv_done <= 0 or time.perf_counter() - recv_done <= max_processing_age_s:
+            send_pose(pose_connection, PosePacket.rejected(frame.frame_id, frame.session_id))
         return estimate, camera_matrix
 
     prep_start = time.perf_counter()
@@ -787,7 +814,7 @@ def estimate_and_send_pose(
         convert_object_axes=convert_object_axes,
     )
     # prep_ms covers world-space transform + struct packing, up to (but not
-    # including) the sendall syscall â€” a packet can't carry its own send
+    # including) the sendall syscall — a packet can't carry its own send
     # duration, so that part is measured separately below and only printed
     # locally; it's negligible for a 64-byte write with TCP_NODELAY.
     send_ready_time = time.perf_counter()
@@ -796,6 +823,7 @@ def estimate_and_send_pose(
         return PoseEstimate.failed(), camera_matrix
     packet = PosePacket(
         frame_id=frame.frame_id,
+        session_id=frame.session_id,
         ok=True,
         confidence=float(estimate.confidence),
         position=position,
@@ -860,15 +888,32 @@ def run(args: argparse.Namespace) -> None:
                     )
                     tracker.reset()
 
-                show_waiting_window(args.host, args.port)
+                if not args.headless:
+                    show_waiting_window(args.host, args.port)
                 last_pixel_format = None
+                last_session_id = None
+                processed = accepted = stale_before = 0
+                pc_work_ms = deque(maxlen=256)
+                next_diagnostics = time.perf_counter() + args.diagnostics_interval
                 intrinsics = None
 
                 with LatestFrameReceiver(connection) as receiver:
                     while True:
                         frame, recv_done = receiver.take()
+                        if args.diagnostics_interval > 0 and time.perf_counter() >= next_diagnostics:
+                            percentiles = (np.percentile(pc_work_ms, [50, 95, 99]).round(2).tolist()
+                                           if pc_work_ms else [])
+                            print(f"[PCTracking] session={frame.session_id} received={receiver.received_frames} "
+                                  f"overwritten={receiver.dropped_frames} processed={processed} accepted={accepted} "
+                                  f"failed_or_expired={processed - accepted} stale_before={stale_before} "
+                                  f"pc_work_ms_p50_p95_p99={percentiles} state={tracker.state}", flush=True)
+                            next_diagnostics = time.perf_counter() + args.diagnostics_interval
                         if time.perf_counter() - recv_done > args.max_processing_age:
+                            stale_before += 1
                             continue
+                        if frame.session_id != last_session_id:
+                            tracker.reset()
+                            last_session_id = frame.session_id
                         detection_start = time.perf_counter()
                         if frame.pixel_format != last_pixel_format:
                             pipeline = ("1: FLOAT32 -> colourise_depth() on PC"
@@ -885,14 +930,19 @@ def run(args: argparse.Namespace) -> None:
                             print("OpenCV distortion coefficients:",
                                   intrinsics.distortion_coefficients, flush=True)
 
-                        display = prepare_detection_image(frame, args)
+                        display = (frame.pixels if args.headless and frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY
+                                   else prepare_detection_image(frame, args))
                         # Keep mapped intensity recordings/HUD for both transport modes.
                         intensity = (frame.pixels if frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY
                                      else display.max(axis=2))
-                        analysis_view, analysis, centers, cutoff = render_analysis(
-                            display, threshold_method, fixed_threshold, top_p,
-                            **_geometry_filter_kwargs(args),
-                        )
+                        if args.headless:
+                            analysis, cutoff, centers = detect_marker_centers(
+                                display, threshold_method, fixed_threshold, top_p,
+                                **_geometry_filter_kwargs(args))
+                        else:
+                            analysis_view, analysis, centers, cutoff = render_analysis(
+                                display, threshold_method, fixed_threshold, top_p,
+                                **_geometry_filter_kwargs(args))
                         detect_ms = (time.perf_counter() - detection_start) * 1000.0
 
                         estimate, pose_K = estimate_and_send_pose(
@@ -908,6 +958,11 @@ def run(args: argparse.Namespace) -> None:
                             clock_offset=clock_offset,
                             max_processing_age_s=args.max_processing_age,
                         )
+                        processed += 1
+                        accepted += int(estimate.ok)
+                        pc_work_ms.append((time.perf_counter() - detection_start) * 1000.0)
+                        if args.headless:
+                            continue
                         projected = None
                         if pose_K is not None:
                             projected = project_model_points(
@@ -1058,7 +1113,16 @@ def run(args: argparse.Namespace) -> None:
                             cv2.imwrite(str(recording_dir / "display" / f"display_{stem}.png"), annotated_display)
                             np.save(recording_dir / "display" / f"display_{stem}.npy", annotated_display)
                             # cv2.imwrite(str(recording_dir / "analysis" / f"analysis_{stem}.png"), analysis)
-                            np.save(recording_dir / "centers" / f"centers_{stem}.npy", np.array(centers, dtype=np.int32))
+                            np.save(recording_dir / "centers" / f"centers_{stem}.npy", np.array(centers, dtype=np.float64))
+                            # Keep exact capture time and camera extrinsics for motion-correct replay.
+                            metadata = dict(session_id=frame.session_id, capture_time_ns=frame.capture_time_ns,
+                                            observation_time=frame.observation_time,
+                                            pnp_camera_matrix=pose_K.tolist() if pose_K is not None else None,
+                                            sensor_position=frame.sensor_position.tolist(),
+                                            sensor_rotation=frame.sensor_rotation.tolist(),
+                                            depth_vertically_flipped=args.depth_vertically_flipped,
+                                            convert_object_axes=args.convert_object_axes)
+                            (recording_dir / "centers" / f"centers_{stem}.json").write_text(json.dumps(metadata))
                             recording_index += 1
 
         except (ConnectionError, OSError, ValueError) as error:
@@ -1080,9 +1144,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1",
                         help="ML Wi-Fi IP, or 127.0.0.1 when using adb forward")
     parser.add_argument("--port", type=int, default=50777,
-                        help="DepthFrameTcpServer port (ML â†’ PC)")
+                        help="DepthFrameTcpServer port (ML → PC)")
     parser.add_argument("--pose-port", type=int, default=DEFAULT_POSE_PORT,
-                        help="PoseEstimateTcpServer port (PC â†’ ML)")
+                        help="PoseEstimateTcpServer port (PC → ML)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run detection and tracking without preview, overlays, or interactive recording")
+    parser.add_argument("--diagnostics-interval", type=float, default=2.0,
+                        help="Seconds between PC timing/drop summaries; 0 disables these diagnostics")
     parser.add_argument("--send-pose", action="store_true",
                         help="Estimate pose live and stream ML2P packets to the headset")
     parser.add_argument(
@@ -1090,7 +1158,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="ML streams flipped depth (shouldFlipTexture=true): adjust cy for PnP and "
-             "skip the OpenCVâ†’Unity Y-flip (default: on). Required for correct motion direction.",
+             "skip the OpenCV→Unity Y-flip (default: on). Required for correct motion direction.",
     )
     parser.add_argument(
         "--display-unflip",
@@ -1191,6 +1259,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-reconnect", action="store_false", dest="reconnect")
     parser.set_defaults(reconnect=True)
     args = parser.parse_args()
+    if not np.isfinite(args.diagnostics_interval) or args.diagnostics_interval < 0:
+        parser.error("--diagnostics-interval must be nonnegative and finite")
+    if not args.depth_vertically_flipped and not args.convert_object_axes:
+        parser.error("--no-depth-vertically-flipped requires --convert-object-axes; otherwise the result is a reflection")
     for name in ("tracking_lost_timeout", "acquisition_timeout", "max_processing_age"):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive and finite")

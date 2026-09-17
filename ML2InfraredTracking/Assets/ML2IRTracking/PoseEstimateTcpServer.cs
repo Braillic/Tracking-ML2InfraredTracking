@@ -9,9 +9,9 @@ using UnityEngine;
 /// Listens for desktop pose packets (PC → Magic Leap) and applies the newest
 /// valid estimate to a tool transform. Companion to <see cref="DepthFrameTcpServer"/>
 /// (ML → PC depth); uses a separate port so depth send stays write-only.
-/// Wire format (little-endian, fixed 80 bytes):
+/// Base wire format (little-endian, 80 bytes); v4 appends uint64 session ID (88 total):
 ///   magic "ML2P"
-///   ushort version (=3), ushort packet_size (=80)
+///   ushort version (=3 or 4), ushort packet_size (=80 or 88)
 ///   ulong  frame_id   (matches depth header frame number)
 ///   uint   ok         (0 = reject, nonzero = apply)
 ///   float  confidence
@@ -105,6 +105,17 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private ulong _lastAppliedFrameId;
     private bool _hasAppliedFrame;
     private long _stalePoseCount;
+    private long _rejectedPoseCount, _wrongSessionCount;
+    private double _nextTimingSummary;
+    private ulong _timingSessionId;
+    private double _lastApplyRealtime, _lastCaptureRealtime = double.NaN;
+    private bool _awaitingBeforeRender;
+    private readonly TimingWindow _submitToApply = new TimingWindow();
+    private readonly TimingWindow _captureToApply = new TimingWindow();
+    private readonly TimingWindow _captureToSubmit = new TimingWindow();
+    private readonly TimingWindow _pollDuration = new TimingWindow();
+    private readonly TimingWindow _readyToSubmit = new TimingWindow();
+    private readonly TimingWindow _applyToBeforeRender = new TimingWindow();
     private long _receivedCount;
     private long _appliedCount;
     private double _nextStatusUpdate;
@@ -125,6 +136,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         }
 
         ActiveServer = this;
+        Application.onBeforeRender += MeasureBeforeRender;
         if (startAutomatically)
             StartServer();
     }
@@ -142,8 +154,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             _updateTickCounter = 0;
             _lastFpsSampleTime = nowUnscaled;
         }
-        TryApplyPendingPose();
-        HideTrackedToolIfTimedOut();
+        LogTimingSummary();
 
         if (Time.unscaledTimeAsDouble >= _nextStatusUpdate)
         {
@@ -162,6 +173,12 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             statusText.text = _status;
     }
 
+    private void LateUpdate()
+    {
+        TryApplyPendingPose();
+        HideTrackedToolIfTimedOut();
+    }
+
     private void OnGUI()
     {
         if (!showOnGuiOverlay)
@@ -172,6 +189,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
     private void OnDisable()
     {
+        Application.onBeforeRender -= MeasureBeforeRender;
         StopServer();
         if (ActiveServer == this)
             ActiveServer = null;
@@ -203,6 +221,16 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             Name = "ML2 Pose TCP Server"
         };
         _serverThread.Start();
+    }
+
+    // Called on the main thread when the sensor/XR tracking origin changes.
+    public void InvalidateTrackingSession()
+    {
+        lock (_poseLock) _hasPending = false;
+        _lastAcceptedPoseTime = double.NegativeInfinity;
+        _lastCaptureRealtime = double.NaN;
+        _awaitingBeforeRender = false;
+        if (trackedTool != null) trackedTool.gameObject.SetActive(false);
     }
 
     public void StopServer()
@@ -354,6 +382,22 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     {
         if (!logLatency)
             return;
+        _lastApplyRealtime = Time.realtimeSinceStartupAsDouble;
+        _awaitingBeforeRender = true;
+        var source = DepthFrameTcpServer.ActiveServer;
+        if (source != null && source.TryGetFrameTiming(frameId, out double submitted, out _, out _, out _))
+        {
+            _submitToApply.Add((_lastApplyRealtime - submitted) * 1000.0);
+            _lastCaptureRealtime = double.NaN;
+            if (source.TryGetCaptureTiming(frameId, out CaptureTiming timing))
+            {
+                _lastCaptureRealtime = timing.CaptureRealtime;
+                _captureToApply.Add((_lastApplyRealtime - timing.CaptureRealtime) * 1000.0);
+                _captureToSubmit.Add((submitted - timing.CaptureRealtime) * 1000.0);
+                _pollDuration.Add((timing.FrameReadyRealtime - timing.PollStartRealtime) * 1000.0);
+                _readyToSubmit.Add((submitted - timing.FrameReadyRealtime) * 1000.0);
+            }
+        }
 
         _latencyLogCounter++;
         if (_latencyLogCounter % latencyLogEveryN != 0)
@@ -372,10 +416,10 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             return;
         }
 
-        double e2eMs = (now - submit) * 1000.0;
+        double submitToApplyMs = (now - submit) * 1000.0;
         if (!hasSend)
         {
-            Debug.Log($"[ML2LAT] frame={frameId} e2e={e2eMs:F1}ms apply_wait={applyWaitMs:F1}ms " +
+            Debug.Log($"[ML2LAT] frame={frameId} submit_to_apply={submitToApplyMs:F1}ms apply_wait={applyWaitMs:F1}ms " +
                       "(send time missing)");
             return;
         }
@@ -384,14 +428,48 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         double leg1Ms = (pcRecvMl2 - sendDone) * 1000.0; // network: ML2 -> PC
         double leg2Ms = (receivedRealtime - pcSendMl2) * 1000.0; // network: PC -> ML2
         double measuredMs = queueMs + leg1Ms + detectMs + pnpMs + sendMs + leg2Ms + applyWaitMs;
-        double unaccountedMs = e2eMs - measuredMs; // clock-sync/measurement slack; large values mean the symmetric-latency assumption is off
+        double unaccountedMs = submitToApplyMs - measuredMs; // PC queue/omitted work; a constant clock offset cancels between leg1 and leg2
         Debug.Log(
             $"[ML2LAT] frame={frameId} pipeline={DepthFrameTcpServer.PipelineLabel(framePipeline)} " +
-            $"e2e={e2eMs:F1}ms " +
-            $"(ml_prepare+queue+tcp_write={queueMs:F1}ms | leg1_net(ML2->PC)={leg1Ms:F1}ms | " +
+            $"submit_to_apply={submitToApplyMs:F1}ms " +
+            $"(ml_prepare+queue+tcp_write={queueMs:F1}ms | leg1_estimate(ML2->PC)={leg1Ms:F1}ms | " +
             $"detect={detectMs:F1}ms | pnp={pnpMs:F1}ms | pack={sendMs:F1}ms | " +
-            $"leg2_net(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
+            $"leg2_estimate(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
             $"unaccounted={unaccountedMs:F1}ms | update_fps={_measuredUpdateFps:F1})");
+    }
+
+    private void MeasureBeforeRender()
+    {
+        if (!logLatency || !_awaitingBeforeRender) return;
+        _applyToBeforeRender.Add((Time.realtimeSinceStartupAsDouble - _lastApplyRealtime) * 1000.0);
+        _awaitingBeforeRender = false;
+    }
+
+    private void LogTimingSummary()
+    {
+        double now = Time.realtimeSinceStartupAsDouble;
+        if (!logLatency || now < _nextTimingSummary) return;
+        _nextTimingSummary = now + 2.0;
+        var depth = DepthFrameTcpServer.ActiveServer;
+        if (depth != null && _timingSessionId != depth.SessionId)
+        {
+            _timingSessionId = depth.SessionId;
+            _submitToApply.Clear(); _captureToApply.Clear(); _captureToSubmit.Clear();
+            _pollDuration.Clear(); _readyToSubmit.Clear(); _applyToBeforeRender.Clear();
+        }
+        string displayedAge = trackedTool != null && trackedTool.gameObject.activeSelf
+            ? ((now - _lastAcceptedPoseTime) * 1000.0).ToString("F1") : "hidden";
+        Debug.Log($"[ML2Timing] session={depth?.SessionId} recv={Interlocked.Read(ref _receivedCount)} " +
+            $"applied={Interlocked.Read(ref _appliedCount)} rejected={Interlocked.Read(ref _rejectedPoseCount)} " +
+            $"stale={_stalePoseCount} wrong_session={Interlocked.Read(ref _wrongSessionCount)} " +
+            $"sender_overwritten={depth?.OverwrittenFrames} rate_dropped={depth?.RateDroppedFrames} " +
+            $"displayed_submit_age_ms={displayedAge} displayed_capture_age_ms=" +
+            (displayedAge == "hidden" ? "hidden" : double.IsNaN(_lastCaptureRealtime)
+                ? "unavailable" : ((now - _lastCaptureRealtime) * 1000.0).ToString("F1")) + " " +
+            $"submit_to_apply={_submitToApply.Summary()} capture_to_apply={_captureToApply.Summary()} " +
+            $"capture_to_submit={_captureToSubmit.Summary()} sdk_poll={_pollDuration.Summary()} " +
+            $"ready_to_submit={_readyToSubmit.Summary()} apply_to_before_render={_applyToBeforeRender.Summary()} " +
+            "presentation=unmeasured (rolling last 256 accepted samples, ms p50/p95/p99)");
     }
 
     private void HideTrackedToolIfTimedOut()
@@ -550,8 +628,19 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
                 throw new InvalidDataException("Invalid ML2P pose packet");
             }
 
+            ulong sessionId = 0;
+            if (BitConverter.ToUInt16(packet, 4) == 4)
+            {
+                byte[] sessionBytes = new byte[8];
+                if (!ReadExact(stream, sessionBytes, 8)) return;
+                sessionId = BitConverter.ToUInt64(sessionBytes, 0);
+            }
+            var depth = DepthFrameTcpServer.ActiveServer;
+            if (depth == null || sessionId == 0 || sessionId != depth.SessionId)
+            { Interlocked.Increment(ref _wrongSessionCount); continue; }
             Interlocked.Increment(ref _receivedCount);
-            DepthFrameTcpServer.ActiveServer?.RecordPoseReceived(frameId);
+            if (!ok) Interlocked.Increment(ref _rejectedPoseCount);
+            depth.RecordPoseReceived(frameId);
             SubmitPose(frameId, ok, confidence, position, rotation, detectMs, pnpMs, sendMs,
                 pcRecvMl2, pcSendMl2);
         }
@@ -620,7 +709,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
         ushort version = reader.ReadUInt16();
         ushort size = reader.ReadUInt16();
-        if (version != ProtocolVersion || size != PacketSize)
+        if (!((version == 3 && size == PacketSize) || (version == 4 && size == PacketSize + 8)))
             return false;
 
         frameId = reader.ReadUInt64();
@@ -663,4 +752,27 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
         return true;
     }
+}
+
+
+// Bounded storage; no allocations until the throttled summary is formatted.
+internal sealed class TimingWindow
+{
+    private readonly double[] values = new double[256];
+    private int count, next;
+    public void Clear() { count = 0; next = 0; }
+    public void Add(double milliseconds)
+    {
+        if (double.IsNaN(milliseconds) || double.IsInfinity(milliseconds) || milliseconds < 0) return;
+        values[next] = milliseconds; next = (next + 1) % values.Length;
+        count = Math.Min(count + 1, values.Length);
+    }
+    internal double Percentile(double fraction)
+    {
+        if (count == 0) return double.NaN;
+        var sorted = new double[count]; Array.Copy(values, sorted, count); Array.Sort(sorted);
+        return sorted[Math.Max(0, Math.Min(count - 1, (int)Math.Ceiling(fraction * count) - 1))];
+    }
+    public string Summary() => count == 0 ? "unavailable(n=0)" :
+        $"{Percentile(.50):F1}/{Percentile(.95):F1}/{Percentile(.99):F1}(n={count})";
 }

@@ -24,8 +24,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         Ml2UInt8 = 2,
     }
 
-    public const int ProtocolVersion = 4;
-    public const int HeaderSize = 72;
+    public const int ProtocolVersion = 5;
+    public const int HeaderSize = 112;
     public const uint PixelFormatFloat32Raw = 1;
     public const uint PixelFormatUInt8SrgbIntensity = 2;
     public static DepthFrameTcpServer ActiveServer { get; private set; }
@@ -58,8 +58,16 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     [SerializeField] private bool showOnGuiOverlay = true;
 
     private readonly object _frameLock = new object();
-    private byte[] _pendingPayload;
-    private byte[] _sparePayload;
+    private float[] _pendingRaw;
+    private float[] _spareRaw;
+    private CaptureTiming _pendingTiming;
+    private ulong _pendingSessionId;
+    private float _pendingRawMin, _pendingRawMax;
+    private bool _pendingSrgb;
+    private long _overwrittenFrames, _rateDroppedFrames;
+    public ulong SessionId { get; private set; }
+    public long OverwrittenFrames => Interlocked.Read(ref _overwrittenFrames);
+    public long RateDroppedFrames => Interlocked.Read(ref _rateDroppedFrames);
     private int _pendingWidth;
     private int _pendingHeight;
     private ulong _pendingFrameNumber;
@@ -77,6 +85,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private volatile string _remoteEndpoint;
     private volatile string _status = "Depth stream stopped";
     private string _sensorInfo;
+    private Pose _statusPose;
+    private DepthCameraIntrinsics? _statusIntrinsics;
     private long _submittedFrameCount;
     private long _sentFrameCount;
     private int _lastWidth;
@@ -85,7 +95,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private double _nextSubmitTime;
     private double _nextStatusUpdate;
 
-    // Ring of recent submit/send times for E2E latency (PoseEstimateTcpServer looks these up).
+    // Ring of capture/submit/send times for software latency (not physical presentation).
     // Storage only — no Debug.Log on the TCP send thread.
     private const int LatencyRingSize = 128;
     private readonly object _latencyLock = new object();
@@ -93,10 +103,12 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private readonly double[] _latencySubmitRealtime = new double[LatencyRingSize];
     private readonly double[] _latencySendDoneRealtime = new double[LatencyRingSize];
     private readonly bool[] _latencyHasSend = new bool[LatencyRingSize];
+    private readonly CaptureTiming[] _captureTimings = new CaptureTiming[LatencyRingSize];
     private readonly PipelineMode[] _latencyPipelines = new PipelineMode[LatencyRingSize];
     private int _latencyWriteIndex;
     private volatile float _lastQueueWaitMs;
     private volatile float _lastWriteMs;
+    private volatile float _lastConversionMs;
 
     // Round-trip (depth-sent -> pose-received) latency accumulator; consumed/reset by
     // ConsumeLatencyStats. frameNumber -> Stopwatch.GetTimestamp() at send-done.
@@ -155,12 +167,28 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         return false;
     }
 
-    private void RecordLatencySubmit(ulong frameId, double submitRealtime, PipelineMode framePipeline)
+    public bool TryGetCaptureTiming(ulong frameId, out CaptureTiming timing)
+    {
+        lock (_latencyLock)
+        {
+            for (int n = 0; n < LatencyRingSize; n++)
+            {
+                int i = (_latencyWriteIndex - 1 - n + LatencyRingSize) % LatencyRingSize;
+                if (_latencyFrameIds[i] == frameId && _latencySubmitRealtime[i] > 0)
+                { timing = _captureTimings[i]; return true; }
+            }
+        }
+        timing = default; return false;
+    }
+
+    private void RecordLatencySubmit(ulong frameId, double submitRealtime, PipelineMode framePipeline,
+        CaptureTiming timing)
     {
         lock (_latencyLock)
         {
             int i = _latencyWriteIndex;
             _latencyFrameIds[i] = frameId;
+            _captureTimings[i] = timing;
             _latencySubmitRealtime[i] = submitRealtime;
             _latencySendDoneRealtime[i] = 0.0;
             _latencyHasSend[i] = false;
@@ -206,13 +234,14 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         if (_clientConnected && Time.unscaledTimeAsDouble >= _nextStatusUpdate)
         {
             _nextStatusUpdate = Time.unscaledTimeAsDouble + 0.25;
+            _sensorInfo = BuildSensorInfo(_statusPose, _statusIntrinsics);
             long submitted = Interlocked.Read(ref _submittedFrameCount);
             long sent = Interlocked.Read(ref _sentFrameCount);
             _status = submitted == 0
                 ? $"PC connected: {_remoteEndpoint}\nWaiting for first DepthRaw frame..."
                 : $"PC connected: {_remoteEndpoint}\nPipeline {PipelineLabel(_lastSubmittedPipeline)} " +
                 $"{_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}" +
-                $"\nqueue={_lastQueueWaitMs:F1}ms write={_lastWriteMs:F1}ms";
+                $"\nqueue={_lastQueueWaitMs:F1}ms conversion={_lastConversionMs:F1}ms write={_lastWriteMs:F1}ms";
         }
 
         long pendingLatencySamples = Interlocked.Read(ref _latencyCount);
@@ -220,7 +249,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         {
             var (avgMs, maxMs, count) = ConsumeLatencyStats();
             if (count > 0)
-                Debug.Log($"[ML2Latency] last {count} poses: avg {avgMs:F1} ms, max {maxMs:F1} ms");
+                Debug.Log($"[ML2Latency] send_done_to_pose_received last {count}: avg {avgMs:F1} ms, max {maxMs:F1} ms");
         }
 
         if (statusText != null)
@@ -256,6 +285,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         if (_running)
             return;
 
+        BeginCaptureEpoch();
+        _nextSubmitTime = 0;
         _running = true;
         _clientConnected = false;
         Interlocked.Exchange(ref _submittedFrameCount, 0);
@@ -267,6 +298,17 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             Name = "ML2 Depth TCP Server"
         };
         _serverThread.Start();
+    }
+
+    public void BeginCaptureEpoch()
+    {
+        lock (_frameLock)
+        {
+            SessionId = BitConverter.ToUInt64(Guid.NewGuid().ToByteArray(), 0) | 1UL;
+            _pendingRaw = null;
+            lock (_latencyLock) Array.Clear(_latencySubmitRealtime, 0, LatencyRingSize);
+        }
+        PoseEstimateTcpServer.ActiveServer?.InvalidateTrackingSession();
     }
 
     public void StopServer()
@@ -321,10 +363,18 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
 
     /// Called on Unity's main thread. The input array may be reused immediately after this returns.
     /// Only the newest unsent frame is retained.
-    public void SubmitFrame(float[] depthMetres, int width, int height, in Pose sensorPose,
-        DepthCameraIntrinsics? intrinsics)
+    public bool CanSubmitFrame()
     {
-        if (!_running || depthMetres == null || width <= 0 || height <= 0)
+        if (!_running || !_clientConnected) return false;
+        if (maximumFramesPerSecond > 0 && Time.realtimeSinceStartupAsDouble < _nextSubmitTime)
+        { Interlocked.Increment(ref _rateDroppedFrames); return false; }
+        return true;
+    }
+
+    public void SubmitFrame(float[] depthMetres, int width, int height, in Pose sensorPose,
+        DepthCameraIntrinsics? intrinsics, CaptureTiming timing)
+    {
+        if (!CanSubmitFrame() || depthMetres == null || width <= 0 || height <= 0)
             return;
 
         PipelineMode framePipeline = pipelineMode;
@@ -353,25 +403,24 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         if (maximumFramesPerSecond > 0f)
             _nextSubmitTime = now + 1.0 / maximumFramesPerSecond;
 
+        float[] raw;
         lock (_frameLock)
         {
-            if (_pendingPayload == null || _pendingPayload.Length != byteCount)
-            {
-                if (_sparePayload != null && _sparePayload.Length == byteCount)
-                {
-                    _pendingPayload = _sparePayload;
-                    _sparePayload = null;
-                }
-                else
-                {
-                    _pendingPayload = new byte[byteCount];
-                }
-            }
-
-            if (framePipeline == PipelineMode.LegacyFloat32)
-                Buffer.BlockCopy(depthMetres, 0, _pendingPayload, 0, byteCount);
-            else
-                ConvertRawToUInt8Srgb(depthMetres, _pendingPayload, elementCount);
+            // Take ownership, then release the lock BEFORE the frame copy.
+            raw = _pendingRaw ?? _spareRaw;
+            if (_pendingRaw != null) Interlocked.Increment(ref _overwrittenFrames);
+            if (raw == _spareRaw) _spareRaw = null;
+            _pendingRaw = null;
+        }
+        if (raw == null || raw.Length != elementCount) raw = new float[elementCount];
+        Array.Copy(depthMetres, raw, elementCount);
+        lock (_frameLock)
+        {
+            if (!_running || !_clientConnected) { _spareRaw = raw; return; }
+            _pendingRaw = raw;
+            _pendingTiming = timing;
+            _pendingSessionId = SessionId;
+            _pendingRawMin = rawMin; _pendingRawMax = rawMax; _pendingSrgb = convertLinearToSrgb;
             _pendingWidth = width;
             _pendingHeight = height;
             _pendingFrameNumber = _nextFrameNumber++;
@@ -381,8 +430,9 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             _pendingIntrinsics = intrinsics;
             _lastWidth = width;
             _lastHeight = height;
-            _sensorInfo = BuildSensorInfo(sensorPose, intrinsics);
-            RecordLatencySubmit(_pendingFrameNumber, now, framePipeline);
+            // Format sensor diagnostics only at the status refresh cadence.
+            _statusPose = sensorPose; _statusIntrinsics = intrinsics;
+            RecordLatencySubmit(_pendingFrameNumber, now, framePipeline, timing);
             long submitted = Interlocked.Increment(ref _submittedFrameCount);
             if (submitted == 1 || framePipeline != _lastSubmittedPipeline)
                 Debug.Log($"[ML2DepthTCP] Pipeline {PipelineLabel(framePipeline)}: " +
@@ -392,7 +442,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         }
     }
 
-    private void ConvertRawToUInt8Srgb(float[] source, byte[] destination, int count)
+    internal static void ConvertRawToUInt8Srgb(float[] source, byte[] destination, int count,
+        float rawMin, float rawMax, bool convertLinearToSrgb)
     {
         float denominator = Mathf.Max(rawMax - rawMin, 1e-6f);
         for (int i = 0; i < count; i++)
@@ -479,10 +530,15 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         using NetworkStream stream = client.GetStream();
         byte[] header = new byte[HeaderSize];
         bool intrinsicsSent = false;
+        byte[] payload = null;
 
         while (_running && client.Connected)
         {
-            byte[] payload;
+            float[] raw;
+            float frameRawMin, frameRawMax;
+            bool frameSrgb;
+            CaptureTiming timing;
+            ulong sessionId;
             int width;
             int height;
             ulong frameNumber;
@@ -493,12 +549,15 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
 
             lock (_frameLock)
             {
-                while (_running && _pendingPayload == null)
+                while (_running && _pendingRaw == null)
                     Monitor.Wait(_frameLock, 500);
                 if (!_running)
                     return;
 
-                payload = _pendingPayload;
+                raw = _pendingRaw;
+                timing = _pendingTiming;
+                sessionId = _pendingSessionId;
+                frameRawMin = _pendingRawMin; frameRawMax = _pendingRawMax; frameSrgb = _pendingSrgb;
                 width = _pendingWidth;
                 height = _pendingHeight;
                 frameNumber = _pendingFrameNumber;
@@ -506,9 +565,20 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 timestamp = _pendingTimestamp;
                 sensorPose = _pendingSensorPose;
                 intrinsics = _pendingIntrinsics;
-                _pendingPayload = null;
+                _pendingRaw = null;
             }
             double pickupRealtime = Time.realtimeSinceStartupAsDouble;
+            int count = checked(width * height);
+            int bytes = framePipeline == PipelineMode.LegacyFloat32 ? checked(count * sizeof(float)) : count;
+            if (payload == null || payload.Length != bytes) payload = new byte[bytes];
+            if (framePipeline == PipelineMode.LegacyFloat32)
+                Buffer.BlockCopy(raw, 0, payload, 0, bytes);
+            else
+                ConvertRawToUInt8Srgb(raw, payload, count, frameRawMin, frameRawMax, frameSrgb);
+            lock (_frameLock) _spareRaw = raw;
+            double conversionDone = Time.realtimeSinceStartupAsDouble;
+            _lastConversionMs = (float)((conversionDone - pickupRealtime) * 1000.0);
+
 
             byte[] intrinsicsBytes = !intrinsicsSent && intrinsics.HasValue
                 ? BuildIntrinsicsBlock(intrinsics.Value)
@@ -516,7 +586,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             int intrinsicsByteCount = intrinsicsBytes?.Length ?? 0;
 
             WriteHeader(header, width, height, framePipeline, payload.Length,
-                frameNumber, timestamp, sensorPose, intrinsicsByteCount);
+                frameNumber, timestamp, sensorPose, intrinsicsByteCount, sessionId, timing);
             stream.Write(header, 0, header.Length);
             stream.Write(payload, 0, payload.Length);
             if (intrinsicsByteCount > 0)
@@ -528,16 +598,11 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             double writeDoneRealtime = Time.realtimeSinceStartupAsDouble;
             if (TryGetFrameTiming(frameNumber, out double submitRt, out _, out _, out _))
                 _lastQueueWaitMs = (float)((pickupRealtime - submitRt) * 1000.0);
-            _lastWriteMs = (float)((writeDoneRealtime - pickupRealtime) * 1000.0);
+            _lastWriteMs = (float)((writeDoneRealtime - conversionDone) * 1000.0);
             RecordLatencySendDone(frameNumber, writeDoneRealtime);
             _frameSendTicks[frameNumber] = Stopwatch.GetTimestamp();
             Interlocked.Increment(ref _sentFrameCount);
 
-            lock (_frameLock)
-            {
-                if (_sparePayload == null || _sparePayload.Length != payload.Length)
-                    _sparePayload = payload;
-            }
 
             // Evict stale entries so the dictionary doesn't grow unbounded
             if (_frameSendTicks.Count > 120)
@@ -551,12 +616,12 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
 
     private static void WriteHeader(byte[] header, int width, int height,
         PipelineMode framePipeline, int payloadBytes, ulong frameNumber,
-        double timestamp, in Pose sensorPose, int intrinsicsByteCount)
+        double timestamp, in Pose sensorPose, int intrinsicsByteCount, ulong sessionId, CaptureTiming timing)
     {
         using MemoryStream memory = new MemoryStream(header, true);
         using BinaryWriter writer = new BinaryWriter(memory);
         writer.Write(new[] { (byte)'M', (byte)'L', (byte)'2', (byte)'D' });
-        writer.Write((ushort)(framePipeline == PipelineMode.LegacyFloat32 ? 3 : ProtocolVersion));
+        writer.Write((ushort)ProtocolVersion);
         writer.Write((ushort)HeaderSize);
         writer.Write((uint)width);
         writer.Write((uint)height);
@@ -573,6 +638,11 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         writer.Write(sensorPose.rotation.z);
         writer.Write(sensorPose.rotation.w);
         writer.Write((uint)intrinsicsByteCount);
+        writer.Write(sessionId);
+        writer.Write(timing.XrNanoseconds);
+        writer.Write(timing.CaptureRealtime);
+        writer.Write(timing.PollStartRealtime);
+        writer.Write(timing.FrameReadyRealtime);
     }
 
     private static byte[] BuildIntrinsicsBlock(in DepthCameraIntrinsics intrinsics)

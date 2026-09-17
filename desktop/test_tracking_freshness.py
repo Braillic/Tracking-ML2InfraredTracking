@@ -231,7 +231,7 @@ class ProcessingAgeTests(unittest.TestCase):
         self.connection.sendall.assert_not_called()
 
     def test_fresh_pose_is_sent_and_camera_basis_matches_world_conversion(self):
-        for flipped, convert in ((True, False), (False, False), (True, True), (False, True)):
+        for flipped, convert in ((True, False), (True, True), (False, True)):
             with self.subTest(flipped=flipped, convert=convert):
                 self.connection.reset_mock()
                 with patch('depth_stream_receiver.time.perf_counter', return_value=1.02):

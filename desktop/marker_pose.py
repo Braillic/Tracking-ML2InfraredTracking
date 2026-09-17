@@ -83,6 +83,7 @@ class MarkerPoseTracker:
     acquire_max_angular_speed_deg_s: float = 360.0
     max_candidates: int = 8
     max_search_hypotheses: int = 32
+    ranking_budget_ms: float = 12.0  # checked per detection subset; separate from solver budget
     search_budget_ms: float = 12.0  # checked between solver calls
     # Soft weights for ranking candidates (lower is better before → confidence).
     temporal_translation_weight: float = 50.0  # px-equivalent per metre
@@ -349,6 +350,7 @@ class MarkerPoseTracker:
         n_img = len(image_points)
         n_model = len(self.model_points)
         minimum = self.min_acquire_markers if self._prev_rvec is None else self.min_markers
+        rank_start = time.perf_counter()
         hypotheses = []
         gate = float(self.max_distance_ratio_error)
         for k in range(min(n_img, n_model), minimum - 1, -1):
@@ -358,6 +360,8 @@ class MarkerPoseTracker:
                 models.append((mi, obj, _pairwise_distance_signature(obj),
                                _point_fingerprints(obj)))
             for ii in combinations(range(n_img), k):
+                if (time.perf_counter() - rank_start) * 1000.0 >= self.ranking_budget_ms:
+                    return PoseEstimate.failed()
                 img = image_points[list(ii)]
                 sig = _pairwise_distance_signature(img)
                 fingerprint = _point_fingerprints(img)
@@ -518,6 +522,13 @@ class MarkerPoseTracker:
                 refine=self.refine_pose,
                 iterations=self.refine_iterations,
             )
+            # Refinement can move a previously valid solution outside the
+            # physical camera volume. Validate the FINAL pose, not just its seed.
+            if (not np.isfinite(rvec_f).all() or not np.isfinite(tvec_f).all()
+                    or not self.min_probe_z_m <= float(tvec_f.reshape(3)[2]) <= self.max_probe_z_m
+                    or not _all_points_in_front(self.model_points, rvec_f, tvec_f)):
+                self.debug_counts["depth"] += 1
+                continue
             # keeping track of # of markers pose predicts as a ratio to how many are expected based on detections
             n_used = len(mi_f)
             coverage = n_used / max(expected, 1)
@@ -540,7 +551,7 @@ class MarkerPoseTracker:
                 camera_matrix,
                 dist_coeffs,
             )
-            if mean_reproj > self.max_reproj_px:
+            if not np.isfinite(mean_reproj) or mean_reproj > self.max_reproj_px:
                 self.debug_counts["reproj"] += 1
                 continue
 
@@ -769,14 +780,14 @@ def filter_isolated_centers(
     centers: Sequence[tuple[float, float]] | np.ndarray,
     *,
     max_nearest_neighbor_px: float,
-) -> list[tuple[int, int]]:
+) -> list[tuple[float, float]]:
     """Drop detections whose nearest neighbor is farther than max_nearest_neighbor_px."""
     pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
     if pts.shape[0] < 2:
         return []
     nn = nearest_neighbor_distances(pts)
     return [
-        (round(pts[i, 0]), round(pts[i, 1]))
+        (float(pts[i, 0]), float(pts[i, 1]))
         for i, d in enumerate(nn)
         if d <= max_nearest_neighbor_px
     ]
@@ -786,7 +797,7 @@ def filter_centers_by_span(
     centers: Sequence[tuple[float, float]] | np.ndarray,
     *,
     max_cluster_span_px: float,
-) -> list[tuple[int, int]]:
+) -> list[tuple[float, float]]:
     """Keep the densest subset whose diameter (max pairwise distance) is ≤ max span."""
     pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
     if pts.shape[0] <= 1:
@@ -816,7 +827,7 @@ def filter_centers_by_span(
             best = chosen
             best_span = trial_span
 
-    return [(round(pts[i, 0]), round(pts[i, 1])) for i in best]
+    return [(float(pts[i, 0]), float(pts[i, 1])) for i in best]
 
 
 def filter_centers_by_model_geometry(
@@ -825,7 +836,7 @@ def filter_centers_by_model_geometry(
     *,
     min_cluster_size: int,
     max_geometry_ratio_error: float,
-) -> list[tuple[int, int]]:
+) -> list[tuple[float, float]]:
     """Keep the largest detection subset whose pairwise distance ratios match the model."""
     pts = np.asarray(centers, dtype=np.float64).reshape(-1, 2)
     model = np.asarray(model_points, dtype=np.float64).reshape(-1, 3)
@@ -855,7 +866,7 @@ def filter_centers_by_model_geometry(
         if best_idx:
             break
 
-    return [(round(pts[i, 0]), round(pts[i, 1])) for i in best_idx]
+    return [(float(pts[i, 0]), float(pts[i, 1])) for i in best_idx]
 
 
 def filter_marker_centers(
@@ -867,7 +878,7 @@ def filter_marker_centers(
     min_cluster_size: int = 3,
     max_geometry_ratio_error: float = 0.35,
     preserve_candidates: bool = False,
-) -> list[tuple[int, int]]:
+) -> list[tuple[float, float]]:
     """Remove isolated / geometrically implausible marker detections.
 
     Pipeline:
@@ -884,7 +895,7 @@ def filter_marker_centers(
 
     model = TEST_MARKER_COORDS if model_points is None else model_points
     as_tuples = [
-        (int(round(p[0])), int(round(p[1]))) for p in pts
+        (float(p[0]), float(p[1])) for p in pts
     ]
     nearby = filter_isolated_centers(
         as_tuples, max_nearest_neighbor_px=max_nearest_neighbor_px

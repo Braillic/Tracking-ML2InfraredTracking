@@ -1,6 +1,6 @@
 """Minimal PC → Magic Leap pose packet (companion to PoseEstimateTcpServer.cs).
 
-Wire format (little-endian, fixed 80 bytes), magic ML2P / version 3.
+Wire format: ML2P v3 is 80 bytes; v4 appends an 8-byte session ID (88 bytes).
 """
 
 from __future__ import annotations
@@ -63,12 +63,14 @@ class PosePacket:
     pnp_ms: float = 0.0  # PnP solve
     send_ms: float = 0.0  # world-space transform + struct pack (excludes the sendall syscall itself)
     pc_recv_ml2: float = 0.0  # depth frame fully received, ML2 clock domain
+    session_id: int = 0  # nonzero uses version 4 with an 8-byte session suffix
     pc_send_ml2: float = 0.0  # pose packet about to be sent, ML2 clock domain
 
     @staticmethod
-    def rejected(frame_id: int) -> PosePacket:
+    def rejected(frame_id: int, session_id: int = 0) -> PosePacket:
         return PosePacket(
             frame_id=frame_id,
+            session_id=session_id,
             ok=False,
             confidence=0.0,
             position=(0.0, 0.0, 0.0),
@@ -79,10 +81,16 @@ class PosePacket:
 def pack_pose_packet(pose: PosePacket) -> bytes:
     px, py, pz = pose.position
     qx, qy, qz, qw = pose.rotation
-    return POSE_HEADER.pack(
+    values = np.asarray((*pose.position, *pose.rotation, pose.confidence,
+                         pose.detect_ms, pose.pnp_ms, pose.send_ms, pose.pc_recv_ml2, pose.pc_send_ml2))
+    if not np.isfinite(values).all():
+        raise ValueError("Cannot transmit a nonfinite pose packet")
+    if pose.ok and (not 0 <= pose.confidence <= 1 or not np.isclose(np.linalg.norm(pose.rotation), 1., atol=1e-4)):
+        raise ValueError("Accepted pose needs valid confidence and unit quaternion")
+    payload = POSE_HEADER.pack(
         POSE_MAGIC,
-        POSE_PROTOCOL_VERSION,
-        POSE_PACKET_SIZE,
+        4 if pose.session_id else POSE_PROTOCOL_VERSION,
+        POSE_PACKET_SIZE + (8 if pose.session_id else 0),
         int(pose.frame_id),
         1 if pose.ok else 0,
         float(pose.confidence),
@@ -99,6 +107,7 @@ def pack_pose_packet(pose: PosePacket) -> bytes:
         float(pose.pc_recv_ml2),
         float(pose.pc_send_ml2),
     )
+    return payload + (struct.pack("<Q", pose.session_id) if pose.session_id else b"")
 
 
 def _receive_exact(connection: socket.socket, count: int) -> bytes:
@@ -150,6 +159,9 @@ def send_pose(connection: socket.socket, pose: PosePacket) -> None:
 def rotation_matrix_to_quaternion_xyzw(rotation: np.ndarray) -> tuple[float, float, float, float]:
     """Convert a 3x3 rotation matrix to a Unity xyzw quaternion."""
     m = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    if (not np.isfinite(m).all() or not np.allclose(m.T @ m, np.eye(3), atol=1e-5)
+            or not np.isclose(np.linalg.det(m), 1., atol=1e-5)):
+        raise ValueError("Quaternion conversion requires a proper rotation, not a reflection")
     trace = float(m[0, 0] + m[1, 1] + m[2, 2])
     if trace > 0.0:
         s = 0.5 / np.sqrt(trace + 1.0)
@@ -194,7 +206,8 @@ def opencv_rvec_tvec_to_cam_T_object(
     Unity camera +Y — do **not** apply the Y-flip matrix C or motion mirrors.
 
     Only for an unflipped image is:
-        R_u = C @ R_cv ,  t_u = C @ t_cv ,  C = diag(1, -1, 1)
+        R_u = C @ R_cv @ C, t_u = C @ t_cv, C = diag(1, -1, 1).
+        This requires convert_object_axes=True; C @ R alone is a reflection.
 
     convert_object_axes conjugates with C as well (C @ R @ C); keep False unless
     model points were authored with a matching Y flip.
@@ -218,8 +231,7 @@ def opencv_rvec_tvec_to_cam_T_object(
             r_u = c @ r_cv @ c
             t_u = c @ t_cv
         else:
-            r_u = c @ r_cv
-            t_u = c @ t_cv
+            raise ValueError("Unflipped input requires --convert-object-axes to define a proper rotation")
 
     cam_t_object = np.eye(4, dtype=np.float64)
     cam_t_object[:3, :3] = r_u
@@ -244,6 +256,10 @@ def camera_matrix_for_vertically_flipped_image(
 def unity_trs_matrix(position_xyz: np.ndarray, rotation_xyzw: np.ndarray) -> np.ndarray:
     """Build a Unity TRS matrix from position (xyz) and quaternion (xyzw)."""
     x, y, z, w = np.asarray(rotation_xyzw, dtype=np.float64).reshape(4)
+    norm = np.linalg.norm([x, y, z, w])
+    if not np.isfinite(norm) or norm < 1e-8 or not np.isfinite(position_xyz).all():
+        raise ValueError("Invalid sensor pose")
+    x, y, z, w = np.asarray([x, y, z, w]) / norm
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
     wx, wy, wz = w * x, w * y, w * z
