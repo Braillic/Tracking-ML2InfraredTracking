@@ -1,5 +1,35 @@
 # Magic Leap 2 depth receiver
 
+## Shared tracking core
+
+Live TCP and offline image replay now use `TrackingPipeline.process()` in
+`tracking_core.py`. Detection/PnP run without networking or preview dependencies.
+See [Tracking architecture and native migration](TRACKING_ARCHITECTURE.md) for the
+input/output contract, buffer ownership, timing definitions and the Android `.so`
+migration path. The current wire protocol and installed Unity APK remain compatible.
+
+Use the same command as before, including `--headless` for latency measurements:
+
+```powershell
+python depth_stream_receiver.py --host 192.168.0.161 --port 50777 --pose-port 50778 --send-pose --headless
+```
+
+Both preview and headless modes now detect directly on grayscale for UINT8 input.
+Preview images and overlays are constructed after sending the pose. `[PCCore]`
+adds receive-queue, preparation, detection, PnP, world-transform and total core
+p50/p95/p99 timings. These are PC processing measurements, not capture-to-display.
+
+For a recording made with the `R` key in preview mode:
+
+```powershell
+python benchmark_tracking.py saves\recording_YYYYMMDD_HHMMSS --csv tracking.csv --json tracking-summary.json
+```
+
+This reruns the same image-to-world-pose core using saved capture-time sensor poses
+and configuration. Older recordings without detection settings need the explicit
+`--allow-legacy-defaults` flag. Missing sensor-pose metadata cannot be substituted
+with a stationary-head assumption. Headless mode does not perform recording I/O.
+
 The Unity app is the TCP server and the PC initiates the connection. Unity exposes
 two full-resolution processing pipelines. The server keeps only
 the newest waiting frame, so a slow connection does not stall the Unity sensor
@@ -33,13 +63,13 @@ Select **IRToolManager → Depth Frame Tcp Server → Processing pipeline → Pi
 
 | Mode | ML2 preparation | Wire payload | PC preparation before shared detection |
 | --- | --- | --- | --- |
-| Pipeline 1 - Legacy FLOAT32 (PC conversion) | Copy original DepthRaw floats | FLOAT32, 4 bytes/pixel | `colourise_depth()` → UINT8 BGR |
-| Pipeline 2 - UINT8 (ML2 conversion) | Normalize, optional sRGB mapping, round to UINT8 | UINT8, 1 byte/pixel | Grayscale-to-BGR |
+| Pipeline 1 - Legacy FLOAT32 (PC conversion) | Copy original DepthRaw floats | FLOAT32, 4 bytes/pixel | Map to UINT8 grayscale (`turbo` retains its legacy color mapping) |
+| Pipeline 2 - UINT8 (ML2 conversion) | Normalize, optional sRGB mapping, round to UINT8 | UINT8, 1 byte/pixel | Use grayscale directly |
 
 Pipeline 1 restores the image-processing path from
 `e8a320133921185f47d032a4ce7c3941d4206251`, with the correspondence and
 explicit tracking-loss/reacquisition fixes. Both modes share those fixes and
-the same `render_analysis()` → threshold → blobs → centres → correspondence →
+the same shared core → threshold → blobs → centres → correspondence →
 PnP → sensor-world-pose composition → Unity return path. This is a selectable
 processing path, not a checkout/revert of the entire repository.
 
@@ -116,13 +146,13 @@ At 544x480, Pipeline 1 sends 1,044,480 payload bytes/frame and Pipeline 2 sends
 
 Unity `[ML2LAT]` logs identify `pipeline=1 FLOAT32 raw` or `pipeline=2 UINT8 sRGB`
 and report `ml_prepare+queue+tcp_write`,
-`leg1_net(ML2->PC)`, PC processing, return transport, and Unity apply wait.
+`leg1_estimate(ML2->PC)`, PC processing, return transport, and Unity apply wait.
 The receiver automatically reconnects if a deployment or app restart leaves a
 stale TCP connection; adjust this with `--frame-timeout` if needed.
 
 The receive timestamp is recorded immediately after payload/metadata decoding,
-before `colourise_depth()` or grayscale-to-BGR conversion. PC preparation is
-included in `detect`, not `leg1_net`. The PC logs the pipeline and actual
+before core image preparation. PC preparation is
+included in `detect`, not `leg1_estimate`. The PC logs the pipeline and actual
 payload size on the first frame and whenever the mode changes.
 The Unity `Sensor input is FLOAT32 DepthRaw` log describes acquisition before
 conversion; use the TCP pipeline log to identify the transmitted representation.
@@ -142,7 +172,7 @@ Candidate ranking and an individual OpenCV call can exceed that budget; it is
 not a hard deadline for the whole frame. These limits are configurable on
 `MarkerPoseTracker` as `max_search_hypotheses` and `search_budget_ms`.
 
-Tracking expires after 200 ms without an accepted observation. Empty detections
+Tracking expires after 650 ms without an accepted observation by default. Empty detections
 also update this timeout; a gap with no delivered frames is handled on the next
 observation. After loss, stale pose priors are cleared and acquisition requires
 two consecutive, consistent estimates using at least four markers.

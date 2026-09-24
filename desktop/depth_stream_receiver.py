@@ -10,11 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import socket
-import struct
-import threading
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import cv2
@@ -37,239 +35,22 @@ from pose_packet import (
     unity_trs_matrix,
 )
 
-MAGIC = b"ML2D"
-PROTOCOL_VERSION = 5
-PIXEL_FORMAT_FLOAT32_RAW = 1
-PIXEL_FORMAT_UINT8_SRGB_INTENSITY = 2
-HEADER = struct.Struct("<4sHHIIIIQd3f4fI")
-TIMING_HEADER = struct.Struct("<Qqddd")  # session, capture XR ns, mapped capture, poll start, frame ready
-INTRINSICS = struct.Struct("<11d")
-MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
+# Re-export the old helper names for existing notebooks and diagnostics.
+from tracking_types import (CameraIntrinsics, DepthFrame, PIXEL_FORMAT_FLOAT32_RAW,
+                            PIXEL_FORMAT_UINT8_SRGB_INTENSITY)
+from depth_transport import (MAGIC, PROTOCOL_VERSION, HEADER, TIMING_HEADER,
+    INTRINSICS, MAX_PAYLOAD_BYTES, receive_exact, receive_frame, LatestFrameReceiver)
+from marker_detection import (raw_to_uint8_srgb, apply_threshold, blob_area_limits,
+    geometry_pixel_limits, detect_marker_centers, MARKER_MIN_AREA, MARKER_MAX_AREA,
+    MARKER_MAX_AREA_FRAC, MARKER_MAX_ASPECT, MARKER_RING_RADIUS, MAX_DETECTED_MARKERS,
+    MARKER_MAX_NEAREST_NEIGHBOR_PX, MARKER_MAX_NEAREST_NEIGHBOR_FRAC,
+    MARKER_MAX_CLUSTER_SPAN_PX, MARKER_MAX_CLUSTER_SPAN_FRAC,
+    MARKER_MIN_CLUSTER_SIZE, MARKER_GEOMETRY_RATIO_ERROR)
+from pose_geometry import pose_camera_matrix
+from tracking_core import TrackingPipeline, TrackingConfig, DetectionConfig, solve_observation
+
 WINDOW_TITLE = "Magic Leap 2 depth transport"
 ANALYSIS_WINDOW_TITLE = "Analysis (f=fixed, p=percentile)"
-MARKER_MIN_AREA = 2
-# Absolute fallback; close-up blobs often exceed a few thousand pixels.
-MARKER_MAX_AREA = 2000
-# Prefer image-relative cap: ~8% of frame (≈20k px on 544x480).
-MARKER_MAX_AREA_FRAC = 0.10
-MARKER_MAX_ASPECT = 6.0
-MARKER_RING_RADIUS = 10
-MAX_DETECTED_MARKERS = 8  # bounded candidate pool; PnP selects the constellation
-# Pre-PnP spatial filter defaults (pixels). These also scale up with image size
-# so close-up constellations are not rejected as "too spread out".
-MARKER_MAX_NEAREST_NEIGHBOR_PX = 90.0
-MARKER_MAX_NEAREST_NEIGHBOR_FRAC = 0.35  # of min(h, w)
-MARKER_MAX_CLUSTER_SPAN_PX = 220.0
-MARKER_MAX_CLUSTER_SPAN_FRAC = 0.85  # of min(h, w)
-MARKER_MIN_CLUSTER_SIZE = 3
-MARKER_GEOMETRY_RATIO_ERROR = 0.35
-
-@dataclass(frozen=True)
-# intrinsics recieved once per TCP connection
-class CameraIntrinsics:
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    fov_x: float
-    fov_y: float
-    k1: float
-    k2: float
-    p1: float
-    p2: float
-    k3: float
-
-    @property
-    def camera_matrix(self) -> np.ndarray:
-        """OpenCV 3x3 camera matrix."""
-        return np.array(((self.fx, 0.0, self.cx),
-                         (0.0, self.fy, self.cy),
-                         (0.0, 0.0, 1.0)), dtype=np.float64)
-
-    @property
-    def distortion_coefficients(self) -> np.ndarray:
-        """OpenCV distortion vector ordered [k1, k2, p1, p2, k3]."""
-        return np.array((self.k1, self.k2, self.p1, self.p2, self.k3),
-                        dtype=np.float64)
-
-
-@dataclass(frozen=True)
-class DepthFrame:
-    """One synchronized ML frame and its Unity-world sensor pose."""
-
-    pixels: np.ndarray  # unmodified wire pixels: float32 DepthRaw or uint8 intensity
-    frame_id: int
-    timestamp: float
-    sensor_position: np.ndarray  # xyz metres, Unity world coordinates
-    sensor_rotation: np.ndarray  # xyzw quaternion, Unity world coordinates
-    intrinsics: CameraIntrinsics | None  # present once per TCP connection
-    pixel_format: int = PIXEL_FORMAT_UINT8_SRGB_INTENSITY  # wire format
-    session_id: int = 0
-    capture_time_ns: int = 0
-    capture_realtime: float = float("nan")  # ML2 clock; NaN means conversion unavailable
-    poll_start_realtime: float = 0.0
-    frame_ready_realtime: float = 0.0
-
-    @property
-    def observation_time(self) -> float:
-        return self.capture_time_ns * 1e-9 if self.capture_time_ns > 0 else self.timestamp
-
-
-def receive_exact(connection: socket.socket, count: int) -> bytes:
-    data = bytearray(count)
-    view = memoryview(data)
-    received = 0
-    while received < count:
-        chunk_size = connection.recv_into(view[received:])
-        if chunk_size == 0:
-            raise ConnectionError("Magic Leap closed the connection")
-        received += chunk_size
-    return bytes(data)
-
-
-def receive_frame(connection: socket.socket) -> DepthFrame:
-    """Decode the wire payload only; conversion happens after recv_done."""
-    values = HEADER.unpack(receive_exact(connection, HEADER.size))
-    (magic, version, header_size, width, height, pixel_format, payload_size,
-     frame_id, timestamp, px, py, pz, qx, qy, qz, qw, intrinsics_size) = values
-
-    if magic != MAGIC:
-        raise ValueError(f"Unexpected stream magic {magic!r}")
-    expected_header = HEADER.size + TIMING_HEADER.size if version == 5 else HEADER.size
-    if version not in (3, 4, 5) or header_size != expected_header:
-        raise ValueError(f"Unsupported protocol version/header: {version}/{header_size}")
-    timing = TIMING_HEADER.unpack(receive_exact(connection, TIMING_HEADER.size)) if version == 5 else None
-    if timing is not None and (timing[0] == 0 or timing[1] <= 0
-                               or not np.isfinite(timing[3:]).all() or timing[4] < timing[3]):
-        raise ValueError("Invalid frame identity/capture timing")
-    if pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY:
-        dtype = np.dtype(np.uint8)
-    elif pixel_format == PIXEL_FORMAT_FLOAT32_RAW:
-        dtype = np.dtype("<f4")
-    else:
-        raise ValueError(f"Unsupported pixel format {pixel_format}")
-    expected_size = width * height * dtype.itemsize
-    if width == 0 or height == 0 or payload_size != expected_size or payload_size > MAX_PAYLOAD_BYTES:
-        raise ValueError(
-            f"Invalid payload: {payload_size} bytes for {width}x{height} {dtype.name}"
-        )
-    if intrinsics_size not in (0, INTRINSICS.size):
-        raise ValueError(
-            f"Invalid intrinsics block size: {intrinsics_size}; expected 0 or {INTRINSICS.size}"
-        )
-
-    payload = receive_exact(connection, payload_size)
-    pixels = np.frombuffer(payload, dtype=dtype).reshape(height, width)
-    intrinsics = (CameraIntrinsics(*INTRINSICS.unpack(receive_exact(connection, intrinsics_size)))
-                  if intrinsics_size else None)
-    return DepthFrame(
-        pixels=pixels,
-        frame_id=frame_id,
-        timestamp=timestamp,
-        sensor_position=np.array((px, py, pz), dtype=np.float32),
-        sensor_rotation=np.array((qx, qy, qz, qw), dtype=np.float32),
-        intrinsics=intrinsics,
-        pixel_format=pixel_format,
-        **(dict(zip(("session_id", "capture_time_ns", "capture_realtime", "poll_start_realtime",
-                     "frame_ready_realtime"), timing)) if timing is not None else {}),
-    )
-
-
-class LatestFrameReceiver:
-    """One socket reader, one replaceable complete-frame slot per connection.
-
-    GUI/recording/PnP stalls drop intermediate frames instead of building a FIFO.
-    Intrinsics belong to the connection and survive dropping their first frame.
-    Receive timestamps are taken here, never when processing eventually starts.
-    """
-
-    def __init__(self, connection: socket.socket):
-        self.connection = connection
-        self._condition = threading.Condition()
-        self._pending = None
-        self._error = None
-        self._stopped = False
-        self.dropped_frames = 0
-        self.received_frames = 0
-        self._thread = threading.Thread(target=self._read, name="ML2 latest frame", daemon=True)
-
-    def __enter__(self):
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-    def close(self):
-        with self._condition:
-            self._stopped = True
-            self._pending = None
-            self._condition.notify_all()
-        # Interrupt recv_into before joining; no old reader survives reconnect.
-        try:
-            self.connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        self._thread.join()
-
-    def _read(self):
-        intrinsics = None
-        try:
-            while True:
-                frame = receive_frame(self.connection)
-                received = time.perf_counter()
-                if frame.intrinsics is not None:
-                    intrinsics = frame.intrinsics
-                frame = replace(frame, intrinsics=intrinsics)
-                with self._condition:
-                    if self._stopped:
-                        return
-                    if self._pending is not None:
-                        self.dropped_frames += 1
-                    self.received_frames += 1
-                    self._pending = (frame, received)
-                    self._condition.notify_all()
-        except (ConnectionError, OSError, ValueError) as error:
-            with self._condition:
-                self._error = error
-                self._pending = None  # disconnected sessions cannot publish poses
-                self._condition.notify_all()
-
-    def take(self):
-        with self._condition:
-            self._condition.wait_for(lambda: self._pending is not None or self._error or self._stopped)
-            if self._error is not None:
-                raise self._error
-            if self._stopped:
-                raise ConnectionError("Depth receiver stopped")
-            result, self._pending = self._pending, None
-            return result
-
-
-def raw_to_uint8_srgb(
-    depth: np.ndarray,
-    raw_min: float,
-    raw_max: float,
-    *,
-    linear_to_srgb: bool,
-) -> np.ndarray:
-    """Map FLOAT32 DepthRaw values to the same uint8 image produced on ML2."""
-    finite = np.isfinite(depth)
-    normalized = (
-        (np.where(finite, depth, raw_min) - raw_min)
-        / max(raw_max - raw_min, 1e-6)
-    )
-    normalized = np.clip(normalized, 0.0, 1.0)
-    if linear_to_srgb:
-        normalized = np.where(
-            normalized <= 0.0031308,
-            normalized * 12.92,
-            1.055 * np.power(normalized, 1.0 / 2.4) - 0.055,
-        )
-    grey = np.rint(normalized * 255.0).astype(np.uint8)
-    grey[~finite] = 0
-    return grey
-
 
 def colourise_depth(depth: np.ndarray, args: argparse.Namespace) -> np.ndarray:
     """Legacy e8a3201 FLOAT32-to-BGR mapping, also used by offline replay."""
@@ -301,158 +82,6 @@ def prepare_detection_image(frame: DepthFrame, args: argparse.Namespace) -> np.n
     if frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY:
         return cv2.cvtColor(frame.pixels, cv2.COLOR_GRAY2BGR)
     raise ValueError(f"Unsupported pixel format {frame.pixel_format}")
-
-
-def apply_threshold(
-    image: np.ndarray,
-    threshold_method: str,
-    fixed_threshold: float = 200.0,
-    top_p: tuple[float, float] = (100.0, 90.0),
-) -> tuple[np.ndarray, float]:
-    """Threshold a colourised uint8 image. top_p is (absolute floor, percentile).
-
-    Intensity is the max channel per pixel (works for grey unity-raw and turbo).
-    Pixels below the cutoff are set to 0; others keep their original colour.
-    """
-    if image.ndim == 3:
-        intensity = image.max(axis=2).astype(np.float32)
-    else:
-        intensity = image.astype(np.float32)
-
-    if threshold_method == "fixed":
-        cutoff = float(fixed_threshold)
-    elif threshold_method == "percentile":
-        floor, percentile = top_p
-        if intensity.size == 0:
-            cutoff = float(floor)
-        else:
-            cutoff = max(float(floor), float(np.percentile(intensity, percentile)))
-    else:
-        raise ValueError(f"Invalid threshold method: {threshold_method}")
-
-    keep = intensity >= cutoff
-    if image.ndim == 3:
-        thresholded = np.where(keep[..., None], image, 0).astype(np.uint8)
-    else:
-        thresholded = np.where(keep, image, 0).astype(np.uint8)
-    return thresholded, cutoff
-
-
-def blob_area_limits(
-    image_shape: tuple[int, ...],
-    *,
-    min_area: int | None = None,
-    max_area: int | None = None,
-    max_area_frac: float = MARKER_MAX_AREA_FRAC,
-) -> tuple[int, int]:
-    """Area gate that scales with frame size for close-up markers."""
-    height, width = int(image_shape[0]), int(image_shape[1])
-    lo = MARKER_MIN_AREA if min_area is None else int(min_area)
-    frac_cap = max(lo + 1, int(max_area_frac * height * width))
-    hi = MARKER_MAX_AREA if max_area is None else int(max_area)
-    return lo, max(hi, frac_cap)
-
-
-def geometry_pixel_limits(
-    image_shape: tuple[int, ...],
-    *,
-    max_nearest_neighbor_px: float | None = None,
-    max_cluster_span_px: float | None = None,
-) -> tuple[float, float]:
-    """Isolation / span gates that grow for close-up (large on-screen) tools."""
-    short_side = float(min(int(image_shape[0]), int(image_shape[1])))
-    nn = MARKER_MAX_NEAREST_NEIGHBOR_PX if max_nearest_neighbor_px is None else float(
-        max_nearest_neighbor_px
-    )
-    span = MARKER_MAX_CLUSTER_SPAN_PX if max_cluster_span_px is None else float(
-        max_cluster_span_px
-    )
-    nn = max(nn, MARKER_MAX_NEAREST_NEIGHBOR_FRAC * short_side)
-    span = max(span, MARKER_MAX_CLUSTER_SPAN_FRAC * short_side)
-    return nn, span
-
-
-def detect_marker_centers(
-    colourised: np.ndarray,
-    threshold_method: str,
-    fixed_threshold: float,
-    top_p: tuple[float, float],
-    # max_markers: int = 5,
-    *,
-    filter_geometry: bool = True,
-    model_points: np.ndarray | None = None,
-    min_area: int | None = None,
-    max_area: int | None = None,
-    max_aspect: float = MARKER_MAX_ASPECT,
-    max_nearest_neighbor_px: float | None = None,
-    max_cluster_span_px: float | None = None,
-    min_cluster_size: int = MARKER_MIN_CLUSTER_SIZE,
-    max_geometry_ratio_error: float = MARKER_GEOMETRY_RATIO_ERROR,
-    max_markers: int=MAX_DETECTED_MARKERS,
-) -> tuple[np.ndarray, float, list[tuple[float, float]]]:
-    """Threshold a colourised frame and locate bright marker blobs."""
-    thresholded, cutoff = apply_threshold(
-        colourised,
-        threshold_method,
-        fixed_threshold=fixed_threshold,
-        top_p=top_p,
-    )
-
-    if colourised.ndim == 3:
-        intensity = colourised.max(axis=2).astype(np.float32)
-    else:
-        intensity = colourised.astype(np.float32)
-
-    min_blob_area, max_blob_area = blob_area_limits(
-        colourised.shape, min_area=min_area, max_area=max_area
-    )
-    max_nn_px, max_span_px = geometry_pixel_limits(
-        colourised.shape,
-        max_nearest_neighbor_px=max_nearest_neighbor_px,
-        max_cluster_span_px=max_cluster_span_px,
-    )
-
-    mask = (intensity >= cutoff).astype(np.uint8) * 255
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-    candidates: list[tuple[float, tuple[int, int]]] = []
-    for label in range(1, n_labels):
-        area = int(stats[label, cv2.CC_STAT_AREA])
-        width = int(stats[label, cv2.CC_STAT_WIDTH])
-        height = int(stats[label, cv2.CC_STAT_HEIGHT])
-        aspect = max(width, height) / max(1, min(width, height))
-
-        if area < min_blob_area or area > max_blob_area or aspect > max_aspect:
-            continue
-
-        # Restrict each blob scan to its bounding box rather than repeatedly
-        # scanning the full image for every connected component.
-        left, top = int(stats[label, cv2.CC_STAT_LEFT]), int(stats[label, cv2.CC_STAT_TOP])
-        ys, xs = np.where(labels[top:top + height, left:left + width] == label)
-        ys, xs = ys + top, xs + left
-        weights = intensity[ys, xs]
-        if weights.size == 0 or float(weights.sum()) <= 0:
-            continue
-
-        weight_sum = float(weights.sum())
-        cx = float((xs * weights).sum() / weight_sum)
-        cy = float((ys * weights).sum() / weight_sum)
-        mean_intensity = float(weights.mean())
-        candidates.append((mean_intensity, (cx, cy)))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    centers = [center for _, center in candidates[:max_markers]]
-    if filter_geometry:
-        centers = filter_marker_centers(
-            centers,
-            model_points=TEST_MARKER_COORDS if model_points is None else model_points,
-            max_nearest_neighbor_px=max_nn_px,
-            max_cluster_span_px=max_span_px,
-            min_cluster_size=min_cluster_size,
-            max_geometry_ratio_error=max_geometry_ratio_error,
-            preserve_candidates=True,
-        )
-    return thresholded, cutoff, centers
 
 
 def annotate_markers(image: np.ndarray, centers: list[tuple[float, float]]) -> np.ndarray:
@@ -497,7 +126,7 @@ def flip_ud_points(
     points: list[tuple[float, float]] | np.ndarray | None,
     image_height: int,
 ) -> list[tuple[float, float]] | np.ndarray | None:
-    """Map stream-buffer coordinates → upright display coordinates (vertical flip)."""
+    """Map stream-buffer coordinates -> upright display coordinates (vertical flip)."""
     if points is None:
         return None
     if isinstance(points, list):
@@ -532,20 +161,6 @@ def prepare_display_view(
         flip_ud_points(projected, height),
     )
 
-
-def pose_camera_matrix(
-    intrinsics: CameraIntrinsics | None,
-    image_height: int,
-    *,
-    depth_vertically_flipped: bool,
-) -> np.ndarray | None:
-    """Camera matrix used for live PnP (includes flip-cy adjustment when needed)."""
-    if intrinsics is None:
-        return None
-    camera_matrix = intrinsics.camera_matrix
-    if depth_vertically_flipped:
-        camera_matrix = camera_matrix_for_vertically_flipped_image(camera_matrix, image_height)
-    return camera_matrix
 
 
 def project_model_points(
@@ -743,106 +358,61 @@ def _new_recording_dir(base_dir: Path) -> Path:
     return path
 
 
-def estimate_and_send_pose(
-    tracker: MarkerPoseTracker,
-    centers: list[tuple[float, float]],
-    frame: DepthFrame,
-    intrinsics: CameraIntrinsics | None,
-    pose_connection: socket.socket | None,
-    *,
-    depth_vertically_flipped: bool = True,
-    convert_object_axes: bool = False,
-    detect_ms: float = 0.0,
-    recv_done: float = 0.0,
-    clock_offset: float = 0.0,
-    max_processing_age_s: float = 0.10,
-) -> tuple[PoseEstimate, np.ndarray | None]:
-    """Run MarkerPoseTracker and optionally stream Unity-world pose to the headset.
-
-    detect_ms is the marker-detection duration measured by the caller (before this
-    function runs); it is only forwarded into the outgoing packet so ML2 can log a
-    per-stage breakdown instead of one lumped "PC + network" bucket.
-
-    recv_done (this frame's perf_counter() receive time) and clock_offset (from
-    sync_clock_offset) let ML2 translate PC timestamps into its own clock domain
-    and split the round trip into its two network legs.
-
-    Returns (estimate, camera_matrix_used_for_pnp).
-    """
-    camera_matrix = pose_camera_matrix(
-        intrinsics,
-        frame.pixels.shape[0],
-        depth_vertically_flipped=depth_vertically_flipped,
-    )
-    if camera_matrix is None:
-        tracker.reset()
-        return PoseEstimate.failed(), camera_matrix
-
-    pnp_start = time.perf_counter()
-    if recv_done > 0 and pnp_start - recv_done > max_processing_age_s:
-        return PoseEstimate.failed(), camera_matrix
-    camera_world = unity_trs_matrix(frame.sensor_position, frame.sensor_rotation)
-    if not depth_vertically_flipped or convert_object_axes:
-        camera_world[:3, 1] *= -1  # same camera basis as world-pose conversion
-
-    estimate = tracker.estimate(
-        centers,
-        camera_matrix,
-        intrinsics.distortion_coefficients if intrinsics is not None else None,
-        observation_time=frame.observation_time,
-        camera_world_transform=camera_world,
-    )
-    pnp_ms = (time.perf_counter() - pnp_start) * 1000.0
-
+def publish_pose_solution(solution, frame, pose_connection, tracker, *,
+                          detect_ms=0., recv_done=0., clock_offset=0., max_processing_age_s=.10):
+    """Transport adapter. Recheck the publication deadline after core processing."""
+    estimate = solution.estimate
     if pose_connection is None:
-        return estimate, camera_matrix
-
-    # Explicit rejected observations let ML2 count failures. The bounded hold
-    # policy still uses the last accepted source time (one miss does not flicker).
-    if not (estimate.ok and estimate.rvec is not None and estimate.tvec is not None):
-        if recv_done <= 0 or time.perf_counter() - recv_done <= max_processing_age_s:
-            send_pose(pose_connection, PosePacket.rejected(frame.frame_id, frame.session_id))
-        return estimate, camera_matrix
-
-    prep_start = time.perf_counter()
-    position, rotation = opencv_camera_pose_to_unity_world(
-        estimate.rvec,
-        estimate.tvec,
-        frame.sensor_position,
-        frame.sensor_rotation,
-        depth_vertically_flipped=depth_vertically_flipped,
-        convert_object_axes=convert_object_axes,
-    )
-    # prep_ms covers world-space transform + struct packing, up to (but not
-    # including) the sendall syscall — a packet can't carry its own send
-    # duration, so that part is measured separately below and only printed
-    # locally; it's negligible for a 64-byte write with TCP_NODELAY.
-    send_ready_time = time.perf_counter()
-    if recv_done > 0 and send_ready_time - recv_done > max_processing_age_s:
-        tracker.reset()  # do not let a pose we cannot publish become the next prior
-        return PoseEstimate.failed(), camera_matrix
-    packet = PosePacket(
-        frame_id=frame.frame_id,
-        session_id=frame.session_id,
-        ok=True,
-        confidence=float(estimate.confidence),
-        position=position,
-        rotation=rotation,
-        detect_ms=detect_ms,
-        pnp_ms=pnp_ms,
-        send_ms=(send_ready_time - prep_start) * 1000.0,
-        pc_recv_ml2=recv_done + clock_offset,
-        pc_send_ml2=send_ready_time + clock_offset,
-    )
+        return estimate
+    now = time.perf_counter()
+    if recv_done > 0 and now - recv_done > max_processing_age_s:
+        if estimate.ok:
+            tracker.reset()
+        return PoseEstimate.failed()
+    if solution.reason.startswith('expired') or solution.reason in (
+            'out_of_order', 'invalid_image', 'invalid_capture_metadata',
+            'missing_calibration', 'invalid_calibration', 'invalid_world_pose'):
+        return PoseEstimate.failed()
+    if not estimate.ok:
+        send_pose(pose_connection, PosePacket.rejected(frame.frame_id, frame.session_id))
+        return estimate
+    packet = PosePacket(frame_id=frame.frame_id, session_id=frame.session_id,
+        ok=True, confidence=float(estimate.confidence), position=solution.position,
+        rotation=solution.rotation, detect_ms=detect_ms, pnp_ms=solution.pnp_ms,
+        send_ms=solution.world_ms, pc_recv_ml2=recv_done+clock_offset,
+        pc_send_ml2=now+clock_offset)
     send_start = time.perf_counter()
     try:
         send_pose(pose_connection, packet)
     except OSError as error:
         raise ConnectionError(f"Pose stream send failed: {error}") from error
-    sendall_ms = (time.perf_counter() - send_start) * 1000.0
+    sendall_ms = (time.perf_counter()-send_start)*1000.
     if sendall_ms > 1.0:
-        print(f"[ML2LAT] slow pose sendall: {sendall_ms:.1f}ms (not reflected in ML2's log)", flush=True)
-    return estimate, camera_matrix
+        print(f"[ML2LAT] pose serialization+sendall: {sendall_ms:.1f}ms "
+              "(included in ML2 leg2 estimate)", flush=True)
+    return estimate
+
+
+def estimate_and_send_pose(tracker, centers, frame, intrinsics, pose_connection, *,
+                          depth_vertically_flipped=True, convert_object_axes=False,
+                          detect_ms=0., recv_done=0., clock_offset=0., max_processing_age_s=.10):
+    """Compatibility adapter for existing center-based callers; shares core pose logic."""
+    solution = solve_observation(tracker, centers, frame, intrinsics,
+        depth_vertically_flipped=depth_vertically_flipped, convert_object_axes=convert_object_axes,
+        deadline=recv_done+max_processing_age_s if recv_done > 0 else None)
+    estimate = publish_pose_solution(solution, frame, pose_connection, tracker,
+        detect_ms=detect_ms, recv_done=recv_done, clock_offset=clock_offset,
+        max_processing_age_s=max_processing_age_s)
+    return estimate, solution.camera_matrix
+
+
+def tracking_config_from_args(args):
+    return TrackingConfig(detection=DetectionConfig(
+        threshold_method=args.threshold_method, fixed_threshold=args.fixed_threshold,
+        top_p=(args.percentile_floor, args.percentile), max_markers=args.max_detected_markers,
+        **_geometry_filter_kwargs(args)), view=args.view, raw_min=args.raw_min,
+        raw_max=args.raw_max, unity_color_space=args.unity_color_space, near=args.near, far=args.far,
+        depth_vertically_flipped=args.depth_vertically_flipped, convert_object_axes=args.convert_object_axes)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -857,6 +427,8 @@ def run(args: argparse.Namespace) -> None:
                                 lost_timeout_s=args.tracking_lost_timeout,
                                 acquisition_timeout_s=args.acquisition_timeout)
 
+    core = TrackingPipeline(tracking_config_from_args(args), tracker=tracker)
+
     recording = False
     recording_dir: Path | None = None
     recording_index = 0
@@ -864,7 +436,7 @@ def run(args: argparse.Namespace) -> None:
     while True:
         pose_connection: socket.socket | None = None
         clock_offset = 0.0
-        tracker.reset()
+        core.reset()
         try:
             print(f"Connecting to Magic Leap depth at {args.host}:{args.port} ...")
             with socket.create_connection((args.host, args.port), timeout=args.connect_timeout) as connection:
@@ -891,9 +463,9 @@ def run(args: argparse.Namespace) -> None:
                 if not args.headless:
                     show_waiting_window(args.host, args.port)
                 last_pixel_format = None
-                last_session_id = None
                 processed = accepted = stale_before = 0
                 pc_work_ms = deque(maxlen=256)
+                core_samples = deque(maxlen=256)
                 next_diagnostics = time.perf_counter() + args.diagnostics_interval
                 intrinsics = None
 
@@ -907,21 +479,22 @@ def run(args: argparse.Namespace) -> None:
                                   f"overwritten={receiver.dropped_frames} processed={processed} accepted={accepted} "
                                   f"failed_or_expired={processed - accepted} stale_before={stale_before} "
                                   f"pc_work_ms_p50_p95_p99={percentiles} state={tracker.state}", flush=True)
+                            if core_samples:
+                                stages = np.percentile(np.asarray(core_samples), [50, 95, 99], axis=0).round(2)
+                                names = ('receive_queue', 'prepare', 'detect', 'pnp', 'world', 'core_total')
+                                print('[PCCore] ms p50/p95/p99 ' + ' '.join(
+                                    f'{name}={stages[:, i].tolist()}' for i, name in enumerate(names)), flush=True)
                             next_diagnostics = time.perf_counter() + args.diagnostics_interval
                         if time.perf_counter() - recv_done > args.max_processing_age:
                             stale_before += 1
                             continue
-                        if frame.session_id != last_session_id:
-                            tracker.reset()
-                            last_session_id = frame.session_id
                         detection_start = time.perf_counter()
                         if frame.pixel_format != last_pixel_format:
                             pipeline = ("1: FLOAT32 -> colourise_depth() on PC"
                                         if frame.pixel_format == PIXEL_FORMAT_FLOAT32_RAW
-                                        else "2: UINT8 from ML2 -> grayscale-to-BGR on PC")
+                                        else "2: UINT8 from ML2 -> shared grayscale tracking core")
                             print(f"Pipeline {pipeline}; {frame.pixels.shape[1]}x{frame.pixels.shape[0]}, "
                                   f"{frame.pixels.nbytes:,} payload bytes/frame", flush=True)
-                            tracker.reset()
                             last_pixel_format = frame.pixel_format
                         if frame.intrinsics is not None and frame.intrinsics != intrinsics:
                             intrinsics = frame.intrinsics
@@ -930,39 +503,33 @@ def run(args: argparse.Namespace) -> None:
                             print("OpenCV distortion coefficients:",
                                   intrinsics.distortion_coefficients, flush=True)
 
-                        display = (frame.pixels if args.headless and frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY
-                                   else prepare_detection_image(frame, args))
-                        # Keep mapped intensity recordings/HUD for both transport modes.
-                        intensity = (frame.pixels if frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY
-                                     else display.max(axis=2))
-                        if args.headless:
-                            analysis, cutoff, centers = detect_marker_centers(
-                                display, threshold_method, fixed_threshold, top_p,
-                                **_geometry_filter_kwargs(args))
-                        else:
-                            analysis_view, analysis, centers, cutoff = render_analysis(
-                                display, threshold_method, fixed_threshold, top_p,
-                                **_geometry_filter_kwargs(args))
-                        detect_ms = (time.perf_counter() - detection_start) * 1000.0
-
-                        estimate, pose_K = estimate_and_send_pose(
-                            tracker,
-                            centers,
-                            frame,
-                            intrinsics,
-                            pose_connection,
-                            depth_vertically_flipped=args.depth_vertically_flipped,
-                            convert_object_axes=args.convert_object_axes,
-                            detect_ms=detect_ms,
-                            recv_done=recv_done,
-                            clock_offset=clock_offset,
-                            max_processing_age_s=args.max_processing_age,
-                        )
+                        # One core for GUI, headless, recordings and the future native backend.
+                        if threshold_method != core.config.detection.threshold_method:
+                            core.config = replace(core.config, detection=replace(core.config.detection,
+                                threshold_method=threshold_method))
+                        config = core.config
+                        processing_start = time.perf_counter()
+                        result = core.process(frame, deadline=recv_done+args.max_processing_age)
+                        estimate = publish_pose_solution(result.solution, frame, pose_connection, tracker,
+                            detect_ms=result.timings.prepare_ms+result.timings.detect_ms,
+                            recv_done=recv_done, clock_offset=clock_offset,
+                            max_processing_age_s=args.max_processing_age)
+                        pose_K = result.solution.camera_matrix
+                        centers, cutoff = list(result.centers), result.cutoff
                         processed += 1
                         accepted += int(estimate.ok)
-                        pc_work_ms.append((time.perf_counter() - detection_start) * 1000.0)
-                        if args.headless:
+                        pc_work_ms.append((time.perf_counter()-detection_start)*1000.)
+                        t = result.timings
+                        core_samples.append(((processing_start-recv_done)*1000., t.prepare_ms,
+                                             t.detect_ms, t.pnp_ms, t.world_ms, t.total_ms))
+                        if args.headless or result.intensity is None:
                             continue
+                        # No BGR image, masked preview or overlay is built before pose publication.
+                        intensity = result.intensity
+                        display = (cv2.cvtColor(result.prepared_image, cv2.COLOR_GRAY2BGR)
+                                   if result.prepared_image.ndim == 2 else result.prepared_image)
+                        analysis = np.where((intensity >= cutoff)[..., None], display, 0).astype(np.uint8)
+                        analysis_view = analysis.copy()
                         projected = None
                         if pose_K is not None:
                             projected = project_model_points(
@@ -1042,42 +609,16 @@ def run(args: argparse.Namespace) -> None:
                                 # make sure the frames are in the correct order
                                 frames_to_load = sorted(frames_to_load, key=lambda x: int(x.stem.split("_")[1]))
                                 frames = []
-                                for frame in frames_to_load:
-                                    frames.append(np.load(frame))
+                                for saved_frame in frames_to_load:
+                                    frames.append(np.load(saved_frame))
                                 video_save_overlay(recording_dir, frames)
                                 recording_dir = None
                         if key == ord("f"):
                             threshold_method = "fixed"
-                            print("Analysis: fixed threshold", flush=True)
-                            analysis_view, analysis, centers, cutoff = render_analysis(
-                                display,
-                                threshold_method, fixed_threshold, top_p,
-                                **_geometry_filter_kwargs(args),
-                            )
-                            analysis_view, _, _ = prepare_display_view(
-                                analysis_view, centers, None, unflip=args.display_unflip
-                            )
-                            analysis_view = draw_analysis_hud(
-                                analysis_view,
-                                analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
-                            )
-                            cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis_view)
+                            print("Analysis: fixed threshold (next frame)", flush=True)
                         elif key == ord("p"):
                             threshold_method = "percentile"
-                            print("Analysis: percentile threshold", flush=True)
-                            analysis_view, analysis, centers, cutoff = render_analysis(
-                                display,
-                                threshold_method, fixed_threshold, top_p,
-                                **_geometry_filter_kwargs(args),
-                            )
-                            analysis_view, _, _ = prepare_display_view(
-                                analysis_view, centers, None, unflip=args.display_unflip
-                            )
-                            analysis_view = draw_analysis_hud(
-                                analysis_view,
-                                analysis_mode_label(threshold_method, fixed_threshold, top_p, cutoff),
-                            )
-                            cv2.imshow(ANALYSIS_WINDOW_TITLE, analysis_view)
+                            print("Analysis: percentile threshold (next frame)", flush=True)
                         elif key == ord("s"):
                             # prompt for save name
                             save_name = input("Enter save name: ")
@@ -1115,14 +656,19 @@ def run(args: argparse.Namespace) -> None:
                             # cv2.imwrite(str(recording_dir / "analysis" / f"analysis_{stem}.png"), analysis)
                             np.save(recording_dir / "centers" / f"centers_{stem}.npy", np.array(centers, dtype=np.float64))
                             # Keep exact capture time and camera extrinsics for motion-correct replay.
-                            metadata = dict(session_id=frame.session_id, capture_time_ns=frame.capture_time_ns,
+                            metadata = dict(recording_schema=2, tracking_config=asdict(config),
+                                            source_pixel_format=frame.pixel_format,
+                                            camera_intrinsics=asdict(intrinsics) if intrinsics else None,
+                                            tracking_lost_timeout=tracker.lost_timeout_s,
+                                            acquisition_timeout=tracker.acquisition_timeout_s,
+                                            session_id=frame.session_id, capture_time_ns=frame.capture_time_ns,
                                             observation_time=frame.observation_time,
                                             pnp_camera_matrix=pose_K.tolist() if pose_K is not None else None,
                                             sensor_position=frame.sensor_position.tolist(),
                                             sensor_rotation=frame.sensor_rotation.tolist(),
                                             depth_vertically_flipped=args.depth_vertically_flipped,
                                             convert_object_axes=args.convert_object_axes)
-                            (recording_dir / "centers" / f"centers_{stem}.json").write_text(json.dumps(metadata))
+                            (recording_dir / "centers" / f"centers_{stem}.json").write_text(json.dumps(metadata), encoding='utf-8')
                             recording_index += 1
 
         except (ConnectionError, OSError, ValueError) as error:
@@ -1144,9 +690,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1",
                         help="ML Wi-Fi IP, or 127.0.0.1 when using adb forward")
     parser.add_argument("--port", type=int, default=50777,
-                        help="DepthFrameTcpServer port (ML → PC)")
+                        help="DepthFrameTcpServer port (ML -> PC)")
     parser.add_argument("--pose-port", type=int, default=DEFAULT_POSE_PORT,
-                        help="PoseEstimateTcpServer port (PC → ML)")
+                        help="PoseEstimateTcpServer port (PC -> ML)")
     parser.add_argument("--headless", action="store_true",
                         help="Run detection and tracking without preview, overlays, or interactive recording")
     parser.add_argument("--diagnostics-interval", type=float, default=2.0,
@@ -1158,7 +704,7 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="ML streams flipped depth (shouldFlipTexture=true): adjust cy for PnP and "
-             "skip the OpenCV→Unity Y-flip (default: on). Required for correct motion direction.",
+             "skip the OpenCV->Unity Y-flip (default: on). Required for correct motion direction.",
     )
     parser.add_argument(
         "--display-unflip",
@@ -1192,8 +738,8 @@ def parse_args() -> argparse.Namespace:
                         help="Initial Analysis-window threshold mode (toggle with f/p)")
     parser.add_argument("--fixed-threshold", type=float, default=200.0,
                         help="Cutoff on colourised 0-255 intensity when mode is fixed")
-    parser.add_argument("--max-detected-markers", type=int, default=4,
-                        help="Maximum number of probe markers to detect and save per frame")
+    parser.add_argument("--max-detected-markers", type=int, default=MAX_DETECTED_MARKERS,
+                        help="Candidate pool before correspondence (default: 8, includes clutter)")
     parser.add_argument("--percentile", type=float, default=90.0,
                         help="Percentile of colourised intensity when mode is percentile")
     parser.add_argument("--percentile-floor", type=float, default=100.0,
@@ -1266,6 +812,10 @@ def parse_args() -> argparse.Namespace:
     for name in ("tracking_lost_timeout", "acquisition_timeout", "max_processing_age"):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive and finite")
+    try:
+        tracking_config_from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
     return args
 
 
