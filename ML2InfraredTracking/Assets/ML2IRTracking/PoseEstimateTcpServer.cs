@@ -19,7 +19,7 @@ using UnityEngine;
 ///   float  qx, qy, qz, qw       Unity world quaternion
 ///   float  detect_ms  PC marker detection duration (own clock, not synced to ML2)
 ///   float  pnp_ms     PC PnP solve duration
-///   float  send_ms    PC world-space transform + struct pack duration (excludes the sendall syscall)
+///   float  send_ms    PC world-pose preparation duration (serialization/send are in the return-leg estimate)
 ///   double pc_recv_ml2  PC depth-frame-received time, translated into ML2's clock domain
 ///   double pc_send_ml2  PC pose-about-to-send time, translated into ML2's clock domain
 ///
@@ -40,7 +40,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [SerializeField, Range(1, 65535)] private int port = 50778;
 
     [Header("Tool")]
-    [Tooltip("Optional. If empty, a TrackedTool root is created on the first accepted pose.")]
+    [Tooltip("Optional. If empty, a hidden TrackedTool root is prepared on the main thread before tracking.")]
     [SerializeField] private Transform trackedTool;
     [SerializeField, Min(0f)] private float minConfidence;
     [Tooltip("Ignore duplicate or older frame IDs. Keep enabled for live tracking.")]
@@ -48,7 +48,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [Tooltip("Maximum submit-to-apply age on ML2's own clock. Independent of capture cadence and tracking-loss hold.")]
     [SerializeField, Min(0.001f)] private float maxPoseAgeSeconds = 0.15f;
 
-    [Header("Marker visualization (created on first accepted pose)")]
+    [Header("Marker visualization (prepared hidden before tracking)")]
     [Tooltip("Spawn one sphere per model point (object-frame metres). The mounting surface is local Z = 0. Defaults match desktop TEST_MARKER_COORDS.")]
     [SerializeField] private bool createMarkerSpheresOnFirstPose = true;
     [SerializeField] private Vector3[] markerLocalPositions =
@@ -66,7 +66,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     [SerializeField] private bool showOnGuiOverlay = false;
 
     [Header("Apply")]
-    [Tooltip("0 = snap. Small values reduce jitter but add a little lag.")]
+    [Tooltip("Consume a fresh pose arriving after LateUpdate immediately before rendering. Main-thread only; logging is deferred to Update.")]
+    [SerializeField] private bool applyBeforeRender = true;
+    [Tooltip("1 = snap. Smaller fractions smooth each new pose but add lag; 0 holds the previous transform.")]
     [SerializeField, Range(0f, 1f)] private float rotationFollow = 1f;
     [SerializeField, Range(0f, 1f)] private float positionFollow = 1f;
     [SerializeField, Min(0f)] private float hideAfterNoPoseSeconds = 0.65f;
@@ -79,7 +81,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
     private readonly object _poseLock = new object();
     private bool _hasPending;
-    private ulong _pendingFrameId;
+    private ulong _pendingFrameId, _pendingSessionId;
     private bool _pendingOk;
     private float _pendingConfidence;
     private Vector3 _pendingPosition;
@@ -122,6 +124,50 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     private bool _markerVisualCreated;
     private double _lastAcceptedPoseTime = double.NegativeInfinity;
 
+    private bool _visualPrepared;
+    private string _displayedStatus;
+    private double _lastUpdateRealtime;
+    private long _lateUpdateApplied, _beforeRenderApplied, _diagnosticOverwritten;
+    private readonly TimingWindow _applyWait = new TimingWindow();
+    private readonly TimingWindow _applyWork = new TimingWindow();
+    private readonly TimingWindow _captureToReady = new TimingWindow();
+    private readonly TimingWindow _captureToBeforeRender = new TimingWindow();
+    private readonly TimingWindow _updateInterval = new TimingWindow();
+    private readonly TimingWindow _rawCopy = new TimingWindow();
+    private readonly AppliedPoseSample[] _appliedSamples = new AppliedPoseSample[32];
+    private int _sampleRead, _sampleCount;
+
+    private struct AppliedPoseSample
+    {
+        public ulong FrameId, SessionId;
+        public double Received, ApplyStarted, Applied;
+        public float DetectMs, PnpMs, WorldMs;
+        public double PcReceive, PcSend;
+        public bool BeforeRender;
+        public DepthFrameTcpServer.FrameTimingSnapshot Frame;
+    }
+
+    // Main-thread snapshot of the raw validated observation, independent of visual smoothing.
+    public struct AcceptedObservation
+    {
+        public ulong FrameId, SessionId;
+        public double CaptureTime, AppliedTime;
+        public Vector3 Position;
+        public Quaternion Rotation;
+        public float Confidence;
+    }
+    private AcceptedObservation _latestObservation;
+
+    public bool TryGetAcceptedObservation(out AcceptedObservation observation)
+    {
+        observation = _latestObservation;
+        var depth = DepthFrameTcpServer.ActiveServer;
+        double age = Time.realtimeSinceStartupAsDouble - observation.CaptureTime;
+        return isActiveAndEnabled && _clientConnected && _hasAppliedFrame && depth != null
+            && observation.SessionId != 0 && observation.SessionId == depth.SessionId
+            && !double.IsNaN(age) && !double.IsInfinity(age) && age >= 0 && age <= maxPoseAgeSeconds;
+    }
+
     public int Port => port;
     public string Status => _status;
 
@@ -136,13 +182,19 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         }
 
         ActiveServer = this;
-        Application.onBeforeRender += MeasureBeforeRender;
+        Application.onBeforeRender += ApplyAndMeasureBeforeRender;
         if (startAutomatically)
             StartServer();
     }
 
     private void Update()
     {
+        PrepareTrackedToolVisual();
+        double updateNow = Time.realtimeSinceStartupAsDouble;
+        if (logLatency && _lastUpdateRealtime > 0.0)
+            _updateInterval.Add((updateNow - _lastUpdateRealtime) * 1000.0);
+        _lastUpdateRealtime = updateNow;
+        FlushAppliedSamples();
         _updateTickCounter++;
         double nowUnscaled = Time.unscaledTimeAsDouble;
         if (_lastFpsSampleTime <= 0.0)
@@ -169,14 +221,27 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             }
         }
 
-        if (statusText != null)
+        if (statusText != null && _displayedStatus != _status)
+        {
             statusText.text = _status;
+            _displayedStatus = _status;
+        }
     }
 
     private void LateUpdate()
     {
+        PrepareTrackedToolVisual();
         TryApplyPendingPose();
         HideTrackedToolIfTimedOut();
+    }
+
+    private void PrepareTrackedToolVisual()
+    {
+        if (_visualPrepared && trackedTool != null) return;
+        // Instantiate/material setup is never allowed inside onBeforeRender.
+        EnsureTrackedToolVisual();
+        _visualPrepared = trackedTool != null;
+        if (_visualPrepared && !_hasAppliedFrame) trackedTool.gameObject.SetActive(false);
     }
 
     private void OnGUI()
@@ -189,7 +254,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
     private void OnDisable()
     {
-        Application.onBeforeRender -= MeasureBeforeRender;
+        Application.onBeforeRender -= ApplyAndMeasureBeforeRender;
         StopServer();
         if (ActiveServer == this)
             ActiveServer = null;
@@ -213,6 +278,9 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         _hasAppliedFrame = false;
         _stalePoseCount = 0;
         _lastAcceptedPoseTime = double.NegativeInfinity;
+        _lastUpdateRealtime = 0.0;
+        _lateUpdateApplied = _beforeRenderApplied = _diagnosticOverwritten = 0;
+        ResetTimingWindows();
         lock (_poseLock) _hasPending = false;
         _status = $"Starting pose server on {bindAddress}:{port}...";
         _serverThread = new Thread(ServerLoop)
@@ -227,9 +295,12 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     public void InvalidateTrackingSession()
     {
         lock (_poseLock) _hasPending = false;
+        _hasAppliedFrame = false;
+        _lastAppliedFrameId = 0;
         _lastAcceptedPoseTime = double.NegativeInfinity;
         _lastCaptureRealtime = double.NaN;
         _awaitingBeforeRender = false;
+        ResetTimingWindows();
         if (trackedTool != null) trackedTool.gameObject.SetActive(false);
     }
 
@@ -253,20 +324,24 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         lock (_poseLock) _hasPending = false;
         _lastAcceptedPoseTime = double.NegativeInfinity;
         if (trackedTool != null) trackedTool.gameObject.SetActive(false);
+        _awaitingBeforeRender = false;
+        _sampleCount = 0; _sampleRead = 0;
         _status = "Pose stream stopped";
     }
 
     public void SubmitPose(ulong frameId, bool ok, float confidence, in Vector3 position,
         in Quaternion rotation, float detectMs, float pnpMs, float sendMs,
-        double pcRecvMl2, double pcSendMl2)
+        double pcRecvMl2, double pcSendMl2, ulong sessionId = 0)
     {
         // realtimeSinceStartup is safe to read off the main thread; avoid Debug.Log here.
         double receivedRealtime = Time.realtimeSinceStartupAsDouble;
+        if (sessionId == 0) sessionId = DepthFrameTcpServer.ActiveServer?.SessionId ?? 0;
         lock (_poseLock)
         {
-            if (dropStaleFrames && _hasPending && frameId <= _pendingFrameId)
+            if (dropStaleFrames && _hasPending && sessionId == _pendingSessionId && frameId <= _pendingFrameId)
                 return;
             _pendingFrameId = frameId;
+            _pendingSessionId = sessionId;
             _pendingOk = ok;
             _pendingConfidence = confidence;
             _pendingPosition = position;
@@ -281,74 +356,107 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         }
     }
 
-    private void TryApplyPendingPose()
+    private void TryApplyPendingPose(bool beforeRender = false)
     {
-        ulong frameId;
+        if (!_visualPrepared || trackedTool == null) return;
+        ulong frameId, sessionId;
         bool ok;
         float confidence;
         Vector3 position;
         Quaternion rotation;
-        double receivedRealtime;
+        double receivedRealtime, pcRecvMl2, pcSendMl2;
         float detectMs, pnpMs, sendMs;
-        double pcRecvMl2, pcSendMl2;
-
-        lock (_poseLock)
+        var depthServer = DepthFrameTcpServer.ActiveServer;
+        DepthFrameTcpServer.FrameTimingSnapshot frame = default;
+        bool knownFrame = false, entered = false;
+        try
         {
-            if (!_hasPending)
-                return;
-
-            frameId = _pendingFrameId;
-            ok = _pendingOk;
-            confidence = _pendingConfidence;
-            position = _pendingPosition;
-            rotation = _pendingRotation;
+            if (beforeRender) entered = Monitor.TryEnter(_poseLock);
+            else Monitor.Enter(_poseLock, ref entered);
+            if (!entered || !_hasPending) return;
+            if (depthServer != null)
+                knownFrame = depthServer.TryGetFrameTimingSnapshot(_pendingFrameId, out frame, beforeRender);
+            // Leave the mailbox intact if the render path cannot get its timing
+            // snapshot immediately. LateUpdate remains the validation fallback.
+            if (beforeRender && !knownFrame) return;
+            frameId = _pendingFrameId; sessionId = _pendingSessionId;
+            ok = _pendingOk; confidence = _pendingConfidence;
+            position = _pendingPosition; rotation = _pendingRotation;
             receivedRealtime = _pendingReceivedRealtime;
-            detectMs = _pendingDetectMs;
-            pnpMs = _pendingPnpMs;
-            sendMs = _pendingSendMs;
-            pcRecvMl2 = _pendingPcRecvMl2;
-            pcSendMl2 = _pendingPcSendMl2;
+            detectMs = _pendingDetectMs; pnpMs = _pendingPnpMs; sendMs = _pendingSendMs;
+            pcRecvMl2 = _pendingPcRecvMl2; pcSendMl2 = _pendingPcSendMl2;
             _hasPending = false;
         }
+        finally { if (entered) Monitor.Exit(_poseLock); }
 
+        double applyStarted = Time.realtimeSinceStartupAsDouble;
+        // Recheck session at consumption, not only at socket receipt. An origin
+        // reset can occur between receipt validation and mailbox publication.
+        if (depthServer == null || sessionId == 0 || sessionId != depthServer.SessionId)
+        { Interlocked.Increment(ref _wrongSessionCount); return; }
         if (!ok || float.IsNaN(confidence) || float.IsInfinity(confidence) || confidence < minConfidence
-            || !IsFinitePose(position, rotation))
-            return;
-
-        var depthServer = DepthFrameTcpServer.ActiveServer;
-        double now = Time.realtimeSinceStartupAsDouble;
-        double submit = 0.0;
-        bool knownFrame = depthServer != null && depthServer.TryGetFrameTiming(frameId,
-            out submit, out _, out _, out _);
+            || !IsFinitePose(position, rotation)) return;
         if (!IsFreshPose(frameId, _hasAppliedFrame, _lastAppliedFrameId, dropStaleFrames,
-                         knownFrame, submit, now, maxPoseAgeSeconds))
-        {
-            _stalePoseCount++;
-            return;
-        }
+                         knownFrame, frame.Submit, applyStarted, maxPoseAgeSeconds))
+        { _stalePoseCount++; return; }
         rotation = rotation.normalized;
-
-        EnsureTrackedToolVisual();
-        if (trackedTool == null)
-            return;
-
-        trackedTool.gameObject.SetActive(true);
-        if (positionFollow >= 0.999f)
-            trackedTool.position = position;
-        else
-            trackedTool.position = Vector3.Lerp(trackedTool.position, position, positionFollow);
-
-        if (rotationFollow >= 0.999f)
-            trackedTool.rotation = rotation;
-        else
-            trackedTool.rotation = Quaternion.Slerp(trackedTool.rotation, rotation, rotationFollow);
-
-        _lastAppliedFrameId = frameId;
-        _hasAppliedFrame = true;
-        // Receipt of a delayed packet must not extend the lifetime of an old pose.
-        _lastAcceptedPoseTime = submit;
+        Vector3 appliedPosition = positionFollow >= 0.999f ? position :
+            Vector3.Lerp(trackedTool.position, position, positionFollow);
+        Quaternion appliedRotation = rotationFollow >= 0.999f ? rotation :
+            Quaternion.Slerp(trackedTool.rotation, rotation, rotationFollow);
+        // Set the pose before enabling a hidden model: OnEnable sees the new pose.
+        trackedTool.SetPositionAndRotation(appliedPosition, appliedRotation);
+        if (!trackedTool.gameObject.activeSelf) trackedTool.gameObject.SetActive(true);
+        double applied = Time.realtimeSinceStartupAsDouble;
+        _latestObservation = new AcceptedObservation { FrameId = frameId, SessionId = sessionId,
+            CaptureTime = frame.Capture.CaptureRealtime, AppliedTime = applied,
+            Position = position, Rotation = rotation, Confidence = confidence };
+        _lastAppliedFrameId = frameId; _hasAppliedFrame = true;
+        _lastAcceptedPoseTime = frame.Submit;
+        _lastApplyRealtime = applied; _lastCaptureRealtime = frame.Capture.CaptureRealtime;
         Interlocked.Increment(ref _appliedCount);
-        MaybeLogLatency(frameId, receivedRealtime, detectMs, pnpMs, sendMs, pcRecvMl2, pcSendMl2);
+        if (beforeRender) _beforeRenderApplied++; else _lateUpdateApplied++;
+        _awaitingBeforeRender = logLatency;
+        if (logLatency) QueueAppliedSample(new AppliedPoseSample
+        {
+            FrameId = frameId, SessionId = sessionId, Received = receivedRealtime,
+            ApplyStarted = applyStarted, Applied = applied, Frame = frame, BeforeRender = beforeRender,
+            DetectMs = detectMs, PnpMs = pnpMs, WorldMs = sendMs, PcReceive = pcRecvMl2, PcSend = pcSendMl2
+        });
+    }
+
+    private void QueueAppliedSample(AppliedPoseSample sample)
+    {
+        if (_sampleCount == _appliedSamples.Length)
+        {
+            _sampleRead = (_sampleRead + 1) % _appliedSamples.Length;
+            _sampleCount--; _diagnosticOverwritten++;
+        }
+        _appliedSamples[(_sampleRead + _sampleCount) % _appliedSamples.Length] = sample;
+        _sampleCount++;
+    }
+
+    private void FlushAppliedSamples()
+    {
+        // Main-thread Update only. Log formatting is deliberately outside render callbacks.
+        var depth = DepthFrameTcpServer.ActiveServer;
+        while (_sampleCount > 0)
+        {
+            var sample = _appliedSamples[_sampleRead];
+            _sampleRead = (_sampleRead + 1) % _appliedSamples.Length; _sampleCount--;
+            if (depth == null || sample.SessionId != depth.SessionId || !logLatency) continue;
+            var timing = sample.Frame.Capture;
+            _submitToApply.Add((sample.Applied - sample.Frame.Submit) * 1000.0);
+            _captureToApply.Add((sample.Applied - timing.CaptureRealtime) * 1000.0);
+            _captureToSubmit.Add((sample.Frame.Submit - timing.CaptureRealtime) * 1000.0);
+            _captureToReady.Add((timing.FrameReadyRealtime - timing.CaptureRealtime) * 1000.0);
+            _pollDuration.Add((timing.FrameReadyRealtime - timing.PollStartRealtime) * 1000.0);
+            _readyToSubmit.Add((sample.Frame.Submit - timing.FrameReadyRealtime) * 1000.0);
+            _rawCopy.Add((timing.RawCopyDoneRealtime - timing.RawCopyStartRealtime) * 1000.0);
+            _applyWait.Add((sample.ApplyStarted - sample.Received) * 1000.0);
+            _applyWork.Add((sample.Applied - sample.ApplyStarted) * 1000.0);
+            MaybeLogLatency(sample);
+        }
     }
 
     internal static bool IsFreshPose(ulong frameId, bool hasApplied, ulong lastApplied,
@@ -377,72 +485,58 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     /// The split's accuracy is bounded by the sync handshake's assumption of symmetric
     /// Wi-Fi latency (see the "Clock sync: ... sync_rtt=" line the desktop prints).
 
-    private void MaybeLogLatency(ulong frameId, double receivedRealtime,
-        float detectMs, float pnpMs, float sendMs, double pcRecvMl2, double pcSendMl2)
+    private void MaybeLogLatency(in AppliedPoseSample sample)
     {
-        if (!logLatency)
-            return;
-        _lastApplyRealtime = Time.realtimeSinceStartupAsDouble;
-        _awaitingBeforeRender = true;
-        var source = DepthFrameTcpServer.ActiveServer;
-        if (source != null && source.TryGetFrameTiming(frameId, out double submitted, out _, out _, out _))
-        {
-            _submitToApply.Add((_lastApplyRealtime - submitted) * 1000.0);
-            _lastCaptureRealtime = double.NaN;
-            if (source.TryGetCaptureTiming(frameId, out CaptureTiming timing))
-            {
-                _lastCaptureRealtime = timing.CaptureRealtime;
-                _captureToApply.Add((_lastApplyRealtime - timing.CaptureRealtime) * 1000.0);
-                _captureToSubmit.Add((submitted - timing.CaptureRealtime) * 1000.0);
-                _pollDuration.Add((timing.FrameReadyRealtime - timing.PollStartRealtime) * 1000.0);
-                _readyToSubmit.Add((submitted - timing.FrameReadyRealtime) * 1000.0);
-            }
-        }
-
         _latencyLogCounter++;
-        if (_latencyLogCounter % latencyLogEveryN != 0)
-            return;
-
-        double now = Time.realtimeSinceStartupAsDouble;
-        double applyWaitMs = (now - receivedRealtime) * 1000.0;
-
-        var depthServer = DepthFrameTcpServer.ActiveServer;
-        if (depthServer == null ||
-            !depthServer.TryGetFrameTiming(frameId, out double submit, out double sendDone,
-                out bool hasSend, out DepthFrameTcpServer.PipelineMode framePipeline))
+        if (_latencyLogCounter % Math.Max(1, latencyLogEveryN) != 0) return;
+        var frame = sample.Frame;
+        double total = (sample.Applied - frame.Submit) * 1000.0;
+        double wait = (sample.ApplyStarted - sample.Received) * 1000.0;
+        double work = (sample.Applied - sample.ApplyStarted) * 1000.0;
+        string phase = sample.BeforeRender ? "BeforeRender" : "LateUpdate";
+        if (!frame.HasSend)
         {
-            Debug.Log($"[ML2LAT] frame={frameId} apply_wait={applyWaitMs:F1}ms " +
-                      "(no matching depth submit time — is DepthFrameTcpServer active?)");
+            Debug.Log($"[ML2LAT] frame={sample.FrameId} phase={phase} submit_to_apply={total:F1}ms " +
+                $"apply_wait={wait:F1}ms apply_work={work:F2}ms (send time missing)");
             return;
         }
-
-        double submitToApplyMs = (now - submit) * 1000.0;
-        if (!hasSend)
-        {
-            Debug.Log($"[ML2LAT] frame={frameId} submit_to_apply={submitToApplyMs:F1}ms apply_wait={applyWaitMs:F1}ms " +
-                      "(send time missing)");
-            return;
-        }
-
-        double queueMs = (sendDone - submit) * 1000.0;
-        double leg1Ms = (pcRecvMl2 - sendDone) * 1000.0; // network: ML2 -> PC
-        double leg2Ms = (receivedRealtime - pcSendMl2) * 1000.0; // network: PC -> ML2
-        double measuredMs = queueMs + leg1Ms + detectMs + pnpMs + sendMs + leg2Ms + applyWaitMs;
-        double unaccountedMs = submitToApplyMs - measuredMs; // PC queue/omitted work; a constant clock offset cancels between leg1 and leg2
-        Debug.Log(
-            $"[ML2LAT] frame={frameId} pipeline={DepthFrameTcpServer.PipelineLabel(framePipeline)} " +
-            $"submit_to_apply={submitToApplyMs:F1}ms " +
-            $"(ml_prepare+queue+tcp_write={queueMs:F1}ms | leg1_estimate(ML2->PC)={leg1Ms:F1}ms | " +
-            $"detect={detectMs:F1}ms | pnp={pnpMs:F1}ms | pack={sendMs:F1}ms | " +
-            $"leg2_estimate(PC->ML2)={leg2Ms:F1}ms | apply_wait={applyWaitMs:F1}ms | " +
-            $"unaccounted={unaccountedMs:F1}ms | update_fps={_measuredUpdateFps:F1})");
+        double queue = (frame.SendDone - frame.Submit) * 1000.0;
+        double leg1 = (sample.PcReceive - frame.SendDone) * 1000.0;
+        double leg2 = (sample.Received - sample.PcSend) * 1000.0;
+        double remaining = total - (queue + leg1 + sample.DetectMs + sample.PnpMs +
+            sample.WorldMs + leg2 + wait + work);
+        var capture = frame.Capture;
+        Debug.Log($"[ML2LAT] frame={sample.FrameId} session={sample.SessionId} " +
+            $"pipeline={DepthFrameTcpServer.PipelineLabel(frame.Pipeline)} phase={phase} " +
+            $"submit_to_apply={total:F1}ms capture_to_apply={(sample.Applied-capture.CaptureRealtime)*1000.0:F1}ms " +
+            $"(ml_prepare+queue+tcp_write={queue:F1}ms | leg1_estimate(ML2->PC)={leg1:F1}ms | " +
+            $"detect={sample.DetectMs:F1}ms | pnp={sample.PnpMs:F1}ms | pack={sample.WorldMs:F1}ms | " +
+            $"leg2_estimate(PC->ML2)={leg2:F1}ms | apply_wait={wait:F1}ms | apply_work={work:F2}ms | " +
+            $"unaccounted={remaining:F1}ms | update_fps={_measuredUpdateFps:F1}) " +
+            $"capture_to_ready={(capture.FrameReadyRealtime-capture.CaptureRealtime)*1000.0:F1}ms " +
+            $"ready_to_submit={(frame.Submit-capture.FrameReadyRealtime)*1000.0:F1}ms");
     }
 
-    private void MeasureBeforeRender()
+    private void ApplyAndMeasureBeforeRender()
     {
+        if (!isActiveAndEnabled) return;
+        if (applyBeforeRender) TryApplyPendingPose(true);
+        HideTrackedToolIfTimedOut();
         if (!logLatency || !_awaitingBeforeRender) return;
-        _applyToBeforeRender.Add((Time.realtimeSinceStartupAsDouble - _lastApplyRealtime) * 1000.0);
+        double now = Time.realtimeSinceStartupAsDouble;
+        _applyToBeforeRender.Add((now - _lastApplyRealtime) * 1000.0);
+        _captureToBeforeRender.Add((now - _lastCaptureRealtime) * 1000.0);
         _awaitingBeforeRender = false;
+    }
+
+    private void ResetTimingWindows()
+    {
+        _sampleRead = _sampleCount = 0;
+        _submitToApply.Clear(); _captureToApply.Clear(); _captureToSubmit.Clear();
+        _pollDuration.Clear(); _readyToSubmit.Clear(); _applyToBeforeRender.Clear();
+        _applyWait.Clear(); _applyWork.Clear(); _captureToReady.Clear();
+        _captureToBeforeRender.Clear(); _updateInterval.Clear(); _rawCopy.Clear();
+        _timingSessionId = DepthFrameTcpServer.ActiveServer?.SessionId ?? 0;
     }
 
     private void LogTimingSummary()
@@ -454,8 +548,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
         if (depth != null && _timingSessionId != depth.SessionId)
         {
             _timingSessionId = depth.SessionId;
-            _submitToApply.Clear(); _captureToApply.Clear(); _captureToSubmit.Clear();
-            _pollDuration.Clear(); _readyToSubmit.Clear(); _applyToBeforeRender.Clear();
+            ResetTimingWindows();
         }
         string displayedAge = trackedTool != null && trackedTool.gameObject.activeSelf
             ? ((now - _lastAcceptedPoseTime) * 1000.0).ToString("F1") : "hidden";
@@ -468,8 +561,12 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
                 ? "unavailable" : ((now - _lastCaptureRealtime) * 1000.0).ToString("F1")) + " " +
             $"submit_to_apply={_submitToApply.Summary()} capture_to_apply={_captureToApply.Summary()} " +
             $"capture_to_submit={_captureToSubmit.Summary()} sdk_poll={_pollDuration.Summary()} " +
-            $"ready_to_submit={_readyToSubmit.Summary()} apply_to_before_render={_applyToBeforeRender.Summary()} " +
-            "presentation=unmeasured (rolling last 256 accepted samples, ms p50/p95/p99)");
+            $"capture_to_ready={_captureToReady.Summary()} ready_to_submit={_readyToSubmit.Summary()} raw_copy={_rawCopy.Summary()} " +
+            $"apply_wait={_applyWait.Summary()} apply_work={_applyWork.Summary()} " +
+            $"apply_to_before_render={_applyToBeforeRender.Summary()} capture_to_before_render={_captureToBeforeRender.Summary()} " +
+            $"update_interval={_updateInterval.Summary()} applied_late={_lateUpdateApplied} applied_before_render={_beforeRenderApplied} " +
+            $"diagnostic_overwritten={_diagnosticOverwritten} before_render_enabled={applyBeforeRender} " +
+            "presentation=unmeasured (rolling ms p50/p95/p99; per-series counts, at most 256)");
     }
 
     private void HideTrackedToolIfTimedOut()
@@ -483,7 +580,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 
 
     /// Creates a TrackedTool root (if needed) and child spheres at each model marker
-    /// the first time a pose is accepted. Sphere local positions are the 3D constellation
+    /// outside the render callback. Sphere local positions are the 3D constellation
     /// points used by PnP — once the root is posed, they sit on the physical markers.
 
     private void EnsureTrackedToolVisual()
@@ -608,6 +705,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
     {
         using NetworkStream stream = client.GetStream();
         byte[] packet = new byte[PacketSize];
+        byte[] sessionBytes = new byte[8];
 
         while (_running && client.Connected)
         {
@@ -631,7 +729,6 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             ulong sessionId = 0;
             if (BitConverter.ToUInt16(packet, 4) == 4)
             {
-                byte[] sessionBytes = new byte[8];
                 if (!ReadExact(stream, sessionBytes, 8)) return;
                 sessionId = BitConverter.ToUInt64(sessionBytes, 0);
             }
@@ -642,7 +739,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             if (!ok) Interlocked.Increment(ref _rejectedPoseCount);
             depth.RecordPoseReceived(frameId);
             SubmitPose(frameId, ok, confidence, position, rotation, detectMs, pnpMs, sendMs,
-                pcRecvMl2, pcSendMl2);
+                pcRecvMl2, pcSendMl2, sessionId);
         }
     }
 
@@ -759,6 +856,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
 internal sealed class TimingWindow
 {
     private readonly double[] values = new double[256];
+    private readonly double[] sorted = new double[256];
     private int count, next;
     public void Clear() { count = 0; next = 0; }
     public void Add(double milliseconds)
@@ -770,9 +868,14 @@ internal sealed class TimingWindow
     internal double Percentile(double fraction)
     {
         if (count == 0) return double.NaN;
-        var sorted = new double[count]; Array.Copy(values, sorted, count); Array.Sort(sorted);
+        Array.Copy(values, sorted, count); Array.Sort(sorted, 0, count);
         return sorted[Math.Max(0, Math.Min(count - 1, (int)Math.Ceiling(fraction * count) - 1))];
     }
-    public string Summary() => count == 0 ? "unavailable(n=0)" :
-        $"{Percentile(.50):F1}/{Percentile(.95):F1}/{Percentile(.99):F1}(n={count})";
+    public string Summary()
+    {
+        if (count == 0) return "unavailable(n=0)";
+        Array.Copy(values, sorted, count); Array.Sort(sorted, 0, count);
+        return $"{sorted[(int)Math.Ceiling(.50 * count)-1]:F1}/" +
+            $"{sorted[(int)Math.Ceiling(.95 * count)-1]:F1}/{sorted[(int)Math.Ceiling(.99 * count)-1]:F1}(n={count})";
+    }
 }

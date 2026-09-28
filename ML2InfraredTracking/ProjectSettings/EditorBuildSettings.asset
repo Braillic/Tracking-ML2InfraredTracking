@@ -17,9 +17,12 @@ EditorBuildSettings:
   - enabled: 0
     path: Assets/Scenes/OptiTracking.unity
     guid: b5c5021403d4eae40a0180a49024ce98
-  - enabled: 1
+  - enabled: 0
     path: Assets/Scenes/IRtoolTracking_demo.unity
     guid: 12a53e1320ed96a4897ee3724988262d
+  - enabled: 1
+    path: Assets/Scenes/ProbeSurfaceTracing_demo.unity
+    guid: 127597163fb246c7b64b067aa7152143
   m_configObjects:
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: bb4daeceea261404d9e9069323220d1b,
       type: 3}

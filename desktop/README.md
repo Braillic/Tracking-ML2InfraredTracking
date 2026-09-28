@@ -1,5 +1,16 @@
 # Magic Leap 2 depth receiver
 
+## ML2 capture/application update
+
+The Unity application can now consume newly arrived poses just before rendering,
+while retaining LateUpdate. Capture submission precedes optional ML2 preview
+uploads, and the sender preserves its pacing through frame-loop jitter. New
+`[ML2Capture]` diagnostics and the split `apply_wait` / `apply_work` measurements
+identify capture delivery, preparation and application costs. These Unity changes
+require an APK rebuild; the existing Python receiver and wire protocol remain
+compatible. See [ML2 capture and application](ML2_CAPTURE_APPLY.md) for exact
+timing boundaries, switches and device A/B validation.
+
 ## Shared tracking core
 
 Live TCP and offline image replay now use `TrackingPipeline.process()` in

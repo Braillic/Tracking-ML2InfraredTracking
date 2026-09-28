@@ -1,5 +1,5 @@
 {
-    "m_SelectedDeviceId": "G572XT10010R",
+    "m_SelectedDeviceId": "GB62XT00008P",
     "m_SelectedProcess": {
         "deviceId": "",
         "name": "",
@@ -137,61 +137,31 @@
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
-            "processId": 29586,
-            "exited": true
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 22906,
-            "exited": true
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 32252,
-            "exited": true
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 14010,
-            "exited": true
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 7867,
-            "exited": false
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
-            "processId": 24781,
-            "exited": false
-        },
-        {
-            "deviceId": "GB62XT00008P",
-            "name": "com.braillic.depthstreaming",
             "processId": 30566,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
             "processId": 8951,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
             "processId": 7378,
-            "exited": false
+            "exited": true
         },
         {
             "deviceId": "GB62XT00008P",
             "name": "com.braillic.depthstreaming",
             "processId": 14284,
+            "exited": true
+        },
+        {
+            "deviceId": "GB62XT00008P",
+            "name": "com.magicleap.homemenu",
+            "processId": 5501,
             "exited": false
         },
         {
@@ -257,7 +227,7 @@
         "AutoCapture": true
     },
     "m_FilterOptions": {
-        "m_Filter": "e2e",
+        "m_Filter": "ML2",
         "m_UseRegularExpressions": false,
         "m_MatchCase": false
     },

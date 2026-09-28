@@ -1,5 +1,6 @@
 """Coordinate transforms shared by the tracking core and adapters; no transport."""
 from __future__ import annotations
+
 import cv2
 import numpy as np
 from tracking_types import CameraIntrinsics

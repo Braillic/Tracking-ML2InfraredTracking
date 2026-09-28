@@ -1,6 +1,7 @@
 param(
     [string]$SourceRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'ML2InfraredTracking'),
-    [string]$Python = ''
+    [string]$Python = '',
+    [string]$DesktopRoot = ''
 )
 $ErrorActionPreference = 'Stop'
 function Method([string]$Source, [string]$Signature) {
@@ -20,7 +21,8 @@ function Method([string]$Source, [string]$Signature) {
 $depth = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/DepthFrameTcpServer.cs')
 $raw = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/ML2DepthRawStream.cs')
 $pose = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/PoseEstimateTcpServer.cs')
-$methods = @('public void BeginCaptureEpoch(', 'public bool CanSubmitFrame(', 'public void SubmitFrame(', 'internal static void ConvertRawToUInt8Srgb(',
+$methods = @('public void BeginCaptureEpoch(', 'public bool CanSubmitFrame(', 'internal static double AdvanceSubmitDeadline(',
+             'public bool TryGetFrameTimingSnapshot(', 'public struct FrameTimingSnapshot', 'private void RecordLatencySubmit(', 'public void SubmitFrame(', 'internal static void ConvertRawToUInt8Srgb(',
              'private static void WriteHeader(') | ForEach-Object { Method $depth $_ }
 $harness = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'PipelineHarness.cs')
 $harness = $harness.Replace('__DEPTH__', ($methods -join "`n"))
@@ -34,7 +36,8 @@ New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
 try {
     [PipelineChecks]::Run($fixtureDirectory)
     if (!$Python) { $Python = Join-Path (Split-Path -Parent $SourceRoot) '.venv/Scripts/python.exe' }
-    & $Python -B (Join-Path $PSScriptRoot 'verify_wire.py') (Join-Path (Split-Path -Parent $SourceRoot) 'desktop') $fixtureDirectory
+    if (!$DesktopRoot) { $DesktopRoot = Join-Path (Split-Path -Parent $SourceRoot) 'desktop' }
+    & $Python -B (Join-Path $PSScriptRoot 'verify_wire.py') $DesktopRoot $fixtureDirectory
     if ($LASTEXITCODE -ne 0) { throw 'Cross-language wire checks failed' }
 } finally {
     # Delete only the two explicitly named test fixtures and their empty temporary directory.

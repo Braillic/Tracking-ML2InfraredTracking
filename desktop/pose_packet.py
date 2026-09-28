@@ -10,10 +10,14 @@ import struct
 import time
 from dataclasses import dataclass
 
-from pose_geometry import (rotation_matrix_to_quaternion_xyzw,
-    opencv_rvec_tvec_to_cam_T_object, camera_matrix_for_vertically_flipped_image,
-    unity_trs_matrix, opencv_camera_pose_to_unity_world)
 import numpy as np
+from pose_geometry import (
+    camera_matrix_for_vertically_flipped_image,
+    opencv_camera_pose_to_unity_world,
+    opencv_rvec_tvec_to_cam_T_object,
+    rotation_matrix_to_quaternion_xyzw,
+    unity_trs_matrix,
+)
 
 POSE_MAGIC = b"ML2P"
 POSE_PROTOCOL_VERSION = 3

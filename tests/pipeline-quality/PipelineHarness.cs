@@ -52,7 +52,13 @@ public class SenderHarness {
     public long _overwrittenFrames,_submittedFrameCount,_rateDroppedFrames;
     public PipelineMode pipelineMode=PipelineMode.Ml2UInt8,_pendingPipeline,_lastSubmittedPipeline;
     public static string PipelineLabel(PipelineMode p)=>p.ToString();
-    public void RecordLatencySubmit(ulong id,double time,PipelineMode mode,CaptureTiming timing) {}
+    public ulong[] _latencyFrameIds=new ulong[LatencyRingSize];
+    public double[] _latencySendDoneRealtime=new double[LatencyRingSize];
+    public bool[] _latencyHasSend=new bool[LatencyRingSize];
+    public CaptureTiming[] _captureTimings=new CaptureTiming[LatencyRingSize];
+    public PipelineMode[] _latencyPipelines=new PipelineMode[LatencyRingSize];
+    public int _latencyWriteIndex;
+
     public float[] LeasePending() {lock(_frameLock){var result=_pendingRaw; _pendingRaw=null; return result;} }
     public static byte[] Header(PipelineMode mode,int bytes,CaptureTiming timing) {
         var data=new byte[HeaderSize]; WriteHeader(data,3,1,mode,bytes,7,123,Pose.identity,0,99,timing); return data;
@@ -89,6 +95,17 @@ public static class PipelineChecks {
         var sender=new SenderHarness(); var input=new float[]{5,123,3000};
         var timing=new CaptureTiming(1234567890123456,4.1,4.11,4.12);
         sender.SubmitFrame(input,3,1,Pose.identity,null,timing);
+        Check(sender.TryGetFrameTimingSnapshot(0,out var snapshot) && snapshot.Submit==1 && snapshot.SessionId==99,
+              "snapshot atomically retains frame identity and submission");
+        Check(snapshot.Capture.XrNanoseconds==1234567890123456 && !snapshot.HasSend,
+              "snapshot carries capture timing without inventing send completion");
+        Check(!sender.TryGetFrameTimingSnapshot(999,out _), "unknown snapshot fails closed");
+        using(var held=new ManualResetEventSlim()) using(var release=new ManualResetEventSlim()) {
+            var worker=new Thread(()=>{lock(sender._latencyLock){held.Set();release.Wait(3000);}});
+            worker.Start(); Check(held.Wait(1000),"timing contention fixture acquired lock");
+            try { Check(!sender.TryGetFrameTimingSnapshot(0,out _,true),"render snapshot does not wait on timing lock"); }
+            finally {release.Set();worker.Join();}
+        }
         var lease=sender.LeasePending(); input[1]=999;
         Check(lease[1]==123,"producer input may be reused after submit");
         for(int i=0;i<100;i++){input[1]=i; sender.SubmitFrame(input,3,1,Pose.identity,null,timing);}
@@ -105,6 +122,20 @@ public static class PipelineChecks {
         Check(!sender.CanSubmitFrame(),"disconnected frame preparation skipped");
         sender._clientConnected=true;sender.maximumFramesPerSecond=30;sender._nextSubmitTime=2;
         Check(!sender.CanSubmitFrame(),"rate-limited preparation skipped");
+        double deadline=0, legacyDeadline=0;
+        int paced=0,legacy=0;
+        for(int i=0;i<600;i++) {
+            double now=1+i/60.0+(i%3)*0.00015;
+            if(now>=deadline){paced++;deadline=SenderHarness.AdvanceSubmitDeadline(now,deadline,30);}
+            if(now>=legacyDeadline){legacy++;legacyDeadline=now+1.0/30;}
+        }
+        Check(paced>=298 && paced<=301 && legacy<paced,"30 Hz pacing survives a jittered 60 Hz producer without drift");
+        Check(Math.Abs(SenderHarness.AdvanceSubmitDeadline(10,1,30)-(10+1.0/30))<1e-10,
+              "long stalls discard missed slots instead of scheduling catch-up bursts");
+        Check(SenderHarness.AdvanceSubmitDeadline(10,0,0)==0,"unlimited rate retains no deadline");
+        var localTiming=new CaptureTiming(100,1,1.01,1.02,1.021,1.022,1.023);
+        Check(localTiming.RawCopyDoneRealtime==1.023 && localTiming.ProcessStartRealtime==1.021,
+              "local preparation timing remains separate from wire timestamps");
         Check(Math.Abs(ClockHarness.Map(9900000000,10000000000,5,5.001)-4.9005)<1e-10,"XR/system/Unity clock bridge");
         Check(double.IsNaN(ClockHarness.Map(0,100,1,1)),"failed XR conversion stays unavailable");
         Check(double.IsNaN(ClockHarness.Map(200,100,1,1)),"future capture cannot produce negative age");

@@ -35,7 +35,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     [Tooltip("Use 0.0.0.0 for Wi-Fi and adb forwarding. Use 127.0.0.1 for adb-only access.")]
     [SerializeField] private string bindAddress = "0.0.0.0";
     [SerializeField, Range(1, 65535)] private int port = 50777;
-    [Tooltip("0 sends every frame. A lower rate is often more reliable over Wi-Fi.")]
+    [Tooltip("0 sends every frame. Otherwise pace the average send rate; small frame-timing jitter may produce shorter individual intervals.")]
     [SerializeField, Min(0)] private float maximumFramesPerSecond = 15f;
 
     [Header("Processing pipeline")]
@@ -85,6 +85,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     private volatile string _remoteEndpoint;
     private volatile string _status = "Depth stream stopped";
     private string _sensorInfo;
+    private string _displayedStatus, _displayedSensorInfo;
     private Pose _statusPose;
     private DepthCameraIntrinsics? _statusIntrinsics;
     private long _submittedFrameCount;
@@ -181,6 +182,42 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         timing = default; return false;
     }
 
+    public bool TryGetFrameTimingSnapshot(ulong frameId, out FrameTimingSnapshot snapshot,
+        bool nonBlocking = false)
+    {
+        snapshot = default;
+        bool entered = false;
+        try
+        {
+            if (nonBlocking) entered = Monitor.TryEnter(_latencyLock);
+            else Monitor.Enter(_latencyLock, ref entered);
+            if (!entered) return false;
+            for (int n = 0; n < LatencyRingSize; n++)
+            {
+                int i = (_latencyWriteIndex - 1 - n + LatencyRingSize) % LatencyRingSize;
+                if (_latencyFrameIds[i] != frameId || _latencySubmitRealtime[i] <= 0.0) continue;
+                snapshot = new FrameTimingSnapshot
+                {
+                    SessionId = SessionId, Submit = _latencySubmitRealtime[i],
+                    SendDone = _latencySendDoneRealtime[i], HasSend = _latencyHasSend[i],
+                    Pipeline = _latencyPipelines[i], Capture = _captureTimings[i]
+                };
+                return true;
+            }
+        }
+        finally { if (entered) Monitor.Exit(_latencyLock); }
+        return false;
+    }
+
+    public struct FrameTimingSnapshot
+    {
+        public ulong SessionId;
+        public double Submit, SendDone;
+        public bool HasSend;
+        public PipelineMode Pipeline;
+        public CaptureTiming Capture;
+    }
+
     private void RecordLatencySubmit(ulong frameId, double submitRealtime, PipelineMode framePipeline,
         CaptureTiming timing)
     {
@@ -252,12 +289,14 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
                 Debug.Log($"[ML2Latency] send_done_to_pose_received last {count}: avg {avgMs:F1} ms, max {maxMs:F1} ms");
         }
 
-        if (statusText != null)
-            statusText.text = sensorInfoText == null && !string.IsNullOrEmpty(_sensorInfo)
-                ? $"{_status}\n{_sensorInfo}"
-                : _status;
-        if (sensorInfoText != null)
-            sensorInfoText.text = _sensorInfo;
+        if (_displayedStatus != _status || _displayedSensorInfo != _sensorInfo)
+        {
+            if (statusText != null)
+                statusText.text = sensorInfoText == null && !string.IsNullOrEmpty(_sensorInfo)
+                    ? $"{_status}\n{_sensorInfo}" : _status;
+            if (sensorInfoText != null) sensorInfoText.text = _sensorInfo;
+            _displayedStatus = _status; _displayedSensorInfo = _sensorInfo;
+        }
     }
 
     private void OnGUI()
@@ -371,6 +410,16 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         return true;
     }
 
+    internal static double AdvanceSubmitDeadline(double now, double previous, float rate)
+    {
+        if (!(rate > 0f) || float.IsInfinity(rate)) return 0.0;
+        double period = 1.0 / rate;
+        double next = previous > 0.0 ? previous + period : now + period;
+        // Keep cadence through small polling jitter. After a stall, discard missed
+        // slots rather than scheduling a burst to repay accumulated time.
+        return next > now ? next : now + period;
+    }
+
     public void SubmitFrame(float[] depthMetres, int width, int height, in Pose sensorPose,
         DepthCameraIntrinsics? intrinsics, CaptureTiming timing)
     {
@@ -401,7 +450,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         if (maximumFramesPerSecond > 0f && now < _nextSubmitTime)
             return;
         if (maximumFramesPerSecond > 0f)
-            _nextSubmitTime = now + 1.0 / maximumFramesPerSecond;
+            _nextSubmitTime = AdvanceSubmitDeadline(now, _nextSubmitTime, maximumFramesPerSecond);
 
         float[] raw;
         lock (_frameLock)

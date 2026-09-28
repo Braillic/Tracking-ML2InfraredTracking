@@ -3276,9 +3276,6 @@ MonoBehaviour:
         type: 2}
   depthTcpServer: {fileID: 1591841590}
   sensorPoseDebugger: {fileID: 1591841592}
-  enablePreview: 1
-  previewIntervalSeconds: 0.1
-  logCaptureTiming: 1
 --- !u!114 &1591841589
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -3898,6 +3895,69 @@ Transform:
   m_Children: []
   m_Father: {fileID: 543450652765866433}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!1 &9009001000
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 9009001001}
+  - component: {fileID: 9009001002}
+  - component: {fileID: 9009001003}
+  m_Layer: 0
+  m_Name: Probe Surface Tracing
+  m_TagString: Untagged
+  m_IsActive: 1
+--- !u!4 &9009001001
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9009001000}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_Children: []
+  m_Father: {fileID: 0}
+--- !u!114 &9009001002
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9009001000}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a0ab6d01e34d49de8b7e1e426cb7edcd, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  tipOffsetMetres: {x: 0, y: 0, z: 0.15}
+  tipDirectionChecked: 0
+  spacingMetres: 0.002
+  maximumGapSeconds: 0.12
+  maximumStepMetres: 0.03
+  maximumCaptureAgeSeconds: 0.15
+  maximumPoints: 3000
+  lineWidthMetres: 0.001
+  traceColor: {r: 0.05, g: 1, b: 0.25, a: 1}
+  traceMaterial: {fileID: 2100000, guid: 98f7fb394d41471aafad28984934af88, type: 2}
+--- !u!114 &9009001003
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 9009001000}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: fc3e97482e014d92a80fa4369fde92e5, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  showPanel: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
@@ -3909,3 +3969,4 @@ SceneRoots:
   - {fileID: 1887860339}
   - {fileID: 1591841584}
   - {fileID: 1284956414}
+  - {fileID: 9009001001}

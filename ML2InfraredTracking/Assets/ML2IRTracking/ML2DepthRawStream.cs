@@ -49,6 +49,15 @@ public class ML2DepthRawStream : MonoBehaviour
     [SerializeField] private bool enablePreview = true;
     [SerializeField, Min(0.01f)] private float previewIntervalSeconds = 0.1f;
     private double _nextPreviewTime;
+    [SerializeField] private bool logCaptureTiming = true;
+    private double _nextCaptureSummary;
+    private ulong _captureTimingSession;
+    private readonly TimingWindow _captureToReady = new TimingWindow();
+    private readonly TimingWindow _sdkPoll = new TimingWindow();
+    private readonly TimingWindow _poseLookup = new TimingWindow();
+    private readonly TimingWindow _rawCopy = new TimingWindow();
+    private readonly TimingWindow _previewUpload = new TimingWindow();
+
     Texture2D targetTexture, filteredTexture;
 
     private float[] _floatBuffer;                        // CPU-side float[] depth map (meters) 
@@ -207,62 +216,64 @@ public class ML2DepthRawStream : MonoBehaviour
     public void ProcessFrame(in PixelSensorFrame frame, in PixelSensorMetaData[] metaData, in Pose sensorPose,
         double pollStart = 0.0, double frameReady = 0.0)
     {
-        if (!frame.IsValid || frame.Planes.Length == 0) return;
-        if (frame.FrameType != PixelSensorFrameType.DepthRaw) return;
-
-        var frameType = frame.FrameType;
+        if (!frame.IsValid || frame.Planes.Length == 0 || frame.FrameType != PixelSensorFrameType.DepthRaw) return;
+        double processStart = Time.realtimeSinceStartupAsDouble;
+        double captureRealtime = CaptureClock.TryMapToUnity(frame.CaptureTime);
+        ulong session = depthTcpServer != null ? depthTcpServer.SessionId : 0;
+        if (session != _captureTimingSession)
+        {
+            _captureTimingSession = session;
+            _captureToReady.Clear(); _sdkPoll.Clear(); _poseLookup.Clear();
+            _rawCopy.Clear(); _previewUpload.Clear();
+        }
+        if (logCaptureTiming)
+        {
+            _captureToReady.Add((frameReady - captureRealtime) * 1000.0);
+            _sdkPoll.Add((frameReady - pollStart) * 1000.0);
+            _poseLookup.Add((processStart - frameReady) * 1000.0);
+        }
         var firstPlane = frame.Planes[0];
-        int w = (int)firstPlane.Width;
-        int h = (int)firstPlane.Height;
-
-        // Preview is independently throttled and performs no GPU upload without a renderer.
+        int w = (int)firstPlane.Width, h = (int)firstPlane.Height;
+        CaptureIntrinsicsOnce(metaData);
+        if (depthTcpServer != null && depthTcpServer.CanSubmitFrame())
+        {
+            double copyStart = Time.realtimeSinceStartupAsDouble;
+            // SDK memory is temporary. Retain the ownership-safe copy before returning.
+            var depthData = GetRawDepthData(in frame, ref _floatBuffer);
+            double copyDone = Time.realtimeSinceStartupAsDouble;
+            if (logCaptureTiming) _rawCopy.Add((copyDone - copyStart) * 1000.0);
+            if (depthData != null)
+            {
+                var timing = new CaptureTiming(frame.CaptureTime, captureRealtime, pollStart,
+                    frameReady, processStart, copyStart, copyDone);
+                depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics, timing);
+                if (sensorPoseDebugger != null)
+                    sensorPoseDebugger.SubmitFrameSynced(sensorPose, intrinsics, w, h);
+            }
+        }
+        // Publish to the tracking sender before optional GPU/preview work.
         double now = Time.realtimeSinceStartupAsDouble;
         if (enablePreview && targetRenderer != null && now >= _nextPreviewTime)
         {
-            Utils.EnsureTargetTexture(ref targetTexture, frameType, w, h);
-            Utils.UploadMainTexture(frameType, ref firstPlane, targetTexture);
+            Utils.EnsureTargetTexture(ref targetTexture, frame.FrameType, w, h);
+            Utils.UploadMainTexture(frame.FrameType, ref firstPlane, targetTexture);
             targetRenderer.material.mainTexture = targetTexture;
             _nextPreviewTime = now + previewIntervalSeconds;
-        }
-
-        switch (frameType)
-        {
-            case PixelSensorFrameType.DepthRaw:
-                {
-                    CaptureIntrinsicsOnce(metaData);
-
-                    // Avoid full-frame CPU preparation for disconnected/rate-limited transport.
-                    if (depthTcpServer == null || !depthTcpServer.CanSubmitFrame()) return;
-                    var timing = new CaptureTiming(frame.CaptureTime,
-                        CaptureClock.TryMapToUnity(frame.CaptureTime), pollStart, frameReady);
-                    // Copy before the SDK's temporary native frame storage expires.
-                    var depthData = GetRawDepthData(in frame, ref _floatBuffer);
-                    if (depthData == null) return;
-
-                    // var detection = markerDetector.Detect(depthData, w, h);
-
-                    // Debug.Log(
-                    //     $"[MarkerDetector] Found {detection.centers.Count} markers"
-                    // );
-
-                    depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics, timing);
-                    if (sensorPoseDebugger != null)
-                        sensorPoseDebugger.SubmitFrameSynced(sensorPose, intrinsics, w, h);
-
-
-
-                    //Matrix4x4 worldTsensor = Matrix4x4.TRS(sensorPose.position, sensorPose.rotation, Vector3.one);
-                }
-                break;
-            default:
-                Debug.LogWarning($"[ML2Tracking] Unsupported frame type: {frameType}");
-                break;
+            if (logCaptureTiming) _previewUpload.Add((Time.realtimeSinceStartupAsDouble - now) * 1000.0);
         }
     }
 
     private void Update()
     {
+        double now = Time.realtimeSinceStartupAsDouble;
+        if (!logCaptureTiming || now < _nextCaptureSummary) return;
+        _nextCaptureSummary = now + 2.0;
+        Debug.Log($"[ML2Capture] session={_captureTimingSession} capture_to_ready={_captureToReady.Summary()} " +
+            $"sdk_poll={_sdkPoll.Summary()} pose_lookup={_poseLookup.Summary()} " +
+            $"raw_copy={_rawCopy.Summary()} preview_upload={_previewUpload.Summary()} preview_enabled={enablePreview} " +
+            "(rolling ms p50/p95/p99; delivered pose-resolved frames, copy/preview only when performed)");
     }
+
 }
 
 
@@ -270,10 +281,14 @@ public readonly struct CaptureTiming
 {
     public readonly long XrNanoseconds;
     public readonly double CaptureRealtime, PollStartRealtime, FrameReadyRealtime;
-    public CaptureTiming(long xrNanoseconds, double captureRealtime, double pollStart, double frameReady)
+    // Local-only preparation timestamps; the v5 wire header remains unchanged.
+    public readonly double ProcessStartRealtime, RawCopyStartRealtime, RawCopyDoneRealtime;
+    public CaptureTiming(long xrNanoseconds, double captureRealtime, double pollStart, double frameReady,
+        double processStart = double.NaN, double rawCopyStart = double.NaN, double rawCopyDone = double.NaN)
     {
         XrNanoseconds = xrNanoseconds; CaptureRealtime = captureRealtime;
         PollStartRealtime = pollStart; FrameReadyRealtime = frameReady;
+        ProcessStartRealtime = processStart; RawCopyStartRealtime = rawCopyStart; RawCopyDoneRealtime = rawCopyDone;
     }
 }
 
