@@ -25,6 +25,8 @@ namespace ProbeTracing
         private int stroke;
         public ulong SessionId { get; private set; }
         public bool Recording { get; private set; }
+        public bool Armed { get; private set; }
+        public double StartsAt { get; private set; }
         public bool Invalidated { get; private set; }
         public IReadOnlyList<TracePoint> Points => points;
         public bool Full => points.Count >= capacity;
@@ -42,9 +44,15 @@ namespace ProbeTracing
             if(sessionId==0||Invalidated||Full)return false;
             if(SessionId!=0&&sessionId!=SessionId){Invalidate();return false;}
             SessionId=sessionId;lastFrame=currentFrame;haveFrame=true;
-            Recording=true;breakStroke=true;lastCapture=double.NegativeInfinity;return true;
+            Armed=false;Recording=true;breakStroke=true;lastCapture=double.NegativeInfinity;return true;
         }
-        public void Pause(){Recording=false;breakStroke=true;}
+        public bool Arm(ulong sessionId,ulong currentFrame,double now,double delaySeconds=3.0)
+        {
+            if(!Finite(now)||!Finite(delaySeconds)||delaySeconds<0||!Finite(now+delaySeconds))return false;
+            if(!Start(sessionId,currentFrame))return false;
+            Recording=false;Armed=true;StartsAt=now+delaySeconds;return true;
+        }
+        public void Pause(){Armed=false;Recording=false;breakStroke=true;}
         public void TrackingGap(){breakStroke=true;}
         public void Invalidate(){Pause();Invalidated=true;}
         public void CheckSession(ulong sessionId){if(SessionId!=0&&SessionId!=sessionId)Invalidate();}
@@ -52,12 +60,18 @@ namespace ProbeTracing
             double x,double y,double z,float confidence)
         {
             CheckSession(sessionId);
-            if(!Recording||Invalidated)return false;
+            if((!Recording&&!Armed)||Invalidated)return false;
             if(haveFrame&&frameId<=lastFrame)return false;
             lastFrame=frameId;haveFrame=true;
             if(!Finite(captureTime)||!Finite(now)||!Finite(maxAge)||maxAge<=0||now<captureTime||now-captureTime>maxAge
                 ||!Finite(x)||!Finite(y)||!Finite(z)||!Finite(confidence)||captureTime<=lastCapture)
             {TrackingGap();return false;}
+            if(Armed)
+            {
+                // Source capture time, not receipt time, excludes positioning frames still in flight.
+                if(now<StartsAt||captureTime<StartsAt)return false;
+                Armed=false;Recording=true;
+            }
             if(captureTime-lastCapture>maxGap)breakStroke=true;
             lastCapture=captureTime;
             if(points.Count>0)

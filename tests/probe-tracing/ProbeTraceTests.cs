@@ -47,6 +47,28 @@ public static class ProbeTraceTests
         Check(ids.Points[0].sessionId==big.ToString(),"uint64 IDs preserve export precision");
         bool invalid=false;try{new ProbeTraceBuffer(double.NaN);}catch(ArgumentException){invalid=true;}
         Check(invalid,"invalid sampling configuration rejected");
+        var delayed=new ProbeTraceBuffer();
+        Check(delayed.Arm(7,10,10),"arm default three-second delay");
+        Check(delayed.Armed&&!delayed.Recording&&delayed.StartsAt==13,"countdown does not record");
+        Check(!Add(delayed,11,10.03)&&delayed.Points.Count==0,"early countdown frame ignored");
+        Check(!Add(delayed,12,12.98,now:13.05)&&delayed.Armed,"pre-deadline capture arriving after deadline ignored");
+        Check(Add(delayed,13,13,now:13.02)&&delayed.Recording&&!delayed.Armed,"fresh capture at deadline starts trace");
+        Check(!Add(delayed,13,13,now:13.03)&&delayed.Points.Count==1,"countdown boundary frame not duplicated");
+        delayed.Pause();Check(delayed.Arm(7,14,14),"resume arms a new countdown");
+        Check(!Add(delayed,15,16.9,.003,now:17.01),"resume excludes in-flight positioning capture");
+        Check(Add(delayed,16,17.01,.003)&&delayed.Points[0].stroke!=delayed.Points[1].stroke,"resume starts a separate stroke");
+        var cancelled=new ProbeTraceBuffer();cancelled.Arm(7,0,20);cancelled.Pause();
+        Check(!cancelled.Armed&&!Add(cancelled,1,23.1),"pause cancels countdown");
+        cancelled.Arm(7,1,24);cancelled.UndoStroke();Check(!cancelled.Armed&&!Add(cancelled,2,27.1),"undo cancels countdown");
+        var epochChanged=new ProbeTraceBuffer();epochChanged.Arm(7,0,30);epochChanged.CheckSession(8);
+        Check(epochChanged.Invalidated&&!epochChanged.Armed&&!Add(epochChanged,1,33.1,session:8),"session change cancels countdown");
+        var noTracking=new ProbeTraceBuffer();noTracking.Arm(7,0,40);noTracking.TrackingGap();
+        Check(!Add(noTracking,1,43.1,now:43.5)&&noTracking.Armed,"stale frame cannot finish countdown");
+        Check(!Add(noTracking,2,43.6,now:43.5)&&noTracking.Armed,"future frame cannot finish countdown");
+        Check(Add(noTracking,3,44,now:44.02),"first fresh post-deadline frame starts after tracking loss");
+        var clock=new ProbeTraceBuffer();
+        Check(!clock.Arm(7,0,double.NaN)&&!clock.Arm(7,0,50,-1)&&!clock.Arm(7,0,50,double.PositiveInfinity),"invalid countdown clocks rejected");
+        Check(clock.Arm(7,0,50,0)&&Add(clock,1,50),"zero-delay API still requires a fresh observation");
         return count+" probe tracing checks passed";
     }
 }

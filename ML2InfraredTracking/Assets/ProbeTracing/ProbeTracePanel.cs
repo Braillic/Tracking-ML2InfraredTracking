@@ -36,7 +36,7 @@ public sealed class ProbeTracePanel : MonoBehaviour
         axisLabel=Button("Change tip axis",4,trace.CycleTipAxis);
         Button("Confirm tip direction",5,trace.ConfirmTip);
         Button("Recenter panel",6,PlacePanel);
-        Button("Pause",7,()=>{if(trace.Recording)trace.ToggleTrace();});
+        Button("Pause / Cancel",7,trace.PauseTrace);
         Label("World-space observations only. Keep contact while tracing; pause when lifting the tip.",new Vector2(25,-620),new Vector2(950,50),21);
     }
     private TextMeshProUGUI Label(string text,Vector2 position,Vector2 size,float fontSize,Transform parent=null)
@@ -66,8 +66,8 @@ public sealed class ProbeTracePanel : MonoBehaviour
         if(canvas==null)return;canvas.gameObject.SetActive(showPanel);if(!showPanel)return;
         if(!placed)PlacePanel();
         if(Time.unscaledTime<nextRefresh)return;nextRefresh=Time.unscaledTime+.2f;
-        status.text=$"{trace.Status}\nPoints: {trace.PointCount} | Tracking: {(trace.Fresh?"fresh":"unavailable")}\nTip local offset: {trace.tipOffsetMetres*1000f} mm | {(trace.tipDirectionChecked?"direction checked":"check direction")}";
-        startLabel.text=trace.Recording?"Pause tracing":"Start tracing";
+        status.text=$"{trace.Status}\nPoints: {trace.PointCount} | Tracking: {(trace.Fresh?"fresh":"unavailable")}\nCenter to tip: {trace.tipOffsetMetres*1000f} mm; total: {trace.EffectiveTipOffsetMetres*1000f} mm | {(trace.tipDirectionChecked?"direction checked":"check direction")}";
+        startLabel.text=trace.Arming?"Cancel countdown":trace.Recording?"Pause tracing":"Start tracing (3 seconds)";
         axisLabel.text="Change tip axis (clear first)";
     }
     private void OnDisable(){if(canvas!=null)canvas.gameObject.SetActive(false);}
