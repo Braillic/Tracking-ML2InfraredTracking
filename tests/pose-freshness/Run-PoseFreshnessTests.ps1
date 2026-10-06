@@ -16,7 +16,7 @@ function Get-MethodSource([string]$Source, [string]$Signature) {
     }
     throw "Unbalanced method: $Signature"
 }
-$source = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/PoseEstimateTcpServer.cs')
+$source = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/PoseEstimateTcpServer.cs')
 $methods = @('public void SubmitPose(', 'private void TryApplyPendingPose(',
              'internal static bool IsFreshPose(', 'private static bool IsFinitePose(',
              'private void HideTrackedToolIfTimedOut(',
@@ -26,7 +26,7 @@ $methods = @('public void SubmitPose(', 'private void TryApplyPendingPose(',
 $harness = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'PoseFreshnessHarness.cs')
 $harness = $harness.Replace('__PRODUCTION_METHODS__', ($methods -join "`n"))
 $harness = $harness.Replace('__WINDOW__', (Get-MethodSource $source 'internal sealed class TimingWindow'))
-$raw = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/ML2DepthRawStream.cs')
+$raw = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/ML2DepthRawStream.cs')
 $harness = $harness.Replace('__CAPTURE__', (Get-MethodSource $raw 'public readonly struct CaptureTiming'))
 Add-Type -TypeDefinition $harness
 [PoseFreshnessChecks]::Run()

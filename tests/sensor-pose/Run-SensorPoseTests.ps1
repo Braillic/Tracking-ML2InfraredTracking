@@ -1,5 +1,6 @@
 param(
-    [string]$SourceRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'ML2InfraredTracking')
+    [string]$SourceRoot = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'ML2InfraredTracking'),
+    [string]$UnityReferenceProject = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -20,8 +21,9 @@ function Get-MethodSource([string]$Source, [string]$Signature) {
 
 # Execute production method bodies with controllable XR responses and clocks.
 # Math uses System.Numerics in the shim; separately compile the application with Unity references.
-$captureSource = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/DepthSensorAPI.cs')
-$sdkSource = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Packages/com.magicleap.unitysdk@2.6.0/Runtime/OpenXR/Common/Spaces.cs')
+$captureSource = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/DepthSensorAPI.cs')
+if(!$UnityReferenceProject){$UnityReferenceProject=$SourceRoot}
+$sdkSource = Get-Content -Raw -LiteralPath (Join-Path $UnityReferenceProject 'Packages/com.magicleap.unitysdk@2.6.0/Runtime/OpenXR/Common/Spaces.cs')
 $captureMethod = Get-MethodSource $captureSource 'private bool TryResolveCapturePose('
 $sdkMethod = Get-MethodSource $sdkSource 'internal bool TryGetUnityPose('
 $harness = @'
@@ -74,7 +76,7 @@ $generated = Join-Path ([IO.Path]::GetTempPath()) ("ML2SensorPoseTests-" + [Guid
 try {
     [IO.File]::WriteAllText($generated, $harness)
     Add-Type -Path @(
-        (Join-Path $SourceRoot 'Assets/ML2IRTracking/SensorPoseHistory.cs'),
+        (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/SensorPoseHistory.cs'),
         (Join-Path $PSScriptRoot 'UnityMathShim.cs'),
         (Join-Path $PSScriptRoot 'SensorPoseRegressionTests.cs'),
         $generated

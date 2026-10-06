@@ -18,9 +18,9 @@ function Method([string]$Source, [string]$Signature) {
     }
     throw "Unbalanced method: $Signature"
 }
-$depth = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/DepthFrameTcpServer.cs')
-$raw = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/ML2DepthRawStream.cs')
-$pose = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/ML2IRTracking/PoseEstimateTcpServer.cs')
+$depth = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/DepthFrameTcpServer.cs')
+$raw = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/ML2DepthRawStream.cs')
+$pose = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Runtime/PoseEstimateTcpServer.cs')
 $methods = @('public void BeginCaptureEpoch(', 'public bool CanSubmitFrame(', 'internal static double AdvanceSubmitDeadline(',
              'public bool TryGetFrameTimingSnapshot(', 'public struct FrameTimingSnapshot', 'private void RecordLatencySubmit(', 'public void SubmitFrame(', 'internal static void ConvertRawToUInt8Srgb(',
              'private static void WriteHeader(') | ForEach-Object { Method $depth $_ }

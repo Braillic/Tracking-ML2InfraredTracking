@@ -43,6 +43,10 @@ public class DepthFrameTcpServer {
 
 }
 public class PoseHarness {
+    public bool applicationManaged;
+    public DepthFrameTcpServer DepthSource => DepthFrameTcpServer.ActiveServer;
+    public event Action<AcceptedObservation> ObservationAccepted;
+    public event Action TrackingInvalidated;
     public Transform trackedTool=new Transform();
     public float minConfidence=0, positionFollow=1, rotationFollow=1, maxPoseAgeSeconds=.15f, hideAfterNoPoseSeconds=.65f;
     public bool dropStaleFrames=true;
@@ -199,6 +203,15 @@ public static class PoseFreshnessChecks {
         Check(bounded.Queued==32 && bounded._diagnosticOverwritten==8,"diagnostic storage is bounded without blocking application");
         Time.realtimeSinceStartupAsDouble=3.0;bounded.BeforeRender();
         Check(!bounded.trackedTool.gameObject.activeSelf,"before-render still honors source-age hiding");
+        Time.realtimeSinceStartupAsDouble=4.01; depth.submissions[100]=4.0;
+        var managed=new PoseHarness{applicationManaged=true,trackedTool=null,_visualPrepared=false};
+        int accepted=0,invalidated=0;
+        managed.ObservationAccepted+=o=>{accepted++;Check(o.FrameId==100 && o.Position.x==9,"application receives raw pose");};
+        managed.TrackingInvalidated+=()=>invalidated++;
+        managed.Receive(100,9);managed.BeforeRender();
+        Check(accepted==1 && managed._appliedCount==1 && managed.visualSetups==0,"managed mode accepts without a Transform");
+        managed.BeforeRender();Check(accepted==1,"same observation published only once");
+        managed.InvalidateTrackingSession();Check(invalidated==1 && !managed.TryGetAcceptedObservation(out observation),"managed reset withdraws observations");
         Console.WriteLine($"Passed {checks} pose freshness checks (production method bodies).");
     }
 }

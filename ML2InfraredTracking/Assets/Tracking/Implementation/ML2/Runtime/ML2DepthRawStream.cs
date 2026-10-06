@@ -1,0 +1,342 @@
+using UnityEngine;
+using System;
+using System.Runtime.InteropServices;
+using MagicLeap.OpenXR.Features;
+using UnityEngine.XR.OpenXR;
+using MagicLeap.OpenXR.Features.PixelSensors;
+public readonly struct DepthCameraIntrinsics
+{
+    public const int BinarySize = 11 * sizeof(double);
+
+    public readonly double Fx, Fy, Cx, Cy, FovX, FovY;
+    public readonly double K1, K2, P1, P2, K3;
+
+    public DepthCameraIntrinsics(Vector2 focalLength, Vector2 principalPoint, Vector2 fov,
+        double[] distortion)
+    {
+        Fx = focalLength.x;
+        Fy = focalLength.y;
+        Cx = principalPoint.x;
+        Cy = principalPoint.y;
+        FovX = fov.x;
+        FovY = fov.y;
+        K1 = GetDistortion(distortion, 0);
+        K2 = GetDistortion(distortion, 1);
+        P1 = GetDistortion(distortion, 2);
+        P2 = GetDistortion(distortion, 3);
+        K3 = GetDistortion(distortion, 4);
+    }
+
+    private static double GetDistortion(double[] values, int index) =>
+        values != null && index < values.Length ? values[index] : 0.0;
+
+    public override string ToString() =>
+        $"Pinhole intrinsics\nFocal: ({Fx:F3}, {Fy:F3}) px\n" +
+        $"Principal: ({Cx:F3}, {Cy:F3}) px\nFOV: ({FovX:F3}, {FovY:F3}) deg\n" +
+        $"Distortion: [{K1:F6}, {K2:F6}, {P1:F6}, {P2:F6}, {K3:F6}]";
+}
+
+public class ML2DepthRawStream : MonoBehaviour
+{
+    [Header("Tracking Data")]
+    public Renderer targetRenderer;          // Renderer that previews the depth texture
+    [SerializeField] private PixelSensorMaterialTable materialList = new();
+    [Tooltip("Optional. If omitted, a DepthFrameTcpServer is added at runtime with its default settings.")]
+    [SerializeField] private DepthFrameTcpServer depthTcpServer;
+    [Tooltip("Optional. Visualizes the same world_T_sensor packed into each depth TCP frame.")]
+    [SerializeField] private DepthSensorPoseDebugger sensorPoseDebugger;
+
+    [SerializeField] private bool enablePreview = true;
+    [SerializeField, Min(0.01f)] private float previewIntervalSeconds = 0.1f;
+    private double _nextPreviewTime;
+    [SerializeField] private bool logCaptureTiming = true;
+    private double _nextCaptureSummary;
+    private ulong _captureTimingSession;
+    private readonly TimingWindow _captureToReady = new TimingWindow();
+    private readonly TimingWindow _sdkPoll = new TimingWindow();
+    private readonly TimingWindow _poseLookup = new TimingWindow();
+    private readonly TimingWindow _rawCopy = new TimingWindow();
+    private readonly TimingWindow _previewUpload = new TimingWindow();
+
+    Texture2D targetTexture, filteredTexture;
+
+    private float[] _floatBuffer;                        // CPU-side float[] depth map (meters) 
+    private DepthCameraIntrinsics? intrinsics;
+
+    public DepthSensorPoseDebugger SensorPoseDebugger => sensorPoseDebugger;
+    private bool applicationManaged;
+    public bool TrackingSubmissionEnabled { get; set; } = true;
+    public void BindTrackingSender(DepthFrameTcpServer sender)
+    {
+        if (sender == null) throw new ArgumentNullException(nameof(sender));
+        applicationManaged = true;
+        depthTcpServer = sender;
+    }
+
+    // --- Rendering helpers ---
+    private float minDepth = 0, maxDepth = 5;
+    private bool _loggedFloatFormat;
+    private bool _loggedUnexpectedBuffer;
+    // Marker detection is supplied by the provider estimation backend.
+
+    // ----------------- Helpers -----------------
+
+    // Converts Magic Leap raw plane into a float[] depth map in meters.
+    private float[] GetRawDepthData(in PixelSensorFrame frame, ref float[] buffer)
+    {
+        if (frame.Planes.Length == 0) return null;
+        var firstPlane = frame.Planes[0];
+
+        int size = (int)(firstPlane.Width * firstPlane.Height);
+        if (size <= 0)
+        {
+            Debug.LogWarning("[ML2Tracking] Invalid frame size.");
+            return null;
+        }
+
+        if (firstPlane.ByteData.Length % sizeof(float) == 0)
+        {
+            var asFloat = firstPlane.ByteData.Reinterpret<float>(sizeof(float));
+            if (buffer == null || buffer.Length != size) buffer = new float[size];
+
+            if (asFloat.Length == size)
+            {
+                asFloat.CopyTo(buffer);
+                LogFloatFormat(firstPlane, false);
+                return buffer;
+            }
+
+            int rowStrideFloats = firstPlane.Stride % sizeof(float) == 0
+                ? (int)firstPlane.Stride / sizeof(float)
+                : 0;
+            if (rowStrideFloats >= (int)firstPlane.Width &&
+                asFloat.Length >= rowStrideFloats * (int)firstPlane.Height)
+            {
+                int width = (int)firstPlane.Width;
+                int height = (int)firstPlane.Height;
+                for (int y = 0; y < height; y++)
+                {
+                    int sourceOffset = y * rowStrideFloats;
+                    int targetOffset = y * width;
+                    for (int x = 0; x < width; x++)
+                        buffer[targetOffset + x] = asFloat[sourceOffset + x];
+                }
+
+                LogFloatFormat(firstPlane, true);
+                return buffer;
+            }
+        }
+
+        if (!_loggedUnexpectedBuffer)
+        {
+            Debug.LogError($"[ML2Tracking] Cannot stream DepthRaw plane as FLOAT32: " +
+                           $"{firstPlane.Width}x{firstPlane.Height}, bytes={firstPlane.ByteData.Length}, " +
+                           $"bytesPerPixel={firstPlane.BytesPerPixel}, stride={firstPlane.Stride}.");
+            _loggedUnexpectedBuffer = true;
+        }
+
+        return null;
+    }
+
+    private void LogFloatFormat(in PixelSensorPlane plane, bool removedRowPadding)
+    {
+        if (_loggedFloatFormat) return;
+
+        Debug.Log($"[ML2Tracking] Sensor input is FLOAT32 DepthRaw (before transport conversion)" +
+                  $"{(removedRowPadding ? " (row padding removed)" : string.Empty)}. " +
+                  $"{plane.Width}x{plane.Height}, stride={plane.Stride}.");
+        _loggedFloatFormat = true;
+    }
+
+    private void CaptureIntrinsicsOnce(in PixelSensorMetaData[] metaData)
+    {
+        if (intrinsics.HasValue) return;
+
+        foreach (var entry in metaData)
+        {
+            if (entry is not PixelSensorPinholeIntrinsics pinhole) continue;
+
+            intrinsics = new DepthCameraIntrinsics(pinhole.FocalLength, pinhole.PrincipalPoint,
+                pinhole.FOV, pinhole.Distortion);
+            Debug.Log($"[ML2Tracking] Captured intrinsics for one-time transmission.\n{intrinsics}");
+            return;
+        }
+    }
+
+    private void Start()
+    {
+        Debug.Log("[ML2Tracking] Start() - initializing preview, native handles and calibration.");
+
+        // OnEnable runs before Start, so this also prevents a stale serialized
+        // reference from feeding a duplicate server that could not bind the port.
+        if (!applicationManaged)
+        {
+            if (DepthFrameTcpServer.ActiveServer != null)
+                depthTcpServer = DepthFrameTcpServer.ActiveServer;
+            else if (depthTcpServer == null)
+                depthTcpServer = GetComponent<DepthFrameTcpServer>();
+            if (depthTcpServer == null)
+                depthTcpServer = gameObject.AddComponent<DepthFrameTcpServer>();
+    
+        }
+
+        if (sensorPoseDebugger == null)
+            sensorPoseDebugger = GetComponent<DepthSensorPoseDebugger>();
+        if (sensorPoseDebugger == null)
+            sensorPoseDebugger = gameObject.AddComponent<DepthSensorPoseDebugger>();
+
+
+        // Assign the material 
+        var mat = materialList.GetMaterialForFrameType(PixelSensorFrameType.DepthRaw);
+        if (targetRenderer) targetRenderer.sharedMaterial = mat;
+
+        Debug.Log("[ML2Tracking] Initialization completed.");
+    }
+
+
+    public void Initialize(uint streamId, MagicLeapPixelSensorFeature feature, PixelSensorId sensorType)
+    {
+        // A newly configured sensor session must transmit its own calibration.
+        intrinsics = null;
+        if (!sensorType.SensorName.Contains("depth", StringComparison.CurrentCultureIgnoreCase)) return;
+
+        if (feature.QueryPixelSensorCapability(sensorType, PixelSensorCapabilityType.Depth, streamId, out var range))
+        {
+            if (range.IntRange.HasValue) { minDepth = range.IntRange.Value.Min; maxDepth = range.IntRange.Value.Max; }
+            if (range.FloatRange.HasValue) { minDepth = range.FloatRange.Value.Min; maxDepth = range.FloatRange.Value.Max; }
+            Debug.Log($"[ML2Tracking] Depth capability range: {minDepth:F3}..{maxDepth:F3} meters.");
+        }
+        else
+        {
+            Debug.LogWarning("[ML2Tracking] QueryPixelSensorCapability(Depth) failed.");
+        }
+    }
+
+    public void Reset()
+    {
+        if (targetTexture) { Destroy(targetTexture); targetTexture = null; }
+        if (filteredTexture) { Destroy(filteredTexture); filteredTexture = null; }
+    }
+
+    private void OnDestroy()
+    {
+        Reset();
+        if (targetRenderer && targetRenderer.material) Destroy(targetRenderer.material);
+
+        Debug.Log("[ML2Tracking] Cleanup completed (textures, material, native handles).");
+    }
+
+    // ----------------- Main per-frame processing -----------------
+    public void ProcessFrame(in PixelSensorFrame frame, in PixelSensorMetaData[] metaData, in Pose sensorPose,
+        double pollStart = 0.0, double frameReady = 0.0)
+    {
+        if (!frame.IsValid || frame.Planes.Length == 0 || frame.FrameType != PixelSensorFrameType.DepthRaw) return;
+        double processStart = Time.realtimeSinceStartupAsDouble;
+        double captureRealtime = CaptureClock.TryMapToUnity(frame.CaptureTime);
+        ulong session = depthTcpServer != null ? depthTcpServer.SessionId : 0;
+        if (session != _captureTimingSession)
+        {
+            _captureTimingSession = session;
+            _captureToReady.Clear(); _sdkPoll.Clear(); _poseLookup.Clear();
+            _rawCopy.Clear(); _previewUpload.Clear();
+        }
+        if (logCaptureTiming)
+        {
+            _captureToReady.Add((frameReady - captureRealtime) * 1000.0);
+            _sdkPoll.Add((frameReady - pollStart) * 1000.0);
+            _poseLookup.Add((processStart - frameReady) * 1000.0);
+        }
+        var firstPlane = frame.Planes[0];
+        int w = (int)firstPlane.Width, h = (int)firstPlane.Height;
+        CaptureIntrinsicsOnce(metaData);
+        if (TrackingSubmissionEnabled && depthTcpServer != null && depthTcpServer.CanSubmitFrame())
+        {
+            double copyStart = Time.realtimeSinceStartupAsDouble;
+            // SDK memory is temporary. Retain the ownership-safe copy before returning.
+            var depthData = GetRawDepthData(in frame, ref _floatBuffer);
+            double copyDone = Time.realtimeSinceStartupAsDouble;
+            if (logCaptureTiming) _rawCopy.Add((copyDone - copyStart) * 1000.0);
+            if (depthData != null)
+            {
+                var timing = new CaptureTiming(frame.CaptureTime, captureRealtime, pollStart,
+                    frameReady, processStart, copyStart, copyDone);
+                depthTcpServer.SubmitFrame(depthData, w, h, sensorPose, intrinsics, timing);
+                if (sensorPoseDebugger != null)
+                    sensorPoseDebugger.SubmitFrameSynced(sensorPose, intrinsics, w, h);
+            }
+        }
+        // Publish to the tracking sender before optional GPU/preview work.
+        double now = Time.realtimeSinceStartupAsDouble;
+        if (enablePreview && targetRenderer != null && now >= _nextPreviewTime)
+        {
+            Utils.EnsureTargetTexture(ref targetTexture, frame.FrameType, w, h);
+            Utils.UploadMainTexture(frame.FrameType, ref firstPlane, targetTexture);
+            targetRenderer.material.mainTexture = targetTexture;
+            _nextPreviewTime = now + previewIntervalSeconds;
+            if (logCaptureTiming) _previewUpload.Add((Time.realtimeSinceStartupAsDouble - now) * 1000.0);
+        }
+    }
+
+    private void Update()
+    {
+        double now = Time.realtimeSinceStartupAsDouble;
+        if (!logCaptureTiming || now < _nextCaptureSummary) return;
+        _nextCaptureSummary = now + 2.0;
+        Debug.Log($"[ML2Capture] session={_captureTimingSession} capture_to_ready={_captureToReady.Summary()} " +
+            $"sdk_poll={_sdkPoll.Summary()} pose_lookup={_poseLookup.Summary()} " +
+            $"raw_copy={_rawCopy.Summary()} preview_upload={_previewUpload.Summary()} preview_enabled={enablePreview} " +
+            "(rolling ms p50/p95/p99; delivered pose-resolved frames, copy/preview only when performed)");
+    }
+
+}
+
+
+public readonly struct CaptureTiming
+{
+    public readonly long XrNanoseconds;
+    public readonly double CaptureRealtime, PollStartRealtime, FrameReadyRealtime;
+    // Local-only preparation timestamps; the v5 wire header remains unchanged.
+    public readonly double ProcessStartRealtime, RawCopyStartRealtime, RawCopyDoneRealtime;
+    public CaptureTiming(long xrNanoseconds, double captureRealtime, double pollStart, double frameReady,
+        double processStart = double.NaN, double rawCopyStart = double.NaN, double rawCopyDone = double.NaN)
+    {
+        XrNanoseconds = xrNanoseconds; CaptureRealtime = captureRealtime;
+        PollStartRealtime = pollStart; FrameReadyRealtime = frameReady;
+        ProcessStartRealtime = processStart; RawCopyStartRealtime = rawCopyStart; RawCopyDoneRealtime = rawCopyDone;
+    }
+}
+
+// Explicit XR -> CLOCK_MONOTONIC -> Unity clock mapping. Never subtract XR time
+// directly from Unity time or pair predicted display time with the current time.
+internal static class CaptureClock
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Timespec { public long Seconds, Nanoseconds; }
+    [DllImport("libc", EntryPoint = "clock_gettime")]
+    private static extern int ClockGetTime(int clockId, out Timespec time);
+
+    internal static double Map(long captureNs, long systemNowNs, double before, double after)
+    {
+        double age = (systemNowNs - captureNs) * 1e-9;
+        if (captureNs <= 0 || systemNowNs <= 0 || age < 0 || age > 10.0
+            || after < before || after - before > 0.002)
+            return double.NaN;
+        return (before + after) * 0.5 - age;
+    }
+
+    public static double TryMapToUnity(long xrTime)
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        var feature = OpenXRSettings.Instance?.GetFeature<MagicLeapFeature>();
+        if (feature == null || !feature.enabled ||
+            !OpenXRRuntime.IsExtensionEnabled("XR_KHR_convert_timespec_time")) return double.NaN;
+        long captureNs = feature.ConvertXrTimeToSystemTime(xrTime);
+        double before = Time.realtimeSinceStartupAsDouble;
+        if (ClockGetTime(1, out Timespec now) != 0) return double.NaN; // Android CLOCK_MONOTONIC
+        double after = Time.realtimeSinceStartupAsDouble;
+        return Map(captureNs, now.Seconds * 1000000000L + now.Nanoseconds, before, after);
+#else
+        return double.NaN;
+#endif
+    }
+}

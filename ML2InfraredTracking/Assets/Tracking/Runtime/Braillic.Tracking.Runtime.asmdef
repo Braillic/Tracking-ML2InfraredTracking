@@ -1,0 +1,6 @@
+{
+  "name": "Braillic.Tracking.Runtime",
+  "references": ["Braillic.Tracking.Core"],
+  "autoReferenced": true,
+  "noEngineReferences": true
+}

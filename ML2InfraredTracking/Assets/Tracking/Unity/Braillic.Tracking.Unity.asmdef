@@ -1,0 +1,5 @@
+{
+  "name": "Braillic.Tracking.Unity",
+  "references": ["Braillic.Tracking.Core", "Braillic.Tracking.Runtime", "Braillic.Tracking.Application"],
+  "autoReferenced": true
+}

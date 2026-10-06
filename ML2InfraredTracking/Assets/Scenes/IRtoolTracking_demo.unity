@@ -3210,6 +3210,9 @@ GameObject:
   m_PrefabAsset: {fileID: 0}
   serializedVersion: 6
   m_Component:
+  - component: {fileID: 9009101003}
+  - component: {fileID: 9009101001}
+  - component: {fileID: 9009101002}
   - component: {fileID: 1591841584}
   - component: {fileID: 1591841586}
   - component: {fileID: 1591841588}
@@ -3304,7 +3307,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: d531a04ad6604fa9ae0545d66b86f70c, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  startAutomatically: 1
+  startAutomatically: 0
   bindAddress: 0.0.0.0
   port: 50777
   maximumFramesPerSecond: 30
@@ -3327,7 +3330,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 2732916654d6e4fb3929eb0648f08875, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  startAutomatically: 1
+  startAutomatically: 0
   bindAddress: 0.0.0.0
   port: 50778
   trackedTool: {fileID: 1887860339}
@@ -3909,3 +3912,74 @@ SceneRoots:
   - {fileID: 1887860339}
   - {fileID: 1591841584}
   - {fileID: 1284956414}
+--- !u!114 &9009101002
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1591841582}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 419f8e550bc056a289c473857b27072c, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  trackedTool: {fileID: 1887860339}
+  positionFollow: 1
+  rotationFollow: 1
+  hideAfterNoPoseSeconds: 0.65
+  createMarkerSpheresOnFirstPose: 0
+  markerLocalPositions:
+  - {x: -0.0466, y: 0, z: 0.0206}
+  - {x: 0.0444, y: 0, z: 0.0206}
+  - {x: 0.0095, y: 0.0623, z: 0.0206}
+  - {x: -0.007, y: -0.0368, z: 0.0206}
+  markerSphereRadius: 0.004
+  markerSphereColor: {r: 1, g: 0.2, b: 0.2, a: 0.9}
+--- !u!114 &9009101001
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1591841582}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e2f70f14eff15982a492176244bea670, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  providers:
+  - {fileID: 9009101003}
+  bindings:
+  - objectId: probe
+    providerId: ml2-ir
+    providerObjectId: marker-body
+    providerBodyFromLogicalPosition: {x: 0, y: 0, z: 0}
+    providerBodyFromLogicalEuler: {x: 0, y: 0, z: 0}
+  displayProviderId: ml2-ir
+  displayedObjectId: probe
+  presenter: {fileID: 9009101002}
+  startAutomatically: 1
+  beforeRender: 1
+  maximumObservationAgeSeconds: 0.15
+  maximumClockUncertaintySeconds: 0.005
+--- !u!114 &9009101003
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1591841582}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 77bec56165fd51739a10dbcefb263db9, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  required: 1
+  providerId: ml2-ir
+  providerObjectId: marker-body
+  calibrationId: ir-calibration-v1
+  sensor: {fileID: 1591841586}
+  capture: {fileID: 1591841588}
+  sender: {fileID: 1591841590}
+  receiver: {fileID: 1591841591}

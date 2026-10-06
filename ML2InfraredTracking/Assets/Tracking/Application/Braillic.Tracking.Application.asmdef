@@ -1,0 +1,7 @@
+{
+  "name": "Braillic.Tracking.Application",
+  "rootNamespace": "Braillic.Tracking.Application",
+  "references": ["Braillic.Tracking.Core", "Braillic.Tracking.Runtime"],
+  "autoReferenced": true,
+  "noEngineReferences": true
+}

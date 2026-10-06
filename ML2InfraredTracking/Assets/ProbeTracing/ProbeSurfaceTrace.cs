@@ -5,11 +5,16 @@ using System.IO;
 using System.Text;
 using UnityEngine;
 using ProbeTracing;
+using Braillic.Tracking.Unity;
+using Braillic.Tracking.Application;
+using Braillic.Tracking.Runtime;
 
 /// Captures actual tip observations; deliberately does not project/snap points to CT data.
 /// Coordinates belong to one Unity/XR tracking epoch. No object-motion compensation yet.
 public sealed class ProbeSurfaceTrace : MonoBehaviour
 {
+    [SerializeField] private TrackingApplicationHost trackingApplication;
+
     [Header("Scene probe references")]
     public Transform trackedToolRoot;
     [Tooltip("Connection point directly under TrackedTool. Its display scale is ignored.")]
@@ -32,9 +37,12 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
 
     [Serializable] private sealed class TraceExport
     {
-        public string schema="ml2-probe-trace-v2",utc,sessionId;
+        public string schema="tracking-probe-trace-v4",utc,sessionId;
+        public string sessionIdentity="Application-local collection epoch; not desktop wire session";
         public string coordinates="Unity world, metres, left-handed; xyz. No CT/PCD registration applied.";
-        public string timestampClock="ML2 Unity realtime mapped from sensor capture time; not UTC";
+        public string timestampClock="Tracking runtime monotonic clock; capture time, not UTC";
+        public string frameId,frameEpoch,providerId,trackingSessionId;
+        public long trackingRevision;
         public string calibration="rough estimated local offset; not pivot calibrated";
         public string reference="Single XR epoch; object motion is not compensated";
         public Vector3 tipOffsetMetres,connectionPointLocalMetres,connectionToTipMetres;
@@ -44,6 +52,12 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
         public TracePoint[] points;
     }
     private ProbeTraceBuffer buffer;
+    private TraceObservationSource traceSource;
+    private TipObservation latestTip;
+    private Vector3 sourceOffset;
+    private float sourceAge;
+    private string savedFrameId,savedFrameEpoch,savedProviderId,savedTrackingSession;
+    private long savedTrackingRevision;
     private readonly List<GameObject> pointVisuals=new List<GameObject>();
     private Vector3 savedOffset,savedConnection,savedExtension;
     private Transform savedRoot,savedConnectionTransform,savedCylinder;
@@ -92,8 +106,8 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
     private void Update()
     {
         if(buffer==null)return;
-        var depth=DepthFrameTcpServer.ActiveServer;
-        buffer.CheckSession(depth!=null?depth.SessionId:0);
+        TryReadObservation(out _);
+        buffer.CheckSession(traceSource!=null?traceSource.CollectionEpoch:0);
         bool referencesReady=TryGetTipOffset(out var effectiveOffset);
         if(buffer.SessionId!=0&&(!referencesReady||ConfigurationChanged()))buffer.Invalidate();
         if(buffer.Invalidated)
@@ -108,12 +122,11 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
             return;
         }
         UpdateCylinderGeometry();
-        var source=PoseEstimateTcpServer.ActiveServer;
-        fresh=source!=null&&source.TryGetAcceptedObservation(out var ignored);
+        fresh=TryReadObservation(out var observation);
         Vector3 tipWorld=default;
-        if(fresh&&source.TryGetAcceptedObservation(out var observation))
+        if(fresh)
         {
-            tipWorld=observation.Position+observation.Rotation*effectiveOffset;
+            tipWorld=observation.Position; // Tip was calculated from the raw unified tracking observation.
             double age=Time.realtimeSinceStartupAsDouble-observation.CaptureTime;
             fresh=Finite(tipWorld)&&age>=0&&age<=maximumCaptureAgeSeconds;
             if(fresh)
@@ -131,6 +144,48 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
         if(!fresh)buffer.TrackingGap();
         // Cylinder follows the existing TrackedTool display; recording uses the raw observation.
     }
+    // Application snapshot in the existing export convention (Unity world metres).
+    private struct TraceObservation
+    {
+        public ulong SessionId, FrameId;
+        public double CaptureTime;
+        public Vector3 Position;
+        public Quaternion Rotation;
+        public float Confidence;
+    }
+    private bool TryReadObservation(out TraceObservation observation)
+    {
+        observation=default;
+        if(trackingApplication==null||trackingApplication.Tracking==null||!TryGetTipOffset(out var offset))return false;
+        if(traceSource==null||(buffer!=null&&buffer.SessionId==0&&(sourceOffset!=offset||sourceAge!=maximumCaptureAgeSeconds)))
+        {
+            sourceOffset=offset;sourceAge=maximumCaptureAgeSeconds;
+            traceSource=new TraceObservationSource(trackingApplication.Tracking,trackingApplication.ObjectId,null,
+                new Braillic.Tracking.Vector3d(offset.x,offset.y,-offset.z),"rough-scene-tip",
+                new ObservationRequirements(maximumCaptureAgeSeconds,.01,.005));
+        }
+        // Missing OTS -> AR calibration must never be mistaken for native Unity world coordinates.
+        if(!trackingApplication.TryGetDisplayFrame(out var frame))
+        {
+            // Let the source observe lifecycle/epoch changes even while no display frame exists.
+            traceSource.TryRead(null,out _,out _);
+            return false;
+        }
+        if(!traceSource.TryRead(frame,out latestTip,out _))return false;
+        if(buffer==null||buffer.SessionId==0)
+        {
+            savedFrameId=latestTip.Tracking.Frame.Id;savedFrameEpoch=latestTip.Tracking.Frame.Epoch;
+            savedProviderId=latestTip.Tracking.Source.Session.SourceId;
+            savedTrackingSession=latestTip.Tracking.Source.Session.SessionId;savedTrackingRevision=latestTip.Tracking.Revision;
+        }
+        observation=new TraceObservation {
+            SessionId=latestTip.CollectionEpoch,FrameId=latestTip.Tracking.Source.Sequence,
+            CaptureTime=latestTip.Tracking.Source.CaptureSeconds,Confidence=(float)(latestTip.Tracking.Source.Quality??0),
+            Position=TrackingCoordinates.ToUnity(latestTip.TipPosition)
+        };
+        return true;
+    }
+
     private static bool Finite(Vector3 v)=>!(float.IsNaN(v.x)||float.IsNaN(v.y)||float.IsNaN(v.z)||float.IsInfinity(v.x)||float.IsInfinity(v.y)||float.IsInfinity(v.z));
     private bool ConfigurationChanged()=>trackedToolRoot!=savedRoot||probeConnection!=savedConnectionTransform
         ||probeCylinder!=savedCylinder||tracePointPrefab!=savedPointPrefab||!TryGetTipOffset(out var effectiveOffset)
@@ -155,8 +210,7 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
         if(!tipDirectionChecked){status="Check the cylinder end against the physical tip, then press Confirm tip.";return;}
         if(!Finite(tipOffsetMetres)||tipOffsetMetres.sqrMagnitude<1e-8f||float.IsNaN(maximumCaptureAgeSeconds)||float.IsInfinity(maximumCaptureAgeSeconds)||maximumCaptureAgeSeconds<=0)
         {status="Invalid tip offset or freshness limit.";return;}
-        var source=PoseEstimateTcpServer.ActiveServer;
-        if(source==null||!source.TryGetAcceptedObservation(out var o)||Time.realtimeSinceStartupAsDouble-o.CaptureTime>maximumCaptureAgeSeconds)
+        if(!TryReadObservation(out var o))
         {status="No fresh probe pose. Keep the markers visible.";return;}
         if(buffer.SessionId==0)
         {
@@ -197,7 +251,7 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
     }
     public void ResetTrace()
     {
-        buffer?.Pause();
+        buffer?.Pause();traceSource=null;
         try{buffer=new ProbeTraceBuffer(spacingMetres,maximumGapSeconds,maximumStepMetres,maximumPoints);}
         catch(Exception e){status=e.Message;buffer=null;return;}
         SaveConfiguration();ClearVisuals();LastExportDirectory=null;status="Ready. Confirm tip direction, then start while touching the surface.";
@@ -220,10 +274,11 @@ public sealed class ProbeSurfaceTrace : MonoBehaviour
     {
         buffer?.Pause();
         if(buffer==null||buffer.Points.Count==0){status="No trace points to export.";return;}
-        buffer.CheckSession(DepthFrameTcpServer.ActiveServer!=null?DepthFrameTcpServer.ActiveServer.SessionId:0);
+        TryReadObservation(out _);
+        buffer.CheckSession(traceSource!=null?traceSource.CollectionEpoch:0);
         if(ConfigurationChanged())buffer.Invalidate();
         buffer.Pause();
-        var data=new TraceExport{utc=DateTime.UtcNow.ToString("o"),sessionId=buffer.SessionId.ToString(),tipOffsetMetres=savedOffset,
+        var data=new TraceExport{utc=DateTime.UtcNow.ToString("o"),sessionId=buffer.SessionId.ToString(),tipOffsetMetres=savedOffset,frameId=savedFrameId,frameEpoch=savedFrameEpoch,providerId=savedProviderId,trackingSessionId=savedTrackingSession,trackingRevision=savedTrackingRevision,
             connectionPointLocalMetres=savedConnection,connectionToTipMetres=savedExtension,
             tipDirectionChecked=savedTipChecked,invalidated=buffer.Invalidated,spacingMetres=savedSpacing,maximumGapSeconds=savedGap,
             maximumStepMetres=savedStep,maximumCaptureAgeSeconds=savedAge,maximumPoints=savedMaximum,points=buffer.Snapshot()};
