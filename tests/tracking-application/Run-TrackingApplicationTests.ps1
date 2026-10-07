@@ -46,11 +46,18 @@ if($LASTEXITCODE){throw 'Unified tracking test compile failed'}
 if($LASTEXITCODE){throw 'Unified tracking behavior checks failed'}
 
 $providerDll=Join-Path $output 'Ml2ProviderTests.dll'
-& dotnet $compiler @common '/target:exe' '/main:Ml2ProviderTests' "/reference:$coreDll" "/reference:$appDll" "/out:$providerDll" (Join-Path $PSScriptRoot 'BackendTests.cs') (Join-Path $PSScriptRoot 'Ml2ProviderTests.cs') (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Compatibility/Ml2DesktopTrackingBackend.cs') (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Ml2TrackingProvider.cs') (Join-Path $SourceRoot 'Assets/Tracking/Unity/TrackingCoordinates.cs')
+& dotnet $compiler @common '/target:exe' '/main:Ml2ProviderTests' "/reference:$coreDll" "/reference:$appDll" "/out:$providerDll" (Join-Path $PSScriptRoot 'BackendTests.cs') (Join-Path $PSScriptRoot 'Ml2ProviderTests.cs') (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Compatibility/Ml2DesktopTrackingBackend.cs') (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/Ml2TrackingProvider.cs') (Join-Path $SourceRoot 'Assets/Tracking/Implementation/ML2/LegacyMl2Geometry.cs') (Join-Path $SourceRoot 'Assets/Tracking/Unity/TrackingCoordinates.cs')
 if($LASTEXITCODE){throw 'ML2 provider test compile failed'}
 [IO.File]::WriteAllText((Join-Path $output 'Ml2ProviderTests.runtimeconfig.json'),$config)
 & dotnet $providerDll
 if($LASTEXITCODE){throw 'ML2 provider behavior checks failed'}
+
+$geometryDll=Join-Path $output 'GeometryFrameworkTests.dll'
+& dotnet $compiler @common '/target:exe' "/reference:$coreDll" "/out:$geometryDll" (Join-Path $PSScriptRoot 'GeometryFrameworkTests.cs')
+if($LASTEXITCODE){throw 'Geometry framework compile failed'}
+[IO.File]::WriteAllText((Join-Path $output 'GeometryFrameworkTests.runtimeconfig.json'),$config)
+& dotnet $geometryDll
+if($LASTEXITCODE){throw 'Geometry framework behavior checks failed'}
 
 if($UnityReferenceProject) {
     # Recompile the actual Unity runtime sources against its installed SDK references.

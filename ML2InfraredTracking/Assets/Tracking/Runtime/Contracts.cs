@@ -7,17 +7,7 @@ namespace Braillic.Tracking.Runtime
     public enum TrackingState { Stopped, Starting, Running, Stopping, Faulted, Disposed }
     public enum ProviderState { Stopped, Starting, Running, Stopping, Faulted }
 
-    public interface ITrackingProvider : IDisposable
-    {
-        string Id { get; }
-        ProviderState State { get; }
-        string LastError { get; }
-        void Initialize(TrackingProviderContext context);
-        void Start();
-        void Stop();
-        void Pump(TrackingUpdatePhase phase);
-        void ResetReferenceFrame();
-    }
+
 
     public readonly struct ObservationRequirements
     {
@@ -68,21 +58,5 @@ namespace Braillic.Tracking.Runtime
         { Id=id;State=state;Error=error;Required=required; }
     }
 
-    public interface ITrackingSystem : IDisposable
-    {
-        TrackingState State { get; }
-        long Revision { get; }
-        string LastError { get; }
-        void Start();
-        void Stop();
-        void Pump(TrackingUpdatePhase phase);
-        bool TryGetProviderFrame(string providerId,out CoordinateFrame frame);
-        void ResetProviderReference(string providerId);
-        void SetFrameCalibration(string id,CoordinateFrame from,CoordinateFrame to,RigidPose toFrom,double validFrom,double validUntil);
-        void RemoveFrameCalibration(string id);
-        bool TryGetPose(string objectId,ObservationRequirements requirements,out ResolvedTrackingPose pose,out TrackingIssue issue);
-        bool TryGetPoseInFrame(string objectId,CoordinateFrame frame,ObservationRequirements requirements,out ResolvedTrackingPose pose,out TrackingIssue issue);
-        bool TryGetRelativePose(string objectId,string referenceObjectId,ObservationRequirements requirements,out ResolvedTrackingPose pose,out TrackingIssue issue);
-        IReadOnlyList<ProviderStatus> GetProviderStatus();
-    }
+
 }

@@ -17,6 +17,9 @@ namespace Braillic.Tracking
         {
             public TrackingSession Session;
             public bool Open=true;
+            public bool HasCompleteFrame;
+            public ulong FrameSequence;
+            public double FrameCapture;
             public readonly Dictionary<string,ObjectState> Objects=new Dictionary<string,ObjectState>();
         }
         private readonly object gate=new object();
@@ -76,6 +79,7 @@ namespace Braillic.Tracking
             {
                 var issue=Current(session,out var state); if(issue!=TrackingIssue.None)return issue;
                 issue=Now(out double now); if(issue!=TrackingIssue.None)return issue;
+                if (state.HasCompleteFrame && (sequence<=state.FrameSequence || captureSeconds<=state.FrameCapture)) return TrackingIssue.OutOfOrder;
                 if (!Numeric.Finite(captureSeconds)||!Numeric.Finite(availableSeconds)||captureSeconds<0
                     ||captureSeconds>availableSeconds||availableSeconds>now) return TrackingIssue.InvalidTimestamp;
                 if (!pose.IsValid) return TrackingIssue.InvalidPose;
@@ -88,6 +92,50 @@ namespace Braillic.Tracking
                 if(obj.Seen && (sequence<=obj.Sequence || captureSeconds<=obj.Capture))return TrackingIssue.OutOfOrder;
                 obj.Seen=true; obj.Available=true; obj.Sequence=sequence; obj.Capture=captureSeconds;
                 obj.Observation=new PoseObservation(session,objectId,sequence,captureSeconds,availableSeconds,pose.Normalized,quality);
+                return TrackingIssue.None;
+            }
+        }
+
+        /// <summary>Atomically replace the source's visible bodies for one complete detection frame.
+        /// Missing bodies become unavailable immediately. No event/query can see a partially installed frame.</summary>
+        public TrackingIssue PublishFrame(TrackingSession session, ulong sequence, double captureSeconds,
+            double availableSeconds, IReadOnlyList<TrackedBodySample> samples)
+        {
+            if (samples == null) throw new ArgumentNullException(nameof(samples));
+            lock (gate)
+            {
+                var issue = Current(session, out var state); if (issue != TrackingIssue.None) return issue;
+                issue = Now(out double now); if (issue != TrackingIssue.None) return issue;
+                if (!Numeric.Finite(captureSeconds) || !Numeric.Finite(availableSeconds) || captureSeconds < 0 ||
+                    captureSeconds > availableSeconds || availableSeconds > now) return TrackingIssue.InvalidTimestamp;
+                if (state.HasCompleteFrame && (sequence <= state.FrameSequence || captureSeconds <= state.FrameCapture))
+                    return TrackingIssue.OutOfOrder;
+                var ids = new HashSet<string>();
+                int total = state.Objects.Count;
+                foreach (var sample in samples)
+                {
+                    if (string.IsNullOrWhiteSpace(sample.ObjectId) || !ids.Add(sample.ObjectId)) return TrackingIssue.AmbiguousGeometry;
+                    if (!sample.ReferenceFromBody.IsValid) return TrackingIssue.InvalidPose;
+                    if (sample.Quality.HasValue && !Numeric.Finite(sample.Quality.Value)) return TrackingIssue.InvalidQuality;
+                    if (state.Objects.TryGetValue(sample.ObjectId, out var old))
+                    {
+                        if (old.Seen && (sequence <= old.Sequence || captureSeconds <= old.Capture)) return TrackingIssue.OutOfOrder;
+                    }
+                    else if (++total > maximumObjectsPerSource) return TrackingIssue.CapacityReached;
+                }
+                // Also reject an old empty frame that would otherwise erase newer single-body publications.
+                foreach (var old in state.Objects.Values)
+                    if (old.Seen && (sequence <= old.Sequence || captureSeconds <= old.Capture)) return TrackingIssue.OutOfOrder;
+                foreach (var old in state.Objects.Values) old.Available = false;
+                foreach (var sample in samples)
+                {
+                    if (!state.Objects.TryGetValue(sample.ObjectId, out var obj))
+                        state.Objects.Add(sample.ObjectId, obj = new ObjectState());
+                    obj.Seen = true; obj.Available = true; obj.Sequence = sequence; obj.Capture = captureSeconds;
+                    obj.Observation = new PoseObservation(session, sample.ObjectId, sequence, captureSeconds,
+                        availableSeconds, sample.ReferenceFromBody.Normalized, sample.Quality);
+                }
+                state.HasCompleteFrame = true; state.FrameSequence = sequence; state.FrameCapture = captureSeconds;
                 return TrackingIssue.None;
             }
         }

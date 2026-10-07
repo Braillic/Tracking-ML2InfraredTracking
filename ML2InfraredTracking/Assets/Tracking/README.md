@@ -1,5 +1,17 @@
 # Unified tracking API
 
+## Tool and geometry configuration
+
+See [ToolGeometry.md](ToolGeometry.md) for the UI-facing tool configuration API, two probes plus
+a dynamic reference frame, identification extension points, and the standalone interface index.
+Both demo scenes now select the legacy probe through a `TrackingToolProfile` and a separate
+`MarkerGeometryAsset`. Probe length and tracing policy remain application concerns.
+
+System pipeline labels are **1 = AR tracking**, **2 = OTS tracking with AR display**.
+The active ML2 path logs `pipeline=1 tracking=AR transport=UINT8 sRGB`. FLOAT32/UINT8 are image
+encodings, not tracking pipelines. The legacy serialized `PipelineMode` enum keeps its numeric
+encoding values for scene compatibility; its Inspector labels and console messages are corrected.
+
 The two demo scenes now use `TrackingSystem` through a generic Unity host. A provider owns the
 complete device pipeline, including resource startup, acquisition/SDK connection, estimation or
 remote transport, and publication. Application code asks for a logical object's pose. It does
@@ -159,8 +171,8 @@ while the anatomy remains rigidly related to it; the tracking API cannot establi
 ## A single frame through the current ML2 implementation
 
 1. `TrackingApplicationHost.Update` calls `TrackingSystem.Pump(Update)`.
-2. `Ml2TrackingProvider` advances sensor permissions/configuration/start, then polls capture once
-   per Update after SDK startup succeeds. Capture-time sensor pose and timestamp mapping use the
+2. `Ml2TrackingProvider` advances sensor permissions/configuration/start in Update, then polls capture once
+   in the host's LateUpdate after normal Update components have run. Capture-time sensor pose and timestamp mapping use the
    existing implementation. Frame submission remains gated until the provider is Running.
 3. `ML2DepthRawStream` -> `DepthFrameTcpServer` prepares and submits the image with its original
    frame/session identity, intrinsics and capture-time sensor pose. Existing rate/queue rules apply.
@@ -238,6 +250,9 @@ per process. Independent OTS providers can coexist with it. Multiple ML2 pipelin
 further transport-instance work. No on-device detection/PnP port is included here.
 
 ## Validation and hardware follow-up
+
+See [PoseFlowAudit.md](PoseFlowAudit.md) for the stationary-jitter audit, restored post-Update
+capture ordering and temporary `[TrackingPose]` diagnostics enabled on the demo presenters.
 
 Run from the repository root in separate PowerShell processes for scripts using Add-Type:
 

@@ -7,13 +7,7 @@ namespace Braillic.Tracking.Application
     public enum TrackingApplicationState { Stopped, Running, Paused, Faulted, Disposed }
 
     // Backend implementations own acquisition/transport; application code owns intent.
-    public interface ITrackingApplicationBackend : IDisposable
-    {
-        void Start();
-        void Stop();
-        void Pump(TrackingPhase phase);
-        void ResetReferenceFrame();
-    }
+
 
     /// <summary>Single-owner application lifecycle. Call on the backend's owning thread.</summary>
     public sealed class TrackingApplication : ITrackingReader, IDisposable

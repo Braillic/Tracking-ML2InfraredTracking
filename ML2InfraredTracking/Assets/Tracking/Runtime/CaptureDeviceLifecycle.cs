@@ -2,18 +2,8 @@ using System;
 
 namespace Braillic.Tracking.Runtime
 {
-    public interface ICaptureOperation { bool IsCompleted { get; } bool Succeeded { get; } }
-    public interface ICaptureDevice
-    {
-        bool OwnsResource { get; }
-        bool IsStreaming { get; }
-        bool Prepare(); // Permission/device discovery may be pending; never blocks.
-        ICaptureOperation Configure();
-        ICaptureOperation Start();
-        ICaptureOperation Stop();
-        void Release();
-        void Read();
-    }
+
+
     /// <summary>Serializes async configure/start/stop. Stop during startup waits for the outstanding
     /// operation before release; a subsequent Start cannot revive that cancelled acquisition.</summary>
     public sealed class CaptureDeviceLifecycle
@@ -35,9 +25,11 @@ namespace Braillic.Tracking.Runtime
         }
         public void Stop()
         { desired=false;teardown=true;blocked=false;State=Released?ProviderState.Stopped:ProviderState.Stopping; }
-        public void Pump()
+        // Resource transitions can advance before normal Update components finish, while actual
+        // frame polling is deferred until after those components update the tracking origin.
+        public void Pump(bool readFrame = true)
         {
-            try { Advance(); }
+            try { Advance(readFrame); }
             catch(Exception error)
             {
                 LastError=error.Message;desired=false;teardown=true;
@@ -46,7 +38,7 @@ namespace Braillic.Tracking.Runtime
                 blocked=true;
             }
         }
-        private void Advance()
+        private void Advance(bool readFrame)
         {
             if(blocked)return;
             if(pending!=null)
@@ -78,7 +70,7 @@ namespace Braillic.Tracking.Runtime
             if(State==ProviderState.Running)
             {
                 if(!device.IsStreaming)throw new InvalidOperationException("Capture device stopped unexpectedly.");
-                device.Read();return;
+                if(readFrame)device.Read();return;
             }
             State=ProviderState.Starting;
             if(!device.Prepare())return;

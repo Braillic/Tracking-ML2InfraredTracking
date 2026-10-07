@@ -4,7 +4,7 @@ import sys
 
 project=Path(sys.argv[1]) if len(sys.argv)>1 else Path(__file__).resolve().parents[2]/'ML2InfraredTracking'
 assets=project/'Assets'
-def guid(rel): return re.search(r'guid: (\w+)',(assets/(rel+'.meta')).read_text()).group(1)
+def guid(rel): return re.search(r'guid: (\w+)',(assets/(rel+'.meta')).read_text(encoding='utf-8-sig')).group(1)
 host=guid('Tracking/Unity/TrackingApplicationHost.cs')
 presenter=guid('Tracking/Unity/TrackedBodyPresenter.cs')
 receiver=guid('Tracking/Implementation/ML2/Runtime/PoseEstimateTcpServer.cs')
@@ -36,6 +36,8 @@ for name in ['IRtoolTracking_demo','ProbeSurfaceTracing_demo']:
     check(f'  providers:\n  - {{fileID: {vid}}}' in h,name+': generic host owns provider')
     check(f'  presenter: {{fileID: {pid}}}' in h,name+': presentation binding')
     check('  - objectId: probe\n    providerId: ml2-ir\n    providerObjectId: marker-body' in h,name+': logical object binding')
+    profile_guid=guid('Tracking/Profiles/LegacyMl2Probe.asset')
+    check(f'    toolProfile: {{fileID: 11400000, guid: {profile_guid}, type: 2}}' in h,name+': geometry profile selected')
     check('  startAutomatically: 0' in r and '  startAutomatically: 0' in s,name+': one lifecycle owner')
     check('  startAutomatically: 1' in h,name+': host starts demo')
     for fid,d in [(hid,h),(pid,p),(vid,v)]:
@@ -49,8 +51,30 @@ for name in ['IRtoolTracking_demo','ProbeSurfaceTracing_demo']:
         check(f'  trackingApplication: {{fileID: {hid}}}' in t,'trace reads application')
         check(f'  trackedToolRoot: {{fileID: {target}}}' in t,'trace retains same local calibration frame')
         check('  tracePointPrefab: {fileID: 7438540521478375765, guid: 8fe3f5a70613a0e45be8d37b7017168b,' in t,'trace prefab retained')
-check('PoseEstimateTcpServer' not in (assets/'ProbeTracing/ProbeSurfaceTrace.cs').read_text(),'trace independent of TCP receiver')
-check('DepthFrameTcpServer' not in (assets/'ProbeTracing/ProbeSurfaceTrace.cs').read_text(),'trace independent of TCP sender')
+check('PoseEstimateTcpServer' not in (assets/'ProbeTracing/ProbeSurfaceTrace.cs').read_text(encoding='utf-8-sig'),'trace independent of TCP receiver')
+check('DepthFrameTcpServer' not in (assets/'ProbeTracing/ProbeSurfaceTrace.cs').read_text(encoding='utf-8-sig'),'trace independent of TCP sender')
 for file in (assets/'Tracking/Unity').glob('*.cs'):
-    check(not any(word in file.read_text() for word in ['DepthSensorAPI','ML2DepthRawStream','PoseEstimateTcpServer','MagicLeap.OpenXR']),file.name+': Unity host independent of ML2')
+    check(not any(word in file.read_text(encoding='utf-8-sig') for word in ['DepthSensorAPI','ML2DepthRawStream','PoseEstimateTcpServer','MagicLeap.OpenXR']),file.name+': Unity host independent of ML2')
 print(f'PASS: {checks} scene wiring and application dependency checks')
+
+# Every authored tracking interface is in a standalone file bearing its own name.
+interfaces=[]
+for path in (assets/'Tracking').rglob('*.cs'):
+    text=path.read_text(encoding='utf-8-sig')
+    names=re.findall(r'\bpublic interface (\w+)',text)
+    if names:
+        assert names==[path.stem],f'Interface must have its own script: {path}'
+        assert not re.search(r'\b(public|internal) (?:sealed |readonly )?(?:class|struct|enum) ',text),path
+        interfaces.extend(names)
+assert len(interfaces)==10,interfaces
+geometry=(assets/'Tracking/Profiles/LegacyMl2Geometry.asset').read_text(encoding='utf-8-sig')
+profile=(assets/'Tracking/Profiles/LegacyMl2Probe.asset').read_text(encoding='utf-8-sig')
+assert 'geometryId: ml2-legacy-asymmetric-4' in geometry and '  role: 1' in profile
+assert 'guid: '+guid('Tracking/Unity/MarkerGeometryAsset.cs') in geometry
+assert 'guid: '+guid('Tracking/Unity/TrackingToolProfile.cs') in profile
+assert 'guid: '+guid('Tracking/Profiles/LegacyMl2Geometry.asset') in profile
+receiver_source=(assets/'Tracking/Implementation/ML2/Runtime/PoseEstimateTcpServer.cs').read_text(encoding='utf-8-sig')
+sender_source=(assets/'Tracking/Implementation/ML2/Runtime/DepthFrameTcpServer.cs').read_text(encoding='utf-8-sig')
+assert 'pipeline=1 tracking=AR transport=' in receiver_source
+assert '"2 UINT8' not in sender_source and 'Pipeline 2 -' not in sender_source
+print('PASS: 10 standalone interfaces, profile asset links, and AR pipeline/transport labels')

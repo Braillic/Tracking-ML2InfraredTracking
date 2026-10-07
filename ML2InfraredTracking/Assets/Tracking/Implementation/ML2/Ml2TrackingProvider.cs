@@ -7,7 +7,7 @@ namespace Braillic.Tracking.Implementation.ML2
 {
     /// <summary>Complete ML2 + remote estimator provider. The tested desktop protocol and
     /// capture-time pose calculation remain in the existing implementation components.</summary>
-    public sealed class Ml2TrackingProvider : ITrackingProvider
+    public sealed class Ml2TrackingProvider : ITrackingProvider, IGeometryTrackingProvider
     {
         private readonly string objectId,calibrationId;
         private readonly DepthSensorAPI sensor;
@@ -17,6 +17,7 @@ namespace Braillic.Tracking.Implementation.ML2
         private TrackingProviderContext context;
         private TrackingSession session;
         private bool requested,disposed;
+        private bool capturePending;
         private ulong wireSession;
         public string Id { get; }
         public ProviderState State { get; private set; }
@@ -51,17 +52,31 @@ namespace Braillic.Tracking.Implementation.ML2
             try { sender.StartServer();receiver.StartServer();sensor.Lifecycle.Start();EnsureSession(); }
             catch { Stop();throw; }
         }
+        public void ValidateGeometryConfiguration(ProviderGeometryConfiguration configuration)
+        {
+            if (configuration.ProviderId != Id || configuration.Tools.Count != 1 ||
+                configuration.Tools[0].Binding.Tracking.ProviderObjectId != objectId ||
+                !LegacyMl2Geometry.Matches(configuration.Tools[0].Geometry))
+                throw new NotSupportedException("The current ML2 desktop adapter supports one " + LegacyMl2Geometry.Id +
+                    " body. Multi-geometry identification and the multi-body desktop protocol are not implemented yet.");
+        }
         public void Stop()
         {
-            requested=false;capture.TrackingSubmissionEnabled=false;OnInvalidated();
+            requested=false;capturePending=false;capture.TrackingSubmissionEnabled=false;OnInvalidated();
             sensor.Lifecycle.Stop();
             try { receiver.StopServer(); } finally { sender.StopServer(); }
             State=sensor.Lifecycle.Released?ProviderState.Stopped:ProviderState.Stopping;
         }
         public void Pump(TrackingUpdatePhase phase)
         {
-            // No sensor SDK work or teardown waits in before-render.
-            if(phase==TrackingUpdatePhase.Update)sensor.Lifecycle.Pump();
+            // The legacy capture coroutine resumed after normal Update. Keep image/pose sampling
+            // after those updates, instead of inside the host's early (-1000) Update callback.
+            // Startup/shutdown still advance in Update; before-render never polls the sensor.
+            if(phase==TrackingUpdatePhase.Update)
+            {
+                sensor.Lifecycle.Pump(readFrame:false);
+                capturePending=requested&&sensor.Lifecycle.State==ProviderState.Running;
+            }
             if(!requested)
             { State=sensor.Lifecycle.Released?ProviderState.Stopped:ProviderState.Stopping;return; }
             if(!sensor.isActiveAndEnabled||!capture.isActiveAndEnabled||!sender.isActiveAndEnabled||!receiver.isActiveAndEnabled||
@@ -71,6 +86,12 @@ namespace Braillic.Tracking.Implementation.ML2
             if(sensor.Lifecycle.LastError!=null)throw new InvalidOperationException(sensor.Lifecycle.LastError);
             State=sensor.Lifecycle.State==ProviderState.Running?ProviderState.Running:ProviderState.Starting;
             capture.TrackingSubmissionEnabled=State==ProviderState.Running;
+            if(phase==TrackingUpdatePhase.LateUpdate&&capturePending&&State==ProviderState.Running)
+            {
+                capturePending=false;
+                sensor.Lifecycle.Pump();
+                if(sensor.Lifecycle.LastError!=null)throw new InvalidOperationException(sensor.Lifecycle.LastError);
+            }
             EnsureSession();
             if(phase==TrackingUpdatePhase.Update||State!=ProviderState.Running)return;
             receiver.PumpApplication(phase==TrackingUpdatePhase.BeforeRender);

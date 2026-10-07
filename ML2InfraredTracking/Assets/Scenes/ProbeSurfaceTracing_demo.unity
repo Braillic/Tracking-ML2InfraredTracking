@@ -4228,6 +4228,7 @@ MonoBehaviour:
   positionFollow: 1
   rotationFollow: 1
   hideAfterNoPoseSeconds: 0.65
+  logPoseDiagnostics: 1
   createMarkerSpheresOnFirstPose: 0
   markerLocalPositions:
   - {x: -0.0466, y: 0, z: 0.0206}
@@ -4254,6 +4255,7 @@ MonoBehaviour:
   - objectId: probe
     providerId: ml2-ir
     providerObjectId: marker-body
+    toolProfile: {fileID: 11400000, guid: dc323af917e65eb9a6df90fe0851ee02, type: 2}
     providerBodyFromLogicalPosition: {x: 0, y: 0, z: 0}
     providerBodyFromLogicalEuler: {x: 0, y: 0, z: 0}
   displayProviderId: ml2-ir

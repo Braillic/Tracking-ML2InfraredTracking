@@ -2,12 +2,13 @@ using System;
 
 namespace Braillic.Tracking
 {
-    public interface ITrackingClock { string Id { get; } double NowSeconds { get; } }
+
     public enum TrackingIssue
     {
         None, UnknownSource, SessionClosed, SessionSuperseded, NoObservation, SourceUnavailable,
         InvalidPose, InvalidTimestamp, InvalidQuality, OutOfOrder, Stale,
-        ClockMismatch, ClockRegressed, FrameMismatch, TimeMismatch, CapacityReached
+        ClockMismatch, ClockRegressed, FrameMismatch, TimeMismatch, CapacityReached,
+        UnknownGeometry, AmbiguousGeometry, GeometryRevisionMismatch, ConfigurationMissing
     }
 
     public sealed class TrackingSession
@@ -44,20 +45,7 @@ namespace Braillic.Tracking
         { Object=obj; Reference=reference; ReferenceFromObject=pose; }
     }
 
-    public interface ITrackingReader
-    {
-        bool TryGetLatest(string sourceId,string objectId,double maximumAgeSeconds,
-            out PoseObservation observation,out TrackingIssue issue);
-        bool TryGetRelative(string sourceId,string objectId,string referenceSourceId,string referenceId,
-            double maximumAgeSeconds,double maximumCaptureSkewSeconds,
-            out RelativeObservation observation,out TrackingIssue issue);
-    }
 
-    /// <summary>Lifecycle of adapters; capture/SDK/transport setup stays in their implementation.</summary>
-    public interface ITrackingBackend : IDisposable
-    {
-        void Start();
-        void Poll();
-        void Stop();
-    }
+
+
 }

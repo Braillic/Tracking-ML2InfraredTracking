@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Receive selectable FLOAT32/PC-conversion and UINT8/ML2-conversion pipelines.
+"""AR tracking (Pipeline 1) with FLOAT32 or UINT8 image transport.
 
 Optionally estimates tool pose with MarkerPoseTracker and streams Unity-world
 poses back to PoseEstimateTcpServer on the headset (--send-pose).
@@ -76,7 +76,7 @@ def colourise_depth(depth: np.ndarray, args: argparse.Namespace) -> np.ndarray:
 
 
 def prepare_detection_image(frame: DepthFrame, args: argparse.Namespace) -> np.ndarray:
-    """Both pipelines converge on UINT8 BGR before render_analysis()."""
+    """Both image encodings converge on UINT8 BGR before render_analysis()."""
     if frame.pixel_format == PIXEL_FORMAT_FLOAT32_RAW:
         return colourise_depth(frame.pixels, args)
     if frame.pixel_format == PIXEL_FORMAT_UINT8_SRGB_INTENSITY:
@@ -490,10 +490,10 @@ def run(args: argparse.Namespace) -> None:
                             continue
                         detection_start = time.perf_counter()
                         if frame.pixel_format != last_pixel_format:
-                            pipeline = ("1: FLOAT32 -> colourise_depth() on PC"
+                            pipeline = ("FLOAT32 -> colourise_depth() on PC"
                                         if frame.pixel_format == PIXEL_FORMAT_FLOAT32_RAW
-                                        else "2: UINT8 from ML2 -> shared grayscale tracking core")
-                            print(f"Pipeline {pipeline}; {frame.pixels.shape[1]}x{frame.pixels.shape[0]}, "
+                                        else "UINT8 from ML2 -> shared grayscale tracking core")
+                            print(f"Pipeline 1: AR tracking; transport={pipeline}; {frame.pixels.shape[1]}x{frame.pixels.shape[0]}, "
                                   f"{frame.pixels.nbytes:,} payload bytes/frame", flush=True)
                             last_pixel_format = frame.pixel_format
                         if frame.intrinsics is not None and frame.intrinsics != intrinsics:

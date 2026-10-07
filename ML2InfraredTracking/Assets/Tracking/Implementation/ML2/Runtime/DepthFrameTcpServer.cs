@@ -11,16 +11,15 @@ using TMPro;
 using UnityEngine;
 using Debug = UnityEngine.Debug;
 
-/// Sends DepthRaw through Pipeline 1 (FLOAT32, PC conversion) or
-/// Pipeline 2 (UINT8 intensity, ML2 conversion).
+/// AR tracking (Pipeline 1), using FLOAT32 or UINT8 image transport.
 /// Network I/O runs on a background thread so a slow client cannot block the sensor loop.
 public sealed class DepthFrameTcpServer : MonoBehaviour
 {
     public enum PipelineMode
     {
-        [InspectorName("Pipeline 1 - Legacy FLOAT32 (PC conversion)")]
+        [InspectorName("FLOAT32 raw (PC conversion)")]
         LegacyFloat32 = 1,
-        [InspectorName("Pipeline 2 - UINT8 (ML2 conversion)")]
+        [InspectorName("UINT8 sRGB (ML2 conversion)")]
         Ml2UInt8 = 2,
     }
 
@@ -38,8 +37,8 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
     [Tooltip("0 sends every frame. Otherwise pace the average send rate; small frame-timing jitter may produce shorter individual intervals.")]
     [SerializeField, Min(0)] private float maximumFramesPerSecond = 15f;
 
-    [Header("Processing pipeline")]
-    [Tooltip("Pipeline 1 sends raw floats for colourise_depth() on PC. Pipeline 2 converts on ML2 before sending. Both use the same PC tracker.")]
+    [Header("Image transport encoding")]
+    [Tooltip("Choose FLOAT32 or UINT8 image transport. Both belong to Pipeline 1: AR tracking.")]
     [SerializeField] private PipelineMode pipelineMode = PipelineMode.Ml2UInt8;
 
     [Header("DepthRaw to UINT8 transport mapping")]
@@ -134,19 +133,20 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
         set => SetPipelineMode((int)value);
     }
 
-    // UnityEvent/API uses pipeline numbers 1 and 2, not zero-based indices.
+    // Legacy UnityEvent name retained for serialized callbacks. Values select image encoding,
+    // not the system tracking pipeline: 1 = FLOAT32, 2 = UINT8. Both are AR tracking.
     public void SetPipelineMode(int pipelineNumber)
     {
         if (pipelineNumber != 1 && pipelineNumber != 2)
         {
-            Debug.LogWarning($"[ML2DepthTCP] Unsupported pipeline {pipelineNumber}.");
+            Debug.LogWarning($"[ML2DepthTCP] Unsupported image transport encoding {pipelineNumber}.");
             return;
         }
         pipelineMode = (PipelineMode)pipelineNumber;
     }
 
     public static string PipelineLabel(PipelineMode mode) =>
-        mode == PipelineMode.LegacyFloat32 ? "1 FLOAT32 raw" : "2 UINT8 sRGB";
+        mode == PipelineMode.LegacyFloat32 ? "FLOAT32 raw" : "UINT8 sRGB";
 
     /// Look up when this depth frame was queued / finished writing on the TCP thread.
     /// Times are <see cref="Time.realtimeSinceStartupAsDouble"/> (same clock as pose apply).
@@ -284,7 +284,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             long sent = Interlocked.Read(ref _sentFrameCount);
             _status = submitted == 0
                 ? $"PC connected: {_remoteEndpoint}\nWaiting for first DepthRaw frame..."
-                : $"PC connected: {_remoteEndpoint}\nPipeline {PipelineLabel(_lastSubmittedPipeline)} " +
+                : $"PC connected: {_remoteEndpoint}\nPipeline 1 AR tracking | transport={PipelineLabel(_lastSubmittedPipeline)} " +
                 $"{_lastWidth}x{_lastHeight} | queued {submitted} | sent {sent}" +
                 $"\nqueue={_lastQueueWaitMs:F1}ms conversion={_lastConversionMs:F1}ms write={_lastWriteMs:F1}ms";
         }
@@ -492,7 +492,7 @@ public sealed class DepthFrameTcpServer : MonoBehaviour
             RecordLatencySubmit(_pendingFrameNumber, now, framePipeline, timing);
             long submitted = Interlocked.Increment(ref _submittedFrameCount);
             if (submitted == 1 || framePipeline != _lastSubmittedPipeline)
-                Debug.Log($"[ML2DepthTCP] Pipeline {PipelineLabel(framePipeline)}: " +
+                Debug.Log($"[ML2DepthTCP] Pipeline 1 AR tracking | transport={PipelineLabel(framePipeline)}: " +
                           $"{width}x{height}, {byteCount} payload bytes/frame.");
             _lastSubmittedPipeline = framePipeline;
             Monitor.Pulse(_frameLock);

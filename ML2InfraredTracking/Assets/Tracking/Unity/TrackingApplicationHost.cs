@@ -12,6 +12,7 @@ namespace Braillic.Tracking.Unity
         [Serializable] private sealed class Binding
         {
             public string objectId="probe",providerId="ml2-ir",providerObjectId="marker-body";
+            public TrackingToolProfile toolProfile;
             public Vector3 providerBodyFromLogicalPosition;
             public Vector3 providerBodyFromLogicalEuler;
         }
@@ -55,7 +56,10 @@ namespace Braillic.Tracking.Unity
                     list.Add(new ObjectBinding(binding.providerId,binding.providerObjectId,TrackingCoordinates.FromUnity(
                         binding.providerBodyFromLogicalPosition,Quaternion.Euler(binding.providerBodyFromLogicalEuler))));
                 }
-                foreach(var pair in grouped)system.BindObject(pair.Key,pair.Value.ToArray());
+                bool hasProfiles=false;
+                foreach(var binding in bindings)hasProfiles|=binding.toolProfile!=null;
+                if(hasProfiles)ConfigureProfiles(grouped);
+                else foreach(var pair in grouped)system.BindObject(pair.Key,pair.Value.ToArray()); // Compatibility for older scenes.
                 system.ObservationPublished+=PresentCurrent;
                 system.ContinuityChanged+=HidePresentation;
                 presenter?.Prepare();
@@ -65,6 +69,35 @@ namespace Braillic.Tracking.Unity
         }
         private void OnEnable()
         { UnityEngine.Application.onBeforeRender+=BeforeRender;if(wantsTracking)StartTracking(); }
+        private void ConfigureProfiles(Dictionary<string,List<ObjectBinding>> grouped)
+        {
+            var geometries=new Dictionary<string,MarkerGeometryAsset>();
+            var selected=new List<TrackedToolDefinition>();
+            foreach(var pair in grouped)
+            {
+                TrackingToolProfile first=null;
+                var toolBindings=new List<ToolGeometryBinding>();
+                int index=0;
+                foreach(var binding in bindings)
+                {
+                    if(binding.objectId!=pair.Key)continue;
+                    var profile=binding.toolProfile;
+                    if(profile==null||profile.Geometry==null)throw new InvalidOperationException("Assign a tool profile and geometry for every binding.");
+                    if(first==null)first=profile;
+                    else if(first.Role!=profile.Role||first.DisplayName!=profile.DisplayName)
+                        throw new InvalidOperationException("Provider bindings for one tool must agree on its role and display name.");
+                    string id=profile.Geometry.GeometryId;
+                    if(geometries.TryGetValue(id,out var existing)&&existing!=profile.Geometry)
+                        throw new InvalidOperationException("Different geometry assets use the same ID: "+id);
+                    geometries[id]=profile.Geometry;
+                    toolBindings.Add(new ToolGeometryBinding(pair.Value[index++],id));
+                }
+                selected.Add(new TrackedToolDefinition(pair.Key,first.DisplayName,first.Role,toolBindings.ToArray()));
+            }
+            var definitions=new List<MarkerGeometryDefinition>();
+            foreach(var geometry in geometries.Values)definitions.Add(geometry.CreateDefinition());
+            system.ConfigureTools(new TrackingConfiguration(definitions,selected));
+        }
         private void OnDisable()
         { UnityEngine.Application.onBeforeRender-=BeforeRender;RequestShutdown(false);HidePresentation(); }
         private void OnDestroy()

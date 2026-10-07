@@ -26,6 +26,7 @@ namespace Braillic.Tracking.Runtime
         public TrackingState State { get; private set; }
         public long Revision { get; private set; }
         public string LastError { get; private set; }
+        public TrackingConfiguration Configuration { get; private set; }
         public event Action ObservationPublished;
         public event Action ContinuityChanged;
 
@@ -50,11 +51,54 @@ namespace Braillic.Tracking.Runtime
         public void BindObject(string objectId,params ObjectBinding[] priorityOrder)
         {
             CheckThread();if(State!=TrackingState.Stopped)throw new InvalidOperationException("Change object mappings while stopped.");
+            if(Configuration!=null)throw new InvalidOperationException("Use ConfigureTools to replace a geometry-aware configuration atomically.");
             if(string.IsNullOrWhiteSpace(objectId)||priorityOrder==null||priorityOrder.Length==0)throw new ArgumentException("Object bindings required.");
             var seen=new HashSet<string>();
             foreach(var binding in priorityOrder)
                 if(binding==null||!providers.ContainsKey(binding.ProviderId)||!seen.Add(binding.ProviderId))throw new ArgumentException("Bind each provider at most once, after adding it.");
             objects[objectId]=(ObjectBinding[])priorityOrder.Clone();Changed();
+        }
+        public bool TryGetToolDefinition(string objectId, out TrackedToolDefinition tool)
+        {
+            CheckThread(); tool = null;
+            if (Configuration == null) return false;
+            foreach (var candidate in Configuration.Tools)
+                if (candidate.ObjectId == objectId) { tool = candidate; return true; }
+            return false;
+        }
+        public void ConfigureTools(TrackingConfiguration configuration)
+        {
+            CheckThread();
+            if (State != TrackingState.Stopped || !ShutdownComplete)
+                throw new InvalidOperationException("Stop tracking and finish resource release before changing tools.");
+            if (configuration == null) throw new ArgumentNullException(nameof(configuration));
+            var routes = new Dictionary<string, ObjectBinding[]>();
+            foreach (var tool in configuration.Tools)
+            {
+                var bindings = new List<ObjectBinding>();
+                foreach (var binding in tool.Bindings)
+                {
+                    if (!providers.ContainsKey(binding.Tracking.ProviderId)) throw new ArgumentException("Unknown provider: " + binding.Tracking.ProviderId);
+                    bindings.Add(binding.Tracking);
+                }
+                routes.Add(tool.ObjectId, bindings.ToArray());
+            }
+            // Validate every provider before replacing any route or context configuration.
+            var selections = new Dictionary<string, ProviderGeometryConfiguration>();
+            foreach (var pair in providers)
+            {
+                var selection = configuration.ForProvider(pair.Key);
+                if (selection.Tools.Count > 0)
+                {
+                    if (!(pair.Value.Provider is IGeometryTrackingProvider geometryProvider))
+                        throw new NotSupportedException(pair.Key + " does not support geometry configuration.");
+                    geometryProvider.ValidateGeometryConfiguration(selection);
+                }
+                selections.Add(pair.Key, selection);
+            }
+            foreach (var pair in providers) { pair.Value.Context.EndSession(); pair.Value.Context.GeometryConfiguration = selections[pair.Key]; }
+            objects.Clear(); foreach (var pair in routes) objects.Add(pair.Key, pair.Value);
+            Configuration = configuration; Changed();
         }
         public void Start()
         {

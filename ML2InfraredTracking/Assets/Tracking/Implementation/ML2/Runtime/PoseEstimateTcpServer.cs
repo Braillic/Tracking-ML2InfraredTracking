@@ -540,7 +540,7 @@ public sealed class PoseEstimateTcpServer : MonoBehaviour
             sample.WorldMs + leg2 + wait + work);
         var capture = frame.Capture;
         Debug.Log($"[ML2LAT] frame={sample.FrameId} session={sample.SessionId} " +
-            $"pipeline={DepthFrameTcpServer.PipelineLabel(frame.Pipeline)} phase={phase} " +
+            $"pipeline=1 tracking=AR transport={DepthFrameTcpServer.PipelineLabel(frame.Pipeline)} phase={phase} " +
             $"submit_to_apply={total:F1}ms capture_to_apply={(sample.Applied-capture.CaptureRealtime)*1000.0:F1}ms " +
             $"(ml_prepare+queue+tcp_write={queue:F1}ms | leg1_estimate(ML2->PC)={leg1:F1}ms | " +
             $"detect={sample.DetectMs:F1}ms | pnp={sample.PnpMs:F1}ms | pack={sample.WorldMs:F1}ms | " +
